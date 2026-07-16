@@ -34,8 +34,9 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
                 ^ divider 1                      ^ divider 2
 ```
 
-- **Sidebar:** fixed width, draggable via divider 1. Range 160–500 pt, default 240 pt. Its width never changes when the preview column appears/disappears.
-- **Editor:** takes all remaining width when no preview is shown. When the preview exists, the editor gets a draggable fraction of the remaining width (divider 2); default fraction ≈ 2/3, clamped to 25 %–85 %.
+- **Default split:** with a Markdown file open (3 columns) the window divides **1/3, 1/3, 1/3**. With a non-Markdown file (2 columns) the sidebar keeps its width (1/3 of the window by default) and the editor takes the remainder (≈ 2/3 by default).
+- **Sidebar:** draggable via divider 1; default width = 1/3 of the default window width (≈ 367 pt), clamped to 160–600 pt. Its width never changes when the preview column appears/disappears.
+- **Editor:** takes all remaining width when no preview is shown. When the preview exists, the editor gets a draggable fraction of the remaining (non-sidebar) width via divider 2; default fraction 1/2 — yielding the 1/3, 1/3, 1/3 default — clamped to 15 %–85 %.
 - **Preview:** exists **iff** the currently open file is Markdown. Takes the rest of the width.
 - Both divider positions are **persisted globally** (`UserDefaults`) and restored on next launch; they are shared across windows.
 - Dividers: 5 pt hit area, thin visible separator line, `resizeLeftRight` cursor on hover.

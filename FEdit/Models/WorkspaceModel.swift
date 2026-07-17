@@ -30,13 +30,25 @@ import SwiftUI
 final class WorkspaceModel: ObservableObject {
     @Published private(set) var roots: [FileNode] = []
 
-    /// Record-only until (open-save) wires this up to actually opening the file.
+    /// Record-only until (open-save) wires this up to actually opening the file. Writing this
+    /// property has **zero side effects at the model layer** — no `didSet` — by design: the
+    /// selection→load hook lives in `ContentView`'s `.onChange(of:)`, so this stays a plain
+    /// record load-bearing for (open-save)'s Cancel-revert (a model-side reload here would
+    /// silently destroy a dirty buffer).
     @Published var selectedFileURL: URL? = nil
 
     /// The sidebar's filter query text (SPEC §5.4–§5.5). Lives on the per-window model rather
     /// than view `@State` because SPEC §9 persists filter text per window, and (session-restore)
     /// snapshots from `WorkspaceModel` — parking it here now avoids a later move.
     @Published var filterText: String = ""
+
+    /// The file currently loaded into the editor (SPEC §6.1: exactly one file open at a time).
+    /// Interim state — (open-save) replaces this with its full open-file model.
+    @Published var openFileURL: URL?
+
+    /// The editor's full text buffer, bound directly to `CodeEditorView`. Interim — (open-save)
+    /// supersedes this with dirty tracking and the real open/save pipeline.
+    @Published var editorText: String = ""
 
     /// Adds each URL as a top-level root, standardizing it and skipping ones already present.
     /// Duplicate comparison resolves symlinks first (`/tmp` vs `/private/tmp` count as the same
@@ -72,6 +84,23 @@ final class WorkspaceModel: ObservableObject {
     /// Rescans every root in place (SPEC §5.1: Refresh rescans all folders).
     func refreshAll() {
         roots = roots.map { FileNode.scan(directory: $0.url) }
+    }
+
+    /// Loads `url` into the editor (interim state — (open-save) supersedes this with the full
+    /// open/save pipeline, including binary/NUL detection and read-error alerts per SPEC §7/§11).
+    /// No-op if `url` is already the open file, so clicking the already-open file's sidebar row
+    /// never reloads or resets the editor's caret/scroll. Tries UTF-8 first, then falls back to
+    /// Latin-1; an unreadable file leaves `openFileURL`/`editorText` unchanged (no alert yet).
+    func loadSelectedFile(_ url: URL) {
+        guard url != openFileURL else { return }
+
+        if let contents = try? String(contentsOf: url, encoding: .utf8) {
+            openFileURL = url
+            editorText = contents
+        } else if let contents = try? String(contentsOf: url, encoding: .isoLatin1) {
+            openFileURL = url
+            editorText = contents
+        }
     }
 
     /// Presents an `NSOpenPanel` restricted to directories, multi-select enabled, and adds the

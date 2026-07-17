@@ -38,6 +38,12 @@ struct ContentView: View {
     // Per-window @State is intentional: each window will later have its own open file.
     @State private var isMarkdown = false
 
+    // Debug-only sinks for `CodeEditorView`'s scroll/cursor callbacks (editor-core Tier 3). The
+    // real consumers arrive with (markdown-preview) (scroll sync) and (session-restore) (cursor
+    // persistence); for now these just prove the callbacks fire correctly.
+    @State private var debugFirstVisibleLine = 0
+    @State private var debugCursorPosition = 0
+
     // One per window (SPEC §3) — holds the open folders and selection for this window.
     @StateObject private var workspace = WorkspaceModel()
 
@@ -99,6 +105,14 @@ struct ContentView: View {
         // Exposes this window's workspace to `FileCommands` via `@FocusedObject`, so
         // File → Open Folder… always targets the focused window (SPEC §10).
         .focusedSceneObject(workspace)
+        // Selection→load hook (DECISION, editor-core): the only place a sidebar selection turns
+        // into an editor load. No model-side `didSet` — writing `selectedFileURL` must stay a
+        // zero-side-effect record (load-bearing for (open-save)'s Cancel-revert).
+        .onChange(of: workspace.selectedFileURL) { _, newValue in
+            if let newValue {
+                workspace.loadSelectedFile(newValue)
+            }
+        }
     }
 
     private var sidebarColumn: some View {
@@ -106,16 +120,40 @@ struct ContentView: View {
     }
 
     private var editorColumn: some View {
-        Group {
-            Color(nsColor: .textBackgroundColor)
-                .overlay(
-                    VStack(spacing: 12) {
-                        Text("No file open")
-                            .foregroundStyle(.secondary)
-                        // TODO(open-save): replace stub with real language detection from the open file.
-                        Toggle("Markdown preview (stub)", isOn: $isMarkdown)
+        VStack(spacing: 0) {
+            // TODO(open-save): remove — temporary debug bar. Relocated here from the placeholder
+            // this column used to be; (open-save) deletes the bar once `isMarkdown` is driven by
+            // real language detection from the open file instead of this stub.
+            HStack {
+                Toggle("Markdown preview (stub)", isOn: $isMarkdown)
+                Spacer()
+            }
+            .padding(8)
+
+            if let url = workspace.openFileURL {
+                CodeEditorView(
+                    text: $workspace.editorText,
+                    documentID: url,
+                    onFirstVisibleLineChange: { line in
+                        debugFirstVisibleLine = line
+                        #if DEBUG
+                        print("[CodeEditorView] onFirstVisibleLineChange: \(line)")
+                        #endif
+                    },
+                    onCursorChange: { location in
+                        debugCursorPosition = location
+                        #if DEBUG
+                        print("[CodeEditorView] onCursorChange: \(location)")
+                        #endif
                     }
                 )
+            } else {
+                Color.white
+                    .overlay(
+                        Text("No file open")
+                            .foregroundStyle(.secondary)
+                    )
+            }
         }
     }
 

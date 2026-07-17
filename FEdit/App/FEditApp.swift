@@ -24,9 +24,36 @@ import SwiftUI
 
 @main
 struct FEditApp: App {
+    init() {
+        // Light appearance only (SPEC §3), regardless of the system setting.
+        NSApplication.shared.appearance = NSAppearance(named: .aqua)
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .frame(minWidth: 700, minHeight: 400)
         }
+        .defaultSize(width: CGFloat(LayoutMetrics.defaultWindowWidth), height: 700)
     }
+}
+
+/// Single home for all `UserDefaults` keys used across the app (SPEC §13 "settings keys").
+enum SettingsKey {
+    static let sidebarWidth = "sidebarWidth"
+    static let editorFraction = "editorFraction"
+}
+
+/// Shared layout constants for the three-column window (SPEC §4). Storage-backed values are
+/// `Double` to match the `@AppStorage` boundary without cast noise.
+enum LayoutMetrics {
+    static let defaultWindowWidth: Double = 1100
+    static let defaultSidebarWidth: Double = 1100.0 / 3.0
+    static let sidebarMin: Double = 160
+    static let sidebarMax: Double = 600
+    static let defaultEditorFraction: Double = 0.5
+    static let editorFractionMin: Double = 0.15
+    static let editorFractionMax: Double = 0.85
+    static let dividerHitWidth: CGFloat = 5
+    static let dividerLineWidth: CGFloat = 1
 }

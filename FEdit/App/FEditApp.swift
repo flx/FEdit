@@ -35,6 +35,28 @@ struct FEditApp: App {
                 .frame(minWidth: 700, minHeight: 400)
         }
         .defaultSize(width: CGFloat(LayoutMetrics.defaultWindowWidth), height: 700)
+        .commands {
+            FileCommands()
+        }
+    }
+}
+
+/// File menu additions (SPEC §10). Acts on the focused window's `WorkspaceModel` via
+/// `@FocusedObject`/`.focusedSceneObject`, so adding a folder in one window never affects
+/// another, and the command disables itself when no editor window is focused.
+struct FileCommands: Commands {
+    @FocusedObject private var workspace: WorkspaceModel?
+
+    var body: some Commands {
+        CommandGroup(after: .newItem) {
+            Button("Open Folder…") {
+                workspace?.presentOpenPanel()
+            }
+            // Lowercase "o" plus explicit `.shift` — the uppercase-"O"-plus-explicit-shift
+            // spelling is the historically fragile one for this chord.
+            .keyboardShortcut("o", modifiers: [.command, .shift])
+            .disabled(workspace == nil)
+        }
     }
 }
 

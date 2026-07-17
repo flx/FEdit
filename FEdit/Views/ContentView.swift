@@ -38,6 +38,9 @@ struct ContentView: View {
     // Per-window @State is intentional: each window will later have its own open file.
     @State private var isMarkdown = false
 
+    // One per window (SPEC §3) — holds the open folders and selection for this window.
+    @StateObject private var workspace = WorkspaceModel()
+
     var body: some View {
         GeometryReader { geo in
             // Clamp at the read site so garbage/NaN persisted values (e.g. from a bogus
@@ -93,16 +96,13 @@ struct ContentView: View {
                 }
             }
         }
+        // Exposes this window's workspace to `FileCommands` via `@FocusedObject`, so
+        // File → Open Folder… always targets the focused window (SPEC §10).
+        .focusedSceneObject(workspace)
     }
 
     private var sidebarColumn: some View {
-        Group {
-            Color(nsColor: .windowBackgroundColor)
-                .overlay(
-                    Text("Sidebar")
-                        .foregroundStyle(.secondary)
-                )
-        }
+        SidebarView(workspace: workspace)
     }
 
     private var editorColumn: some View {

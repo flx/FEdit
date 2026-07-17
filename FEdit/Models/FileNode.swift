@@ -97,4 +97,27 @@ struct FileNode: Identifiable {
         let byName: (FileNode, FileNode) -> Bool = { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         return directories.sorted(by: byName) + files.sorted(by: byName)
     }
+
+    /// Every file under `self`, paired with its path relative to `self` — `self`'s own name is
+    /// excluded from every path (callable directly on a root: yields `swift-source/main.swift`,
+    /// never `FEdit/swift-source/main.swift`; a root-name leak would corrupt filter matching,
+    /// e.g. a query for "fedit" matching every file under a root named FEdit). Depth-first order
+    /// preserves the scanner's folders-first sort (filter-query §5.4).
+    func filesWithRelativePaths() -> [(path: String, node: FileNode)] {
+        var results: [(path: String, node: FileNode)] = []
+        for child in children ?? [] {
+            child.collect(prefix: "", into: &results)
+        }
+        return results
+    }
+
+    private func collect(prefix: String, into results: inout [(path: String, node: FileNode)]) {
+        if isDirectory {
+            for child in children ?? [] {
+                child.collect(prefix: prefix + name + "/", into: &results)
+            }
+        } else {
+            results.append((prefix + name, self))
+        }
+    }
 }

@@ -33,6 +33,11 @@ final class WorkspaceModel: ObservableObject {
     /// Record-only until (open-save) wires this up to actually opening the file.
     @Published var selectedFileURL: URL? = nil
 
+    /// The sidebar's filter query text (SPEC §5.4–§5.5). Lives on the per-window model rather
+    /// than view `@State` because SPEC §9 persists filter text per window, and (session-restore)
+    /// snapshots from `WorkspaceModel` — parking it here now avoids a later move.
+    @Published var filterText: String = ""
+
     /// Adds each URL as a top-level root, standardizing it and skipping ones already present.
     /// Duplicate comparison resolves symlinks first (`/tmp` vs `/private/tmp` count as the same
     /// root) so it catches more than a plain standardized-path comparison would.

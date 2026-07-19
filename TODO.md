@@ -10,7 +10,6 @@ files an item touches so overlapping items don't get batched in parallel.
 
 ## Features
 
-- [ ] (markdown-preview) Preview column with editor→preview scroll sync — New `Preview/MarkdownPreviewView.swift` (read-only selectable TextKit 1 NSTextView showing renderer output; re-render on edit with scroll position preserved); `Views/ContentView.swift`: mount in third column when open file is markdown, feed editor's throttled first-visible-line into anchor lookup (greatest anchor line ≤ editor top scrolls to top of preview); one-way sync only, approximate but sub-second. Depends on (markdown-renderer), (open-save), (editor-core). Spec §8.3, §4.
 - [ ] (session-restore) Session persistence and multi-window polish — `Models/WorkspaceModel.swift`: Codable snapshot (root paths, open file path, filter text, cursor) exposed as JSON; `Views/ContentView.swift`: @SceneStorage save/restore per window (missing folders silently dropped, missing file not opened, cursor restored and scrolled visible, content always re-read from disk); verify frames restore via system window restoration and that all menu commands target the focused window. Depends on (open-save), (filter-query). Spec §3, §9.
 
 ## Bugs

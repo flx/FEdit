@@ -35,10 +35,15 @@ struct ContentView: View {
     @State private var sidebarDragBase: Double?
     @State private var fractionDragBase: Double?
 
-    // Debug-only sinks for `CodeEditorView`'s scroll/cursor callbacks (editor-core Tier 3). The
-    // real consumers arrive with (markdown-preview) (scroll sync) and (session-restore) (cursor
-    // persistence); for now these just prove the callbacks fire correctly.
-    @State private var debugFirstVisibleLine = 0
+    // (markdown-preview) Tier 3: the editor's throttled first-visible-line report (editor-core),
+    // driving the preview's one-way scroll sync (SPEC §8.3). Reset to 0 on file switch (see
+    // `.onChange(of:)` below) so a stale previous-file line can never drive the new file's
+    // preview before its first throttled report arrives.
+    @State private var editorFirstVisibleLine = 0
+
+    // Debug-only sink for `CodeEditorView`'s cursor callback (editor-core Tier 3). The real
+    // consumer arrives with (session-restore) (cursor persistence); for now this just proves the
+    // callback fires correctly.
     @State private var debugCursorPosition = 0
 
     // One per window (SPEC §3) — holds the open folders and selection for this window.
@@ -112,6 +117,13 @@ struct ContentView: View {
         // its close button / Cmd+W (SPEC §7). See `WindowCloseGuard` for why this can't just
         // replace `window.delegate`.
         .background(WindowCloseGuard(model: workspace))
+        // (markdown-preview) High defect #1: without this, `editorFirstVisibleLine` would keep
+        // holding the *previous* file's line for ~100–200 ms after a switch (until the editor's
+        // throttled report for the new file arrives), and that stale value must not drive the
+        // new file's preview.
+        .onChange(of: workspace.openFile?.url) {
+            editorFirstVisibleLine = 0
+        }
     }
 
     private var sidebarColumn: some View {
@@ -130,10 +142,7 @@ struct ContentView: View {
                     // that already drives `documentID`.
                     language: SyntaxLanguage(fileExtension: workspace.openFile?.url.pathExtension),
                     onFirstVisibleLineChange: { line in
-                        debugFirstVisibleLine = line
-                        #if DEBUG
-                        print("[CodeEditorView] onFirstVisibleLineChange: \(line)")
-                        #endif
+                        editorFirstVisibleLine = line
                     },
                     onCursorChange: { location in
                         debugCursorPosition = location
@@ -153,13 +162,11 @@ struct ContentView: View {
     }
 
     private var previewColumn: some View {
-        Group {
-            Color(nsColor: .underPageBackgroundColor)
-                .overlay(
-                    Text("Preview")
-                        .foregroundStyle(.secondary)
-                )
-        }
+        MarkdownPreviewView(
+            text: workspace.editorText,
+            fileURL: workspace.openFile?.url,
+            firstVisibleLine: editorFirstVisibleLine
+        )
     }
 
     private func clampSidebar(_ value: Double) -> Double {

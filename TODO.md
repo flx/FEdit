@@ -10,7 +10,6 @@ files an item touches so overlapping items don't get batched in parallel.
 
 ## Features
 
-- [ ] (session-restore) Session persistence and multi-window polish — `Models/WorkspaceModel.swift`: Codable snapshot (root paths, open file path, filter text, cursor) exposed as JSON; `Views/ContentView.swift`: @SceneStorage save/restore per window (missing folders silently dropped, missing file not opened, cursor restored and scrolled visible, content always re-read from disk); verify frames restore via system window restoration and that all menu commands target the focused window. Depends on (open-save), (filter-query). Spec §3, §9.
 
 ## Bugs
 

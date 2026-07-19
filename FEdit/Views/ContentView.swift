@@ -41,13 +41,19 @@ struct ContentView: View {
     // preview before its first throttled report arrives.
     @State private var editorFirstVisibleLine = 0
 
-    // Debug-only sink for `CodeEditorView`'s cursor callback (editor-core Tier 3). The real
-    // consumer arrives with (session-restore) (cursor persistence); for now this just proves the
-    // callback fires correctly.
-    @State private var debugCursorPosition = 0
-
     // One per window (SPEC §3) — holds the open folders and selection for this window.
     @StateObject private var workspace = WorkspaceModel()
+
+    // (session-restore) SPEC §3, §9: this window's persisted state — open folders, open file,
+    // filter text, cursor — round-tripped through `WorkspaceModel.snapshotJSON()`/`restore(fromJSON:)`
+    // as JSON. `@SceneStorage` keys this per-scene, so each window restores its own snapshot.
+    @SceneStorage("workspaceSnapshot") private var workspaceSnapshot: String = ""
+
+    // Guards the `.onAppear` restore call to once per scene, and also gates the save path so it
+    // cannot write before the first restore decision has been made (see the `.onChange(of:
+    // workspaceSnapshot)` recovery handler below) — a premature write here could otherwise race
+    // and clobber a persisted snapshot that the platform hasn't finished delivering yet.
+    @State private var didRestore = false
 
     var body: some View {
         GeometryReader { geo in
@@ -124,6 +130,36 @@ struct ContentView: View {
         .onChange(of: workspace.openFile?.url) {
             editorFirstVisibleLine = 0
         }
+        // (session-restore) SPEC §3, §9: restore this scene's state once, on first appear. A
+        // freshly created (Cmd+N) scene's `@SceneStorage` value is empty, so `restore` is a
+        // no-op there — the pristine-scene guarantee this relies on.
+        .onAppear {
+            guard !didRestore else { return }
+            didRestore = true
+            workspace.restore(fromJSON: workspaceSnapshot)
+        }
+        // Late-arriving `@SceneStorage` recovery rule: the platform can deliver the persisted
+        // string *after* the first render (`workspaceSnapshot` starts at `""` and is updated once
+        // the real value has loaded). If that empty→non-empty transition happens while the model
+        // is still pristine, retry the restore — otherwise a slow-arriving snapshot would never
+        // get applied.
+        .onChange(of: workspaceSnapshot) { oldValue, newValue in
+            guard oldValue.isEmpty, !newValue.isEmpty,
+                  workspace.roots.isEmpty, workspace.openFile == nil else { return }
+            workspace.restore(fromJSON: newValue)
+        }
+        // Save: keeps `workspaceSnapshot` current whenever restorable state changes, tracked over
+        // **post-change** values only — `onReceive(workspace.objectWillChange)` is deliberately
+        // not used here: it fires on `willSet`, which would persist the *pre*-change snapshot and
+        // lose the last edit made before quit. Gated on `didRestore` so this can never write
+        // before the first restore decision above has run (so it can't race and clobber a
+        // snapshot the platform is still in the middle of delivering — the late-arriving rule's
+        // whole point). `snapshotJSON() == nil` (encode failure) skips the write, keeping
+        // whatever was last stored (last-good).
+        .onChange(of: workspace.snapshotJSON()) { _, newValue in
+            guard didRestore, let newValue else { return }
+            workspaceSnapshot = newValue
+        }
     }
 
     private var sidebarColumn: some View {
@@ -141,14 +177,15 @@ struct ContentView: View {
                     // own yet (load-bearing assumption #4), so this piggybacks on the same URL
                     // that already drives `documentID`.
                     language: SyntaxLanguage(fileExtension: workspace.openFile?.url.pathExtension),
+                    // (session-restore): the one-shot cursor-restore seam (editor-core cross-plan
+                    // decision) — the model clears this itself the next time `noteCursorMoved`
+                    // fires, which the editor's own restore-consume triggers via `onCursorChange`.
+                    cursorToRestore: workspace.pendingCursorRestore,
                     onFirstVisibleLineChange: { line in
                         editorFirstVisibleLine = line
                     },
                     onCursorChange: { location in
-                        debugCursorPosition = location
-                        #if DEBUG
-                        print("[CodeEditorView] onCursorChange: \(location)")
-                        #endif
+                        workspace.noteCursorMoved(location)
                     }
                 )
             } else {

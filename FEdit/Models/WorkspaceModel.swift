@@ -72,6 +72,16 @@ final class WorkspaceModel: ObservableObject {
     /// The file currently loaded into the editor, or `nil` if none (SPEC §6.1, §7).
     @Published var openFile: OpenFile?
 
+    /// The editor's last-reported caret offset (UTF-16, `NSRange.location`), sunk here by
+    /// (session-restore) via `noteCursorMoved(_:)`. Drives `snapshotJSON()`'s `cursorLocation`.
+    @Published private(set) var cursorLocation: Int = 0
+
+    /// One-shot cursor value for (session-restore)'s consumer, `CodeEditorView`'s
+    /// `cursorToRestore` parameter — stashed by `restore(fromJSON:)`, cleared by the next
+    /// `noteCursorMoved(_:)` call (the editor's restore-consume reports back through the cursor
+    /// callback, which fires `noteCursorMoved` and clears this).
+    private(set) var pendingCursorRestore: Int?
+
     /// Real language stub (SPEC §6.3's full enum arrives with (syntax-highlighting)): `true` for
     /// a `.md`/`.markdown` extension (case-insensitive), driving the preview column's visibility
     /// (SPEC §8).
@@ -102,6 +112,17 @@ final class WorkspaceModel: ObservableObject {
             file.isDirty = true
             openFile = file
         }
+    }
+
+    /// Sink for `CodeEditorView`'s `onCursorChange` callback (editor-core), including the
+    /// synthetic report the coordinator fires right after consuming a restored cursor. Updates
+    /// `cursorLocation` for the next snapshot, and clears `pendingCursorRestore` the first time
+    /// this fires after a restore — the editor's one-shot restore-consume reports back through
+    /// this same callback, so by the time it does, the seam has been used and must not be
+    /// re-applied on a later document switch.
+    func noteCursorMoved(_ location: Int) {
+        cursorLocation = location
+        pendingCursorRestore = nil
     }
 
     /// Adds each URL as a top-level root, standardizing it and skipping ones already present.
@@ -170,21 +191,39 @@ final class WorkspaceModel: ObservableObject {
         return String(data: data, encoding: .isoLatin1)!
     }
 
+    /// Shared success-path assignment for both `loadFile` (interactive open) and
+    /// (session-restore)'s silent restore-open: replaces `openFile` with a clean (non-dirty)
+    /// buffer and syncs `selectedFileURL` to `url`. Factored out so the two routes' success
+    /// behavior can never drift apart.
+    private func applyLoadedFile(url: URL, text: String) {
+        openFile = OpenFile(url: url, text: text, isDirty: false)
+        selectedFileURL = url
+    }
+
     /// Loads `url` into the editor unconditionally — no dirty check, no no-op-on-already-open
     /// guard; both live in `requestOpen`, the only public entry point for a sidebar selection.
-    /// On success: replaces `openFile` with a clean (non-dirty) buffer and syncs
-    /// `selectedFileURL` to `url`. On failure: alerts (binary-refusal wording vs. a generic
-    /// read-error wording) and reverts `selectedFileURL` back to whatever was already open, so
-    /// the sidebar highlight doesn't follow a selection that failed to load (criterion 3).
+    /// On success: assigns via `applyLoadedFile`. On failure: alerts (binary-refusal wording vs.
+    /// a generic read-error wording) and reverts `selectedFileURL` back to whatever was already
+    /// open, so the sidebar highlight doesn't follow a selection that failed to load
+    /// (criterion 3).
     private func loadFile(_ url: URL) {
         do {
             let text = try loadText(from: url)
-            openFile = OpenFile(url: url, text: text, isDirty: false)
-            selectedFileURL = url
+            applyLoadedFile(url: url, text: text)
         } catch {
             presentReadErrorAlert(for: url, error: error)
             selectedFileURL = openFile?.url
         }
+    }
+
+    /// (session-restore)'s silent, non-interactive counterpart to `loadFile`: reuses the same
+    /// `loadText(from:)` core and the same success assignment (`applyLoadedFile`), but on
+    /// failure swallows the error with no alert and no `selectedFileURL` revert — SPEC §9's "a
+    /// missing file is simply not opened". Never routes through `requestOpen` (no dirty check,
+    /// no dialog) — restore only ever runs against a pristine, freshly created model.
+    private func silentlyLoadFile(_ url: URL) {
+        guard let text = try? loadText(from: url) else { return }
+        applyLoadedFile(url: url, text: text)
     }
 
     /// The sidebar's single entry point for opening a file (both tree rows and filter-query's
@@ -311,6 +350,64 @@ final class WorkspaceModel: ObservableObject {
 
         if panel.runModal() == .OK {
             addFolders(panel.urls)
+        }
+    }
+
+    // MARK: - Session restore (SPEC §3, §9)
+
+    /// Builds the current per-window state as `WorkspaceSnapshot` JSON for `@SceneStorage`
+    /// (ContentView, Tier 2). Returns `nil` — never `""` — on encode failure, so the caller skips
+    /// the write and keeps whatever snapshot is already stored; an empty write would erase a
+    /// valid one.
+    func snapshotJSON() -> String? {
+        let snapshot = WorkspaceSnapshot(
+            rootPaths: roots.map { $0.url.path },
+            openFilePath: openFile?.url.path,
+            filterText: filterText,
+            cursorLocation: cursorLocation
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        guard let data = try? encoder.encode(snapshot),
+              let json = String(data: data, encoding: .utf8) else { return nil }
+        return json
+    }
+
+    /// Restores this window's state from a `WorkspaceSnapshot` JSON string (ContentView, Tier 2's
+    /// `.onAppear`/late-arriving-`@SceneStorage` recovery). A no-op if the model already has
+    /// roots or an open file — only a pristine, freshly created scene restores, which also means
+    /// this never has to contend with an in-progress dirty-file guard. Silent throughout: no
+    /// dialogs, no alerts (SPEC §7/§9) — a missing folder is dropped, a missing/unreadable file is
+    /// simply not opened, and empty/corrupt JSON leaves the model exactly as it was (an empty
+    /// pristine window). Runs synchronously on the main thread (SPEC §11: root rescans + one file
+    /// read at launch is acceptable).
+    func restore(fromJSON json: String) {
+        guard roots.isEmpty, openFile == nil else { return }
+        guard let data = json.data(using: .utf8),
+              let snapshot = try? JSONDecoder().decode(WorkspaceSnapshot.self, from: data) else { return }
+
+        // `addFolders` already validates each path with `fileExists(atPath:isDirectory:)` and
+        // skips anything that isn't an existing directory, so a deleted root is dropped silently
+        // here for free (SPEC §9: "missing folder dropped silently") — no separate filter needed.
+        addFolders(snapshot.rootPaths.map { URL(fileURLWithPath: $0) })
+
+        filterText = snapshot.filterText
+
+        if let openFilePath = snapshot.openFilePath {
+            silentlyLoadFile(URL(fileURLWithPath: openFilePath))
+        }
+
+        // Written to both `pendingCursorRestore` (Tier 2's editor consumes it) and
+        // `cursorLocation` directly (criterion 12): if only the stash were set, the immediate
+        // post-restore snapshot save — which reads `cursorLocation`, not the pending stash —
+        // would clobber the stored cursor with the model's default `0` before the editor ever
+        // gets a chance to apply and report it back through `noteCursorMoved`. Gated on `openFile
+        // != nil` — when the restored file didn't actually open, no editor mounts to consume and
+        // clear `pendingCursorRestore`, so it would otherwise leak onto the next file the user
+        // opens and snap its caret to this stale offset.
+        if openFile != nil, let cursorLocation = snapshot.cursorLocation {
+            pendingCursorRestore = cursorLocation
+            self.cursorLocation = cursorLocation
         }
     }
 }

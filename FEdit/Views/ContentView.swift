@@ -35,9 +35,6 @@ struct ContentView: View {
     @State private var sidebarDragBase: Double?
     @State private var fractionDragBase: Double?
 
-    // Per-window @State is intentional: each window will later have its own open file.
-    @State private var isMarkdown = false
-
     // Debug-only sinks for `CodeEditorView`'s scroll/cursor callbacks (editor-core Tier 3). The
     // real consumers arrive with (markdown-preview) (scroll sync) and (session-restore) (cursor
     // persistence); for now these just prove the callbacks fire correctly.
@@ -58,7 +55,7 @@ struct ContentView: View {
                 geo.size.width
                     - CGFloat(clampedSidebarWidth)
                     - LayoutMetrics.dividerHitWidth
-                    - (isMarkdown ? LayoutMetrics.dividerHitWidth : 0)
+                    - (workspace.isMarkdown ? LayoutMetrics.dividerHitWidth : 0)
             )
             let editorWidth = max(0, contentWidth * CGFloat(clampedEditorFraction))
 
@@ -77,7 +74,7 @@ struct ContentView: View {
                     }
                 )
 
-                if isMarkdown {
+                if workspace.isMarkdown {
                     editorColumn
                         .frame(width: editorWidth)
 
@@ -103,16 +100,18 @@ struct ContentView: View {
             }
         }
         // Exposes this window's workspace to `FileCommands` via `@FocusedObject`, so
-        // File → Open Folder… always targets the focused window (SPEC §10).
+        // File → Open Folder…/Save always target the focused window (SPEC §10).
         .focusedSceneObject(workspace)
-        // Selection→load hook (DECISION, editor-core): the only place a sidebar selection turns
-        // into an editor load. No model-side `didSet` — writing `selectedFileURL` must stay a
-        // zero-side-effect record (load-bearing for (open-save)'s Cancel-revert).
-        .onChange(of: workspace.selectedFileURL) { _, newValue in
-            if let newValue {
-                workspace.loadSelectedFile(newValue)
-            }
-        }
+        // Window title/subtitle (SPEC §7): the open file's name, with an "Edited" marker while
+        // dirty. Sidebar row taps route through `WorkspaceModel.requestOpen` directly — there is
+        // no selection→load `.onChange` any more (editor-core's temporary hook is gone; see
+        // `WorkspaceModel.selectedFileURL`'s doc comment for why writing it must stay inert).
+        .navigationTitle(workspace.openFileName ?? "FEdit")
+        .navigationSubtitle(workspace.openFile?.isDirty == true ? "Edited" : "")
+        // Invisible: walks up to this window once mounted and installs the dirty-file guard on
+        // its close button / Cmd+W (SPEC §7). See `WindowCloseGuard` for why this can't just
+        // replace `window.delegate`.
+        .background(WindowCloseGuard(model: workspace))
     }
 
     private var sidebarColumn: some View {
@@ -121,19 +120,10 @@ struct ContentView: View {
 
     private var editorColumn: some View {
         VStack(spacing: 0) {
-            // TODO(open-save): remove — temporary debug bar. Relocated here from the placeholder
-            // this column used to be; (open-save) deletes the bar once `isMarkdown` is driven by
-            // real language detection from the open file instead of this stub.
-            HStack {
-                Toggle("Markdown preview (stub)", isOn: $isMarkdown)
-                Spacer()
-            }
-            .padding(8)
-
-            if let url = workspace.openFileURL {
+            if workspace.openFile != nil {
                 CodeEditorView(
                     text: $workspace.editorText,
-                    documentID: url,
+                    documentID: workspace.openFile?.url,
                     onFirstVisibleLineChange: { line in
                         debugFirstVisibleLine = line
                         #if DEBUG

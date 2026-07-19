@@ -24,6 +24,10 @@ import SwiftUI
 
 @main
 struct FEditApp: App {
+    // Routes Cmd+Q through the same per-window dirty-file guard as Cmd+W (SPEC §7); see
+    // `WindowCloseGuard.swift`.
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     init() {
         // Light appearance only (SPEC §3), regardless of the system setting.
         NSApplication.shared.appearance = NSAppearance(named: .aqua)
@@ -47,6 +51,10 @@ struct FEditApp: App {
 struct FileCommands: Commands {
     @FocusedObject private var workspace: WorkspaceModel?
 
+    // Same `UserDefaults` key the model reads/writes directly (`WorkspaceModel.autosaveOnFileSwitch`)
+    // — this `@AppStorage` is just the menu's live view onto it, not a second source of truth.
+    @AppStorage(SettingsKey.autosaveOnFileSwitch) private var autosaveOnFileSwitch = false
+
     var body: some Commands {
         CommandGroup(after: .newItem) {
             Button("Open Folder…") {
@@ -56,6 +64,14 @@ struct FileCommands: Commands {
             // spelling is the historically fragile one for this chord.
             .keyboardShortcut("o", modifiers: [.command, .shift])
             .disabled(workspace == nil)
+
+            Button("Save") {
+                workspace?.saveOpenFile()
+            }
+            .keyboardShortcut("s", modifiers: [.command])
+            .disabled(workspace?.canSave != true)
+
+            Toggle("Autosave on File Switch", isOn: $autosaveOnFileSwitch)
         }
     }
 }
@@ -64,6 +80,7 @@ struct FileCommands: Commands {
 enum SettingsKey {
     static let sidebarWidth = "sidebarWidth"
     static let editorFraction = "editorFraction"
+    static let autosaveOnFileSwitch = "autosaveOnFileSwitch"
 }
 
 /// Shared layout constants for the three-column window (SPEC §4). Storage-backed values are

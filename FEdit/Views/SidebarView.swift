@@ -141,7 +141,7 @@ private struct FileRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .onTapGesture {
-                workspace.selectedFileURL = node.url
+                workspace.requestOpen(node.url)
             }
             .background(
                 RoundedRectangle(cornerRadius: 4)

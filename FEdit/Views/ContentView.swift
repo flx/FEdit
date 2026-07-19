@@ -124,6 +124,11 @@ struct ContentView: View {
                 CodeEditorView(
                     text: $workspace.editorText,
                     documentID: workspace.openFile?.url,
+                    // (syntax-highlighting): derived from the open file's extension at the
+                    // ContentView call site — `WorkspaceModel.openFile` has no `language` of its
+                    // own yet (load-bearing assumption #4), so this piggybacks on the same URL
+                    // that already drives `documentID`.
+                    language: SyntaxLanguage(fileExtension: workspace.openFile?.url.pathExtension),
                     onFirstVisibleLineChange: { line in
                         debugFirstVisibleLine = line
                         #if DEBUG

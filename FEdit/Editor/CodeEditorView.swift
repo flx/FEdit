@@ -34,6 +34,12 @@ struct CodeEditorView: NSViewRepresentable {
     /// (SPEC §6.1: "Undo enabled, reset when switching files").
     let documentID: URL?
 
+    /// The syntax-highlighting language for the currently open file (SPEC §6.3), piggybacking on
+    /// the same file identity as `documentID`. Defaults to `nil` (treated as `.plain`, i.e. the
+    /// highlighter's reset pass runs but no rules apply) so call sites that predate
+    /// (syntax-highlighting) keep compiling unchanged.
+    var language: SyntaxLanguage? = nil
+
     /// One-shot cursor-restore hook for (session-restore); defaults to `nil` so every other call
     /// site is unaffected. Consumed once per `documentID` change: clamped to the text length,
     /// the selection is applied synchronously, and `scrollRangeToVisible` is deferred to the next
@@ -86,12 +92,13 @@ struct CodeEditorView: NSViewRepresentable {
         textView.allowsUndo = true
         textView.isRichText = false
 
-        let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-        let textColor = NSColor(white: 0.1, alpha: 1)
-        textView.font = font
-        textView.textColor = textColor
-        textView.typingAttributes = [.font: font, .foregroundColor: textColor]
-        textView.backgroundColor = .white
+        // (syntax-highlighting): re-pointed at `Theme` so these defaults and the highlighter's
+        // reset pass (`Theme.baseAttributes`) can never drift apart — no visual change from the
+        // literals editor-core shipped with.
+        textView.font = Theme.editorFont
+        textView.textColor = Theme.text
+        textView.typingAttributes = [.font: Theme.editorFont, .foregroundColor: Theme.text]
+        textView.backgroundColor = Theme.background
 
         // Plain text only — every smart substitution, correction, and detector disabled
         // (criterion 5).
@@ -130,6 +137,14 @@ struct CodeEditorView: NSViewRepresentable {
         let coordinator = context.coordinator
         guard let textView = coordinator.textView else { return }
 
+        // (syntax-highlighting) ownership rule: written before the file-switch `highlightNow`
+        // below, so a debounced work item scheduled by a *previous* update always reads the
+        // language that matches whatever content it actually fires against — never a value
+        // captured from a struct copy. Without this ordering, switching from `a.swift` to `b.py`
+        // could highlight `b.py`'s content with Swift rules forever (the classic
+        // stale-representable bug).
+        coordinator.currentLanguage = language ?? .plain
+
         if documentID != coordinator.currentDocumentID {
             // File switch: full reload, undo reset, selection to either the restored cursor or
             // the top of the document.
@@ -140,6 +155,14 @@ struct CodeEditorView: NSViewRepresentable {
             // explicitly for v1 (criterion 6: switching files must never resurrect the previous
             // file's edits).
             textView.undoManager?.removeAllActions()
+
+            // (syntax-highlighting): cancel any pending debounced pass carried over from the
+            // previous file, then highlight the newly loaded content synchronously — no 150 ms
+            // flash of plain/stale-colored text, and no leftover attributes from the previous
+            // file ever appear (criterion 6).
+            coordinator.pendingHighlight?.cancel()
+            coordinator.pendingHighlight = nil
+            coordinator.highlightNow(textView)
 
             let fullLength = (textView.string as NSString).length
             if let cursorToRestore, !coordinator.hasConsumedCursorRestore {
@@ -186,6 +209,13 @@ struct CodeEditorView: NSViewRepresentable {
             textView.setSelectedRange(NSRange(location: min(oldLocation, newLength), length: 0))
             coordinator.rulerView?.invalidateLineNumbers()
             coordinator.isProgrammaticUpdate = false
+
+            // (syntax-highlighting): editor-core has two programmatic-content paths, and both
+            // are hooked — this is the second (external-change) path, same cancel-pending +
+            // synchronous-highlight treatment as the file-switch branch above.
+            coordinator.pendingHighlight?.cancel()
+            coordinator.pendingHighlight = nil
+            coordinator.highlightNow(textView)
         }
     }
 
@@ -202,6 +232,17 @@ struct CodeEditorView: NSViewRepresentable {
         var hasConsumedCursorRestore = false
         var isProgrammaticUpdate = false
 
+        /// (syntax-highlighting) ownership rule: the single source of truth a debounced/immediate
+        /// highlight pass reads at execution time. Written by `updateNSView` before any
+        /// `highlightNow` call in the same pass — never read from a captured `CodeEditorView`
+        /// struct copy (see the ownership note at the `updateNSView` call site).
+        var currentLanguage: SyntaxLanguage = .plain
+
+        /// The pending ~150 ms debounced highlight pass (criterion 5), if any. Exposed
+        /// (non-private) so `updateNSView`'s two programmatic-content paths can cancel it before
+        /// running a synchronous pass of their own (criterion 6).
+        var pendingHighlight: DispatchWorkItem?
+
         private var lastReportedFirstVisibleLine: Int?
         private var firstVisibleLineWorkItem: DispatchWorkItem?
 
@@ -211,12 +252,39 @@ struct CodeEditorView: NSViewRepresentable {
 
         deinit {
             firstVisibleLineWorkItem?.cancel()
+            pendingHighlight?.cancel()
             NotificationCenter.default.removeObserver(self)
         }
 
         func textDidChange(_ notification: Notification) {
             guard !isProgrammaticUpdate, let textView else { return }
             parent.text = textView.string
+            scheduleHighlight(for: textView)
+        }
+
+        /// Debounces a highlight pass ~150 ms after the last keystroke (criterion 5): cancels any
+        /// already-pending pass and reschedules, so a burst of characters produces exactly one
+        /// pass. `textDidChange(_:)` fires only for character edits — never for the attribute-only
+        /// pass this eventually runs — so this can never reschedule itself (criterion 8, no
+        /// feedback loop).
+        func scheduleHighlight(for textView: NSTextView) {
+            pendingHighlight?.cancel()
+            let workItem = DispatchWorkItem { [weak self, weak textView] in
+                guard let self, let textView else { return }
+                self.highlightNow(textView)
+            }
+            pendingHighlight = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150), execute: workItem)
+        }
+
+        /// Runs a full highlight pass immediately, using `currentLanguage` at the moment this is
+        /// called (never a value captured earlier). Attribute-only — `SyntaxHighlighter.highlight`
+        /// never calls `didChangeText()` or mutates characters — so this cannot itself trigger
+        /// `textDidChange(_:)` (criterion 8) and never moves the selection, so there is nothing to
+        /// restore here.
+        func highlightNow(_ textView: NSTextView) {
+            guard let textStorage = textView.textStorage else { return }
+            SyntaxHighlighter.highlight(textStorage, language: currentLanguage)
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {

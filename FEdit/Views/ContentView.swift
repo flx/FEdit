@@ -176,11 +176,19 @@ struct ContentView: View {
     }
 
     private var sidebarColumn: some View {
-        SidebarView(workspace: workspace)
+        VStack(spacing: 0) {
+            if !workspace.roots.isEmpty {
+                ColumnHeaderBar(title: workspace.roots.map { $0.url.lastPathComponent }.joined(separator: ", "))
+            }
+            SidebarView(workspace: workspace)
+        }
     }
 
     private var editorColumn: some View {
         VStack(spacing: 0) {
+            if let name = workspace.openFileName {
+                ColumnHeaderBar(title: name)
+            }
             if workspace.openFile != nil {
                 CodeEditorView(
                     text: $workspace.editorText,

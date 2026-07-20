@@ -116,4 +116,5 @@ enum LayoutMetrics {
     static let editorFractionMax: Double = 0.85
     static let dividerHitWidth: CGFloat = 5
     static let dividerLineWidth: CGFloat = 1
+    static let columnHeaderHeight: CGFloat = 28
 }

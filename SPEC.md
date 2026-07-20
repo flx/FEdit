@@ -40,6 +40,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 - **Preview:** exists **iff** the currently open file is Markdown. Takes the rest of the width.
 - Both divider positions are **persisted globally** (`UserDefaults`) and restored on next launch; they are shared across windows.
 - Dividers: 5 pt hit area, thin visible separator line, `resizeLeftRight` cursor on hover.
+- **Column header strips:** the sidebar and editor columns each carry a fixed-height header strip above their content — the sidebar strip shows the open folder name(s) (each root's last path component, comma-separated), the editor strip shows the open file's name. Both are hidden (no strip, no gap) when their column has nothing open. The preview column has no strip.
 
 ## 5. Folder sidebar
 
@@ -50,6 +51,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 - Context menu on a section header: **Remove from Sidebar** (does not touch the disk), **Refresh** (rescans all folders).
 - Adding a folder that is already open is a no-op.
 - With no folders open, the sidebar shows a placeholder with an "Add Folder to Window…" button (adds a folder to the current window).
+- The sidebar column's fixed top strip (§4, a name-only summary — each open root's last path component, comma-separated) is **distinct from and complements** these per-root section headers (full `~`-abbreviated path, head-truncated, Remove/Refresh menu); the section headers are unchanged.
 
 ### 5.2 Directory scanning
 - Recursive scan at add-time (and on Refresh). No file-system watching in v1 — refresh is manual.
@@ -61,7 +63,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 - Only files are selectable; clicking a file requests opening it (see §7). The open file's row is highlighted.
 
 ### 5.4 Filter mode (non-empty filter)
-- The search field sits at the top of the sidebar (standard rounded style, placeholder like `Filter files (e.g. .py OR .swift)`).
+- The search field (standard rounded style, placeholder like `Filter files (e.g. .py OR .swift)`) sits at the top of the sidebar's list content, below the column's folder-name header strip (§4) when one is shown — top-to-bottom order: folder-name strip → search field → list.
 - While the filter is non-empty, each section shows a **flat list of matching files as paths relative to that top-level folder** (e.g. `swift-source/main.swift`) — the top folder path is not repeated. A section with no matches shows a muted "No matches".
 
 ### 5.5 Filter query language
@@ -110,6 +112,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 
 - **Opening:** any file readable as text (UTF-8, fallback Latin-1). Files containing NUL bytes are treated as binary and refused with an alert. Read errors are alerted.
 - **Dirty tracking:** any edit marks the file dirty; the window subtitle shows an "Edited" marker.
+- The editor column's fixed top strip (§4) shows the open file's name, complementing (not replacing) the window `.navigationTitle`/`.navigationSubtitle`, which continue to show the name plus the "Edited" dirty marker.
 - **Save:** Cmd+S, atomic write, UTF-8. Write errors are alerted and the file stays dirty.
 - **Switching files with unsaved changes:**
   - If autosave is ON: save silently, then switch (a failed save aborts the switch).

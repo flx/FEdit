@@ -46,7 +46,6 @@ final class LineNumberRulerView: NSRulerView {
     }
 
     private let backgroundColor = NSColor(white: 0.95, alpha: 1)
-    private let separatorColor = NSColor(white: 0.8, alpha: 1)
     private let numberColor = NSColor.secondaryLabelColor
 
     private static let horizontalPadding: CGFloat = 4
@@ -131,8 +130,9 @@ final class LineNumberRulerView: NSRulerView {
 
         backgroundColor.setFill()
         bounds.fill()
-        separatorColor.setFill()
-        NSRect(x: bounds.maxX - 1, y: bounds.minY, width: 1, height: bounds.height).fill()
+        // No vertical gutter/text separator line: its top met the editor-column header strip at the
+        // file-name's x, reading as a hairline running up through the title. The gutter stays
+        // visually distinct by its light-gray background alone (Xcode-style).
 
         let nsString = textStorage.string as NSString
         let visibleRect = textView.visibleRect

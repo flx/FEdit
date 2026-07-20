@@ -40,7 +40,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 - **Preview:** exists **iff** the currently open file is Markdown. Takes the rest of the width.
 - Both divider positions are **persisted globally** (`UserDefaults`) and restored on next launch; they are shared across windows.
 - Dividers: 5 pt hit area, thin visible separator line, `resizeLeftRight` cursor on hover.
-- **Column header strips:** the sidebar and editor columns each carry a fixed-height header strip above their content — the sidebar strip shows the open folder name(s) (each root's last path component, comma-separated), the editor strip shows the open file's name. Both are hidden (no strip, no gap) when their column has nothing open. The preview column has no strip.
+- **Column header strips:** each column carries a fixed-height header strip above its content — the sidebar strip shows the open folder name(s) (each root's last path component, comma-separated), the editor strip shows the open file's name, and the preview column (Markdown only) carries a "Preview" strip so its content starts at the same vertical level as the editor. The sidebar and editor strips are hidden (no strip, no gap) when their column has nothing open; the preview strip shows whenever the preview column is present.
 
 ## 5. Folder sidebar
 
@@ -112,7 +112,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 
 - **Opening:** any file readable as text (UTF-8, fallback Latin-1). Files containing NUL bytes are treated as binary and refused with an alert. Read errors are alerted.
 - **Dirty tracking:** any edit marks the file dirty; the window subtitle shows an "Edited" marker.
-- The editor column's fixed top strip (§4) shows the open file's name, complementing (not replacing) the window `.navigationTitle`/`.navigationSubtitle`, which continue to show the name plus the "Edited" dirty marker.
+- The window `.navigationTitle` is always **"FEdit"** (not the file name — the open file's name is shown in the editor column's fixed top strip, §4). The window `.navigationSubtitle` still carries the "Edited" dirty marker.
 - **Save:** Cmd+S, atomic write, UTF-8. Write errors are alerted and the file stays dirty.
 - **Switching files with unsaved changes:**
   - If autosave is ON: save silently, then switch (a failed save aborts the switch).

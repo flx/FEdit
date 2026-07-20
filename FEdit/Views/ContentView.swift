@@ -124,7 +124,9 @@ struct ContentView: View {
         // dirty. Sidebar row taps route through `WorkspaceModel.requestOpen` directly — there is
         // no selection→load `.onChange` any more (editor-core's temporary hook is gone; see
         // `WorkspaceModel.selectedFileURL`'s doc comment for why writing it must stay inert).
-        .navigationTitle(workspace.openFileName ?? "FEdit")
+        // Window title is always "FEdit" — the open file's name is shown in the editor column's
+        // header strip (§4), not the titlebar. The subtitle keeps the "Edited" dirty marker (§7).
+        .navigationTitle("FEdit")
         .navigationSubtitle(workspace.openFile?.isDirty == true ? "Edited" : "")
         // Invisible: walks up to this window once mounted and installs the dirty-file guard on
         // its close button / Cmd+W (SPEC §7). See `WindowCloseGuard` for why this can't just
@@ -230,11 +232,17 @@ struct ContentView: View {
     }
 
     private var previewColumn: some View {
-        MarkdownPreviewView(
-            text: workspace.editorText,
-            fileURL: workspace.openFile?.url,
-            firstVisibleLine: editorFirstVisibleLine
-        )
+        // A "Preview" header strip so the preview content starts at the same vertical level as the
+        // editor (which carries the file-name strip). The preview column only appears for Markdown,
+        // so a file is always open here; the strip is unconditional.
+        VStack(spacing: 0) {
+            ColumnHeaderBar(title: "Preview")
+            MarkdownPreviewView(
+                text: workspace.editorText,
+                fileURL: workspace.openFile?.url,
+                firstVisibleLine: editorFirstVisibleLine
+            )
+        }
     }
 
     private func clampSidebar(_ value: Double) -> Double {

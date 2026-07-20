@@ -18,7 +18,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 
 ## 3. Windows
 
-- `WindowGroup`-based: **multiple editor windows** opened via File → Open Folder… (Cmd+N), which opens a new window and prompts for a folder that becomes the new window's sole root (Cancel leaves an empty window).
+- `WindowGroup`-based: **multiple editor windows** opened via File → Open Folder… (Cmd+O), which opens a new window and prompts for a folder that becomes the new window's sole root (Cancel leaves an empty window).
 - Each window owns its own independent state: folder list, filter text, open file, cursor.
 - Default window size 1100×700, minimum 700×400.
 - Window frames restored by the system's window restoration.
@@ -168,11 +168,11 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 
 | Menu item | Shortcut | Behavior |
 |---|---|---|
-| File → Open Folder… | Cmd+N | opens a new window and prompts for a folder (its sole root); Cancel leaves an empty window |
+| File → Open Folder… | Cmd+O | opens a new window and prompts for a folder (its sole root); Cancel leaves an empty window |
 | File → Add Folder to Window… | Cmd+Shift+O | add top-level folder(s) to the focused window |
 | File → Save | Cmd+S | save open file (disabled when none/clean; autosave is unconditional, §7) |
 
-Commands act on the focused window's state (`focusedSceneObject`), except **Open Folder… (Cmd+N)**, which is app-level — it creates a new window and is not focused-window-scoped.
+Commands act on the focused window's state (`focusedSceneObject`), except **Open Folder… (Cmd+O)**, which is app-level — it creates a new window and is not focused-window-scoped.
 
 ## 11. Error handling & edge cases
 

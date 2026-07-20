@@ -92,7 +92,7 @@ struct ViewCommands: Commands {
 struct FileCommands: Commands {
     @FocusedObject private var workspace: WorkspaceModel?
 
-    // Opens a new editor window for the "Open Folder…" (Cmd+N) flow — app-level, so it works
+    // Opens a new editor window for the "Open Folder…" (Cmd+O) flow — app-level, so it works
     // with no window focused (e.g. after closing the last window).
     @Environment(\.openWindow) private var openWindow
 
@@ -108,7 +108,7 @@ struct FileCommands: Commands {
                 LaunchCoordinator.shared.pendingNewWindowPicks += 1
                 openWindow(id: "editor")
             }
-            .keyboardShortcut("n", modifiers: [.command])
+            .keyboardShortcut("o", modifiers: [.command])
         }
 
         CommandGroup(after: .newItem) {

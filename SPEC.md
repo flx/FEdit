@@ -54,7 +54,10 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 - The sidebar column's fixed top strip (§4, a name-only summary — each open root's last path component, comma-separated) is **distinct from and complements** these per-root section headers (full `~`-abbreviated path, head-truncated, Remove/Refresh menu); the section headers are unchanged.
 
 ### 5.2 Directory scanning
-- Recursive scan at add-time (and on Refresh). No file-system watching in v1 — refresh is manual.
+- Recursive scan at add-time and on Refresh.
+- **File-system watching (automatic refresh):**
+  - **Open file:** watched with a precise vnode `DispatchSource`. An external change is reflected automatically, no manual Refresh. If the buffer is **clean**, it is reloaded from disk (caret preserved at its UTF-16 offset, clamped into the new length; scroll position — the first visible line — preserved). If the buffer is **dirty**, the in-editor version is kept (no clobber; SPEC §11 last-writer-wins) and a subtle **"changed on disk"** marker is shown in the window subtitle ("Edited — changed on disk"); the next save (or, under always-on autosave, the ~0.75 s flush) writes the buffer over the external version and clears the marker. FEdit's own writes (Cmd+S and every autosave, all through the single save path) are recognized by an `(inode, size, mtime)` signature and never mistaken for an external change. The reload reads the whole file synchronously (bounded by the 100 MB open cap). Delete/recreate does not blank the editor — the buffer is retained (a later save recreates the file). Promptness/timing is specified for local APFS/HFS+ volumes; on coarse-mtime volumes (SMB/NFS/FAT/exFAT) a same-size in-place external write within one mtime tick of FEdit's own write can be missed (accepted, last-writer-wins).
+  - **Sidebar roots:** each root is watched recursively with FSEvents; an external add/remove (including in subdirectories) is reflected in the tree without manual Refresh, debounced so a burst of changes coalesces into a single rescan. Removing a root stops watching it. Manual Refresh remains.
 - Hidden files (dotfiles) are skipped. Additionally skipped directory names: `node_modules`, `.build`, `DerivedData`.
 - Sort order within a directory: folders first, then files, each alphabetically (`localizedStandardCompare`).
 
@@ -168,14 +171,14 @@ Commands act on the focused window's state (`focusedSceneObject`), except **Open
 ## 11. Error handling & edge cases
 
 - Binary or unreadable file selected → alert, selection stays on the previous file.
-- File deleted/renamed externally while open → save recreates it at the old path (no watching in v1); refresh updates the tree.
+- File deleted/renamed externally while open → the buffer is retained (not blanked) and a save recreates it at the old path; the tree is watched (§5.2) and refreshes automatically, while after an external delete the open-file watcher goes dormant and auto-detection re-establishes when the file reappears (or on the next save/switch), and manual Refresh still updates the tree.
 - Empty file, file without trailing newline, very long single line (wraps), CRLF content (opened as-is) — must not crash; line numbering counts `\n`.
 - Folder with thousands of files: scan is recursive and synchronous in v1 — acceptable; skip-list keeps the worst offenders out. (If it proves slow, move scan off the main thread — behavior otherwise unchanged.)
 - Two windows editing the same file: allowed, last save wins; no coordination in v1.
 
 ## 12. Non-goals (v1)
 
-Tabs, split editors, find/replace, file create/rename/delete from the sidebar, git integration, LSP/completion, themes/dark mode, printing, preview→editor scroll sync, file-system watching, encodings beyond UTF-8/Latin-1 fallback.
+Tabs, split editors, find/replace, file create/rename/delete from the sidebar, git integration, LSP/completion, themes/dark mode, printing, preview→editor scroll sync, encodings beyond UTF-8/Latin-1 fallback. (File-system watching of the open file and sidebar roots is now in v1 — see §5.2 — and no longer a non-goal.)
 
 ## 13. Planned project structure
 
@@ -186,6 +189,8 @@ FEdit/
   Models/WorkspaceModel.swift   per-window state: roots, open file, dirty/save/autosave logic
   Models/FileNode.swift         tree node + recursive scanner
   Models/FilterQuery.swift      boolean filter parser/evaluator
+  Models/FileWatcher.swift      open-file vnode watcher + FileSignature (self-write key)
+  Models/DirectoryTreeWatcher.swift  recursive FSEvents watcher for sidebar roots
   Views/ContentView.swift       three-column layout, dividers, persistence wiring
   Views/SidebarView.swift       search field, tree mode, filtered flat mode
   Editor/CodeEditorView.swift   NSTextView wrapper (representable + coordinator)

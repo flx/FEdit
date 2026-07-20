@@ -24,7 +24,7 @@ import Foundation
 
 /// A single entry in the folder sidebar's directory tree (SPEC §5.2–§5.3). Value type so the
 /// tree can be scanned synchronously and handed straight to `OutlineGroup`.
-struct FileNode: Identifiable {
+struct FileNode: Identifiable, Equatable {
     let url: URL
     let name: String
     let isDirectory: Bool

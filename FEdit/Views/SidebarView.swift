@@ -111,7 +111,9 @@ struct SidebarView: View {
                     workspace.removeRoot(root)
                 }
                 Button("Refresh") {
-                    workspace.refreshAll()
+                    // Explicit user action: force a republish even when the tree is unchanged, so
+                    // Refresh is never a silent no-op (the watcher path keeps the diff-guard).
+                    workspace.refreshAll(force: true)
                 }
             }
     }

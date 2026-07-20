@@ -87,6 +87,16 @@ final class WorkspaceModel: ObservableObject {
     /// The file currently loaded into the editor, or `nil` if none (SPEC §6.1, §7).
     @Published var openFile: OpenFile?
 
+    /// (external-change-watch) Raised when an external write lands on the open file **while the
+    /// buffer has unsaved edits** — the in-editor version is kept (no clobber, SPEC §11
+    /// last-writer-wins) and this drives Tier 2's "changed on disk" subtitle marker. Set only in
+    /// the dirty branch of `fileDidChangeOnDisk`; cleared by `applyLoadedFile` (file switch), by
+    /// `reloadOpenFileFromDisk` (clean reload), and by `saveOpenFile`'s success branch (the write
+    /// resolves the conflict in-editor's favor). Near-cosmetic under always-on autosave: the
+    /// ~0.75 s flush writes the dirty buffer and clears this on its own, so it is reliably visible
+    /// only during continuous typing that keeps the buffer dirty across the external write.
+    @Published var openFileChangedOnDisk = false
+
     /// The editor's last-reported caret offset (UTF-16, `NSRange.location`), sunk here by
     /// (session-restore) via `noteCursorMoved(_:)`. Drives `snapshotJSON()`'s `cursorLocation`.
     @Published private(set) var cursorLocation: Int = 0
@@ -102,6 +112,33 @@ final class WorkspaceModel: ObservableObject {
     /// `cancelPendingAutosave()` on a file switch / explicit save, and its work item re-checks
     /// dirtiness at fire time so a straggler that outlives a switch or reload is a no-op.
     private var pendingAutosave: DispatchWorkItem?
+
+    /// (external-change-watch, Tier 1) The vnode watcher on the one open file. Its `onChange` is
+    /// delivered on the main queue, so `MainActor.assumeIsolated` (the same idiom as the
+    /// resign-active observer and `WindowCloseGuardProxy`) can hop straight into the `@MainActor`
+    /// flush consumer. `lazy` because the callback captures `self`, which a stored-property default
+    /// initializer cannot reference; it is assigned exactly once on first file open. Cleans up via
+    /// its own `deinit` (its source uses `[weak self]`, so it never keeps this model alive).
+    private lazy var fileWatcher = FileWatcher(onChange: { [weak self] in
+        // Delivered on the main queue by the wrapper, so this runs on the main actor.
+        MainActor.assumeIsolated { self?.fileDidChangeOnDisk() }
+    })
+
+    /// (external-change-watch, Tier 1) The signature of the content FEdit itself last put on disk
+    /// (via `saveOpenFile`) or last loaded (via `applyLoadedFile`). It is the self-write suppression
+    /// key: a vnode event whose current signature equals this is an echo of FEdit's own write and is
+    /// ignored; an unequal signature is a genuine external change.
+    private var lastWriteSignature: FileSignature?
+
+    /// (external-change-watch, Tier 3) The recursive FSEvents watcher on the sidebar roots. Its
+    /// `onChange` carries the changed-path batch (delivered on the main queue), which
+    /// `handleTreeChange` filters through the tree-skip gate before deciding whether to rescan.
+    /// `lazy` for the same reason as `fileWatcher` (the callback captures `self`); (re)pointed from
+    /// `addFolders`/`removeRoot`. Cleans up via its own `deinit`.
+    private lazy var treeWatcher = DirectoryTreeWatcher(onChange: { [weak self] paths in
+        // Delivered on the main queue by the wrapper, so this runs on the main actor.
+        MainActor.assumeIsolated { self?.handleTreeChange(paths) }
+    })
 
     /// Token for the `NSApplication.didResignActiveNotification` observer that flushes a dirty
     /// buffer the moment the user leaves FEdit (Tier 3), collapsing the leave-app exposure window
@@ -198,6 +235,12 @@ final class WorkspaceModel: ObservableObject {
             existingResolvedPaths.insert(resolvedPath)
             roots.append(FileNode.scan(directory: standardized))
         }
+
+        // (external-change-watch, Tier 3) Re-point the recursive watcher at the current root set —
+        // one of the two sites (with `removeRoot`) where that set changes. Safe on the
+        // session-restore path too: the watcher uses `kFSEventStreamEventIdSinceNow`, so this does
+        // not replay historical events into a launch-time rescan.
+        treeWatcher.watch(roots: roots.map(\.url))
     }
 
     /// Removes `root` from the sidebar. Disk untouched. Clears `selectedFileURL` if it points
@@ -209,11 +252,123 @@ final class WorkspaceModel: ObservableObject {
            selectedFileURL.path == root.url.path || selectedFileURL.path.hasPrefix(root.url.path + "/") {
             self.selectedFileURL = nil
         }
+        // (external-change-watch, Tier 3) Re-point the watcher at the reduced root set so the
+        // removed root is no longer watched (an empty set tears the stream down entirely).
+        treeWatcher.watch(roots: roots.map(\.url))
     }
 
-    /// Rescans every root in place (SPEC §5.1: Refresh rescans all folders).
-    func refreshAll() {
-        roots = roots.map { FileNode.scan(directory: $0.url) }
+    /// Rescans every root in place (SPEC §5.1: Refresh rescans all folders). Republishes `roots`
+    /// **only when the rescanned structure actually differs** (external-change-watch, Tier 3): a
+    /// watcher-driven rescan whose surviving event turned out structure-neutral (e.g. an in-place
+    /// content write to an unopened file) then does not thrash the sidebar or re-fire
+    /// (session-restore)'s snapshot `.onChange`. The root URL set is unchanged, so the tree watcher
+    /// needs no re-point here.
+    ///
+    /// `force` bypasses the diff-guard and always republishes: the explicit user "Refresh" action
+    /// (SidebarView) must feel responsive and re-publish unconditionally, whereas the watcher/tree
+    /// paths call it with the default so a structure-neutral event doesn't thrash the sidebar.
+    func refreshAll(force: Bool = false) {
+        let rescanned = roots.map { FileNode.scan(directory: $0.url) }
+        guard force || rescanned != roots else { return }
+        roots = rescanned
+    }
+
+    /// (external-change-watch, Tier 3) The tree watcher's main-actor consumer + skip gate. FSEvents
+    /// has no self-write suppression, and under always-on autosave the open file is rewritten every
+    /// ~0.75 s while typing (with git-status refresh shelling out to `git`, which writes under
+    /// `.git`, on save/activation) — so an ungated stream would fire a full recursive main-thread
+    /// rescan + whole-sidebar re-diff on FEdit's own routine writes. Filter the batch first:
+    /// - drop the open file's own path (its content is handled by the Tier 1 vnode watcher and it
+    ///   changes no tree *structure*);
+    /// - drop any path inside the scanner skip-set (dotfiles/hidden — covering `.git`/`.build` — and
+    ///   `FileNode.skippedDirectoryNames`), so a rescan would not surface it anyway.
+    /// Only if a path survives is a rescan worth doing; `refreshAll` then republishes only on a real
+    /// structural diff.
+    private func handleTreeChange(_ paths: [String]) {
+        // Canonicalize the gate's comparison paths (Fix 3) so an event under a firmlink root still
+        // matches: FSEvents already delivers realpaths (`/private/tmp/...`), while
+        // `resolvingSymlinksInPath()` deliberately keeps the `/tmp`, `/var`, `/etc` firmlinks
+        // unresolved — without canonicalizing the roots/open-file side, an event under such a root
+        // fails the prefix match and is wrongly treated as outside-all-roots (no rescan ever). Only
+        // the roots and the open-file path (a handful) need `realpath(3)`; the FSEvents batch is
+        // already canonical, so we do NOT syscall over every changed path — that would pay realpath
+        // cost on thousands of paths (npm install, git checkout) the skip gate then discards.
+        let openURL = openFile?.url
+        let openFilePath = openURL.map { canonicalPath($0.resolvingSymlinksInPath().path) }
+        let rootPaths = roots.map { canonicalPath($0.url.resolvingSymlinksInPath().path) }
+        let changedPaths = paths
+
+        // (Fix 1) Recreate-after-delete recovery. An external `rm` of the open file drives the vnode
+        // `fileWatcher` dormant (`isActive == false`) once its re-arm retries give up, and nothing
+        // else re-arms it — so a later external recreate + edit would go undetected. The tree watcher
+        // still covers the open file's parent (when it is under a watched root), so if the open
+        // file's own path reappears in this batch while the vnode watcher is dormant, re-establish it
+        // and re-run the change consumer (which stats the recreated file and, via the
+        // signature/content gate, reloads a clean buffer or raises the indicator on a dirty one).
+        // This runs independently of the skip gate below, which drops the open file's own path. An
+        // open file outside every current root can't be recovered this way — a documented limitation
+        // (SPEC §11), left as-is here rather than crashing. The `isActive == false` guard prevents
+        // double-arming an already-active watcher.
+        if let openURL, let openFilePath, !fileWatcher.isActive,
+           rootPaths.contains(where: { openFilePath == $0 || openFilePath.hasPrefix($0 + "/") }),
+           changedPaths.contains(openFilePath) {
+            fileWatcher.watch(openURL.resolvingSymlinksInPath())
+            fileDidChangeOnDisk()
+        }
+
+        let hasSurvivor = changedPaths.contains { path in
+            if let openFilePath, path == openFilePath { return false }
+            // (Fix 2) `Data.write(options: .atomic)` drops a sibling temp named
+            // `<openFileName>.sb-XXXXXXXX-YYYYYY` next to the open file; it is neither the open-file
+            // path nor a skip-dir, so without this every autosave/save would force a full recursive
+            // main-thread rescan. Scoped to the open file's own temp so genuine external atomic saves
+            // of other files still trigger a rescan.
+            if let openFilePath, isOwnAtomicWriteTemp(path, openFilePath: openFilePath) { return false }
+            return !isSkippedTreePath(path, rootPaths: rootPaths)
+        }
+        guard hasSurvivor else { return }
+
+        refreshAll()
+    }
+
+    /// Whether a rescan would ignore `path` — mirroring `FileNode`'s scan skip rules so the
+    /// watcher's notion of "interesting" matches exactly what a rescan surfaces. A path outside every
+    /// watched root is skipped (nothing a rescan touches); otherwise only the components **below**
+    /// the containing root are tested (so a root that itself lives under a hidden ancestor is not
+    /// wrongly filtered out), skipping any hidden (`.`-prefixed) component — covering `.git`,
+    /// `.build`, and dotfiles — or any name in `FileNode.skippedDirectoryNames`.
+    private func isSkippedTreePath(_ path: String, rootPaths: [String]) -> Bool {
+        guard let root = rootPaths.first(where: { path == $0 || path.hasPrefix($0 + "/") }) else {
+            return true
+        }
+        let relativeComponents = path.dropFirst(root.count).split(separator: "/")
+        for component in relativeComponents {
+            if component.hasPrefix(".") { return true }
+            if FileNode.skippedDirectoryNames.contains(String(component)) { return true }
+        }
+        return false
+    }
+
+    /// (external-change-watch, Fix 2) Whether `path` is FEdit's own `Data.write(options: .atomic)`
+    /// temp for the open file — a sibling in the open file's parent directory whose last component
+    /// is `<openFileLastComponent>.sb-…`. Both arguments are already canonicalized by the caller, so
+    /// the parent-directory equality is a straight string compare.
+    private func isOwnAtomicWriteTemp(_ path: String, openFilePath: String) -> Bool {
+        guard (path as NSString).deletingLastPathComponent
+            == (openFilePath as NSString).deletingLastPathComponent else { return false }
+        let name = (path as NSString).lastPathComponent
+        let openName = (openFilePath as NSString).lastPathComponent
+        return name.hasPrefix(openName + ".sb-")
+    }
+
+    /// (external-change-watch, Fix 3) Fully resolves `path` with `realpath(3)` — including the
+    /// `/tmp`, `/var`, `/etc` firmlinks that `resolvingSymlinksInPath()` deliberately leaves
+    /// unresolved — so the tree-skip gate compares FSEvents realpaths against consistently
+    /// canonicalized root/open-file paths. Idempotent on already-resolved paths; falls back to the
+    /// raw path when the target no longer exists (a deleted atomic-write temp, or mid-rename).
+    private func canonicalPath(_ path: String) -> String {
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+        return realpath(path, &buf) != nil ? String(cString: buf) : path
     }
 
     /// Reads `url`'s contents as text (SPEC §7): NUL bytes anywhere in the data mean the file is
@@ -260,6 +415,15 @@ final class WorkspaceModel: ObservableObject {
         cancelPendingAutosave()
         openFile = OpenFile(url: url, text: text, isDirty: false)
         selectedFileURL = url
+        // (external-change-watch, Tier 1) (Re)arm the vnode watcher on the freshly loaded file and
+        // baseline the self-write key to the just-loaded content (a change *after* load differs
+        // from it). The symlink-resolved path is used for both, matching `saveOpenFile`'s write
+        // target so watcher, signature, and writer all track the same inode. A reload does **not**
+        // route through here — that would re-arm onto an unchanged fd; see `reloadOpenFileFromDisk`.
+        let resolved = url.resolvingSymlinksInPath()
+        fileWatcher.watch(resolved)
+        lastWriteSignature = FileSignature.of(resolved)
+        openFileChangedOnDisk = false
     }
 
     /// Loads `url` into the editor unconditionally — no dirty check, no no-op-on-already-open
@@ -286,6 +450,62 @@ final class WorkspaceModel: ObservableObject {
     private func silentlyLoadFile(_ url: URL) {
         guard let text = try? loadText(from: url) else { return }
         applyLoadedFile(url: url, text: text)
+    }
+
+    /// (external-change-watch, Tier 1) The `fileWatcher` flush consumer, invoked on the main actor
+    /// once per coalesced vnode event. Decides between echo-suppress, no-op, clean reload, and
+    /// dirty-conflict, in that order:
+    ///
+    /// 1. Nothing open ⇒ ignore.
+    /// 2. `stat` fails ⇒ the file is currently gone (external delete, or mid-rename): retain the
+    ///    buffer, do nothing (SPEC §11: a later save recreates it at the old path).
+    /// 3. **Self-write gate.** Current signature equals `lastWriteSignature` ⇒ this is the content
+    ///    FEdit last wrote or loaded (Cmd+S / autosave / load); ignore. This is what keeps saves and
+    ///    autosaves silent even while the buffer runs ahead of disk during active autosaved editing.
+    /// 4. Read failure (transient, or the external file is now binary / over the 100 MB cap) ⇒ skip;
+    ///    a later event retries.
+    /// 5. Disk content byte-identical to the buffer (external touch, or an external write of what we
+    ///    already have) ⇒ rebaseline and do nothing. This sits *after* the step-3 gate, so it only
+    ///    suppresses a needless reload — it can never recover a change the signature gate dropped.
+    /// 6. Genuine external change: clean buffer ⇒ reload (external wins); dirty buffer ⇒ keep the
+    ///    in-editor version (no clobber) and raise `openFileChangedOnDisk`, rebaselining the key so
+    ///    the same external state does not re-fire the indicator on the next coalesced event.
+    func fileDidChangeOnDisk() {
+        guard let file = openFile else { return }
+
+        let resolved = file.url.resolvingSymlinksInPath()
+        guard let currentSignature = FileSignature.of(resolved) else { return }
+        guard currentSignature != lastWriteSignature else { return }
+        guard let diskText = try? loadText(from: file.url) else { return }
+
+        if diskText == file.text {
+            lastWriteSignature = currentSignature
+            openFileChangedOnDisk = false
+            return
+        }
+
+        if file.isDirty {
+            openFileChangedOnDisk = true
+            lastWriteSignature = currentSignature
+        } else {
+            reloadOpenFileFromDisk(text: diskText, signature: currentSignature)
+        }
+    }
+
+    /// (external-change-watch, Tier 1) The clean-buffer reload path. Deliberately does **not** route
+    /// through `applyLoadedFile` (which re-arms the watcher onto an unchanged fd) — the fd is fine,
+    /// only the buffer changes. Cancels any pending autosave **first**, before replacing `openFile`,
+    /// so no straggler debounce survives the reload and later writes stale pre-reload text over the
+    /// just-loaded content (the coordination-seam hard requirement). Replaces the buffer in place
+    /// with the **same URL** so the editor's `documentID` is unchanged and `CodeEditorView` takes
+    /// its external-change branch (caret clamped + scroll preserved), not the file-switch branch.
+    /// The just-read on-disk signature becomes the new baseline.
+    func reloadOpenFileFromDisk(text: String, signature: FileSignature) {
+        cancelPendingAutosave()
+        guard let file = openFile else { return }
+        openFile = OpenFile(url: file.url, text: text, isDirty: false)
+        lastWriteSignature = signature
+        openFileChangedOnDisk = false
     }
 
     /// The sidebar's single entry point for opening a file (both tree rows and filter-query's
@@ -450,12 +670,22 @@ final class WorkspaceModel: ObservableObject {
             // write replaces whatever is at the destination path with a new regular file, so
             // writing to `file.url` directly would replace a symlink with a plain file instead
             // of updating its target; resolving symlinks first writes through to the real path.
-            try Data(file.text.utf8).write(to: file.url.resolvingSymlinksInPath(), options: .atomic)
+            let resolved = file.url.resolvingSymlinksInPath()
+            try Data(file.text.utf8).write(to: resolved, options: .atomic)
             file.isDirty = false
             openFile = file
-            // The single shared post-write success branch: (external-change-watch) will hang its
-            // `FileSignature` echo-suppression capture here when it ships. This item captures
-            // nothing — it only cancels the now-redundant pending debounce.
+            // (external-change-watch, Tier 1) The single shared post-write success branch, reached
+            // by Cmd+S, the switch/close/quit flush, **and** the ~0.75 s debounced autosave — so
+            // every write rebaselines the self-write key here. Capturing the signature *after* the
+            // write accepts a microscopic race (an external write between write and stat is read as
+            // the baseline and missed for that one change) per SPEC §11 last-writer-wins. Clear the
+            // conflict flag (the write resolves it in-editor's favor), and re-arm the watcher only
+            // if it went dormant — e.g. after an external delete this save has just re-created.
+            lastWriteSignature = FileSignature.of(resolved)
+            openFileChangedOnDisk = false
+            if !fileWatcher.isActive {
+                fileWatcher.watch(resolved)
+            }
             cancelPendingAutosave()
             return true
         } catch {

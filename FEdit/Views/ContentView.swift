@@ -131,7 +131,7 @@ struct ContentView: View {
         // Window title is always "FEdit" — the open file's name is shown in the editor column's
         // header strip (§4), not the titlebar. The subtitle keeps the "Edited" dirty marker (§7).
         .navigationTitle("FEdit")
-        .navigationSubtitle(workspace.openFile?.isDirty == true ? "Edited" : "")
+        .navigationSubtitle(subtitleText)
         // Invisible: walks up to this window once mounted and installs the dirty-file guard on
         // its close button / Cmd+W (SPEC §7). See `WindowCloseGuard` for why this can't just
         // replace `window.delegate`.
@@ -250,6 +250,19 @@ struct ContentView: View {
                 firstVisibleLine: editorFirstVisibleLine
             )
         }
+    }
+
+    // (external-change-watch) Tier 2: the window subtitle is the whole "changed on disk" indicator
+    // for v1 (SPEC §5.2) — no dedicated badge or reload/keep-mine affordance, which under always-on
+    // autosave would rarely be seen (the ~0.75 s flush resolves the conflict and clears the flag).
+    // A dirty conflict reads "Edited — changed on disk"; a plain dirty buffer stays "Edited"; a
+    // clean buffer stays "" (the conflict flag is only ever raised while dirty).
+    private var subtitleText: String {
+        let isDirty = workspace.openFile?.isDirty == true
+        if isDirty && workspace.openFileChangedOnDisk {
+            return "Edited — changed on disk"
+        }
+        return isDirty ? "Edited" : ""
     }
 
     private func clampSidebar(_ value: Double) -> Double {

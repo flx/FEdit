@@ -235,16 +235,23 @@ struct CodeEditorView: NSViewRepresentable {
             coordinator.currentDocumentID = documentID
             coordinator.isProgrammaticUpdate = false
         } else if textView.string != text {
-            // Speculative external-change path: kept but no shipped item drives this branch yet.
-            // Caret is clamped into the new text; undo is deliberately left untouched — this is
-            // not a file switch.
+            // (external-change-watch, Tier 1) External-change reload applier: the model replaced
+            // `openFile.text` with `documentID` unchanged (a clean-buffer reload via
+            // `reloadOpenFileFromDisk`), so `updateNSView` lands here rather than the file-switch
+            // branch. Preserve the caret (clamped into the new length) and the scroll position (the
+            // first-visible line re-pinned after relayout), reusing (editor-font-zoom)'s anchor
+            // helpers. Undo is deliberately left untouched — this is not a file switch. Wrapped in
+            // `isProgrammaticUpdate` so the swap never round-trips through `textDidChange` to mark
+            // the buffer dirty (load-bearing: a reload must leave a clean buffer clean).
             let oldLocation = textView.selectedRange().location
+            // Capture the scroll anchor *before* the swap, off the old layout.
+            let anchorChar = coordinator.firstVisibleCharIndex(textView)
             coordinator.isProgrammaticUpdate = true
             textView.string = text
             let newLength = (text as NSString).length
-            textView.setSelectedRange(NSRange(location: min(oldLocation, newLength), length: 0))
+            let clamped = min(oldLocation, newLength)
+            textView.setSelectedRange(NSRange(location: clamped, length: 0))
             coordinator.rulerView?.invalidateLineNumbers()
-            coordinator.isProgrammaticUpdate = false
 
             // (syntax-highlighting): editor-core has two programmatic-content paths, and both
             // are hooked — this is the second (external-change) path, same cancel-pending +
@@ -252,6 +259,19 @@ struct CodeEditorView: NSViewRepresentable {
             coordinator.pendingHighlight?.cancel()
             coordinator.pendingHighlight = nil
             coordinator.highlightNow(textView)
+
+            // Re-pin the previously first-visible line to the viewport top after the swap+relayout
+            // (unchanged when the text above the caret is unchanged); same anchor helper the zoom
+            // block uses.
+            coordinator.scrollCharToTop(textView, characterIndex: anchorChar)
+            coordinator.isProgrammaticUpdate = false
+
+            // Report the clamped caret so (session-restore)'s `cursorLocation` can't persist an
+            // out-of-range offset after a *truncating* reload. Deferred one runloop pass (the
+            // callback writes @State), matching the file-switch branch.
+            DispatchQueue.main.async {
+                onCursorChange?(clamped)
+            }
         }
 
         // (editor-font-zoom) Independent of the branches above (an `if`, not `else if`): a

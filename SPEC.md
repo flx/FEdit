@@ -18,7 +18,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 
 ## 3. Windows
 
-- `WindowGroup`-based: **multiple editor windows** via File → New Window (Cmd+N).
+- `WindowGroup`-based: **multiple editor windows** opened via File → Open Folder… (Cmd+N), which opens a new window and prompts for a folder that becomes the new window's sole root (Cancel leaves an empty window).
 - Each window owns its own independent state: folder list, filter text, open file, cursor.
 - Default window size 1100×700, minimum 700×400.
 - Window frames restored by the system's window restoration.
@@ -44,12 +44,12 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 ## 5. Folder sidebar
 
 ### 5.1 Top-level folders
-- Added via **File → Open Folder…** (Cmd+Shift+O), `NSOpenPanel`, directories only, multi-select allowed.
+- Added to the focused window via **File → Add Folder to Window…** (Cmd+Shift+O), `NSOpenPanel`, directories only, multi-select allowed.
 - Multiple top-level folders can be open at once; each is a section in the sidebar list.
 - Section header shows the folder path abbreviated with `~` for the home directory (e.g. `~/Programming/swift/FEdit`), truncated head-first if too long.
 - Context menu on a section header: **Remove from Sidebar** (does not touch the disk), **Refresh** (rescans all folders).
 - Adding a folder that is already open is a no-op.
-- With no folders open, the sidebar shows a placeholder with an "Open Folder…" button.
+- With no folders open, the sidebar shows a placeholder with an "Add Folder to Window…" button (adds a folder to the current window).
 
 ### 5.2 Directory scanning
 - Recursive scan at add-time (and on Refresh). No file-system watching in v1 — refresh is manual.
@@ -160,12 +160,12 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 
 | Menu item | Shortcut | Behavior |
 |---|---|---|
-| File → New Window | Cmd+N | standard |
-| File → Open Folder… | Cmd+Shift+O | add top-level folder(s) to the focused window |
+| File → Open Folder… | Cmd+N | opens a new window and prompts for a folder (its sole root); Cancel leaves an empty window |
+| File → Add Folder to Window… | Cmd+Shift+O | add top-level folder(s) to the focused window |
 | File → Save | Cmd+S | save open file (disabled when none) |
 | File → Autosave on File Switch | — | checkmark toggle, global |
 
-Commands act on the focused window's state (`focusedSceneObject`).
+Commands act on the focused window's state (`focusedSceneObject`), except **Open Folder… (Cmd+N)**, which is app-level — it creates a new window and is not focused-window-scoped.
 
 ## 11. Error handling & edge cases
 

@@ -34,7 +34,10 @@ struct FEditApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        // Value-less `WindowGroup(id:)` + `openWindow(id:)` opens a *new* window per Cmd+N call
+        // (no `openWindow(value:)` dedup that would reuse a window / restructure the shipped
+        // `@SceneStorage` restore). See LaunchCoordinator / FileCommands for the new-window flow.
+        WindowGroup(id: "editor") {
             ContentView()
                 .frame(minWidth: 700, minHeight: 400)
         }
@@ -51,13 +54,31 @@ struct FEditApp: App {
 struct FileCommands: Commands {
     @FocusedObject private var workspace: WorkspaceModel?
 
+    // Opens a new editor window for the "Open Folder…" (Cmd+N) flow — app-level, so it works
+    // with no window focused (e.g. after closing the last window).
+    @Environment(\.openWindow) private var openWindow
+
     // Same `UserDefaults` key the model reads/writes directly (`WorkspaceModel.autosaveOnFileSwitch`)
     // — this `@AppStorage` is just the menu's live view onto it, not a second source of truth.
     @AppStorage(SettingsKey.autosaveOnFileSwitch) private var autosaveOnFileSwitch = false
 
     var body: some Commands {
-        CommandGroup(after: .newItem) {
+        // Replace SwiftUI's default "New Window" (which `.newItem` auto-installs at Cmd+N) with
+        // "Open Folder…": creates a fresh empty window and flags intent via the launch mailbox so
+        // that window presents the folder picker on appear (drained in ContentView). App-level —
+        // no `.disabled` — since creating a window must work with no window focused. The increment
+        // runs on the main actor immediately before `openWindow`, so the new window's appear
+        // observes it.
+        CommandGroup(replacing: .newItem) {
             Button("Open Folder…") {
+                LaunchCoordinator.shared.pendingNewWindowPicks += 1
+                openWindow(id: "editor")
+            }
+            .keyboardShortcut("n", modifiers: [.command])
+        }
+
+        CommandGroup(after: .newItem) {
+            Button("Add Folder to Window…") {
                 workspace?.presentOpenPanel()
             }
             // Lowercase "o" plus explicit `.shift` — the uppercase-"O"-plus-explicit-shift

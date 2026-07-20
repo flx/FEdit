@@ -87,7 +87,7 @@ struct SidebarView: View {
         VStack(spacing: 12) {
             Text("No folders open")
                 .foregroundStyle(.secondary)
-            Button("Open Folder…") {
+            Button("Add Folder to Window…") {
                 workspace.presentOpenPanel()
             }
         }

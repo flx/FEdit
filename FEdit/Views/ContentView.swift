@@ -111,7 +111,8 @@ struct ContentView: View {
             }
         }
         // Exposes this window's workspace to `FileCommands` via `@FocusedObject`, so
-        // File → Open Folder…/Save always target the focused window (SPEC §10).
+        // File → Add Folder to Window…/Save always target the focused window (SPEC §10).
+        // (Open Folder…/Cmd+N is app-level — it creates a new window — and is not scoped here.)
         .focusedSceneObject(workspace)
         // Window title/subtitle (SPEC §7): the open file's name, with an "Edited" marker while
         // dirty. Sidebar row taps route through `WorkspaceModel.requestOpen` directly — there is
@@ -137,6 +138,18 @@ struct ContentView: View {
             guard !didRestore else { return }
             didRestore = true
             workspace.restore(fromJSON: workspaceSnapshot)
+            // "Open Folder…" (Cmd+N) new-window flow: the menu command incremented the launch
+            // mailbox immediately before opening this window. Drain exactly one pending pick if
+            // this window is genuinely pristine (nothing restored above), then present the
+            // folder picker one runloop turn later so the window is on screen first — Cancel
+            // then trivially leaves an empty window. Restored / blank-startup windows (counter
+            // == 0) skip this, so today's startup behavior is unchanged.
+            if LaunchCoordinator.shared.pendingNewWindowPicks > 0 && workspace.roots.isEmpty && workspace.openFile == nil {
+                LaunchCoordinator.shared.pendingNewWindowPicks -= 1
+                DispatchQueue.main.async {
+                    workspace.presentNewWindowFolderPanel()
+                }
+            }
         }
         // Late-arriving `@SceneStorage` recovery rule: the platform can deliver the persisted
         // string *after* the first render (`workspaceSnapshot` starts at `""` and is updated once

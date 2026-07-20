@@ -25,7 +25,8 @@ import SwiftUI
 
 /// Per-window state for the folder sidebar (SPEC §5, §10) and the open document (SPEC §7). One
 /// instance lives per window (SPEC §3) and is exposed to `Commands` via `.focusedSceneObject` so
-/// File → Open Folder…/Save always target the focused window.
+/// File → Add Folder to Window…/Save always target the focused window. (Open Folder…/Cmd+N is
+/// app-level — it opens a new window — and is not focused-window-scoped.)
 @MainActor
 final class WorkspaceModel: ObservableObject {
     /// The single file open in this window's editor (SPEC §6.1: exactly one file at a time), or
@@ -347,6 +348,21 @@ final class WorkspaceModel: ObservableObject {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = true
+
+        if panel.runModal() == .OK {
+            addFolders(panel.urls)
+        }
+    }
+
+    /// Presents an `NSOpenPanel` restricted to directories, **single-select**, for the "Open
+    /// Folder…" (Cmd+N) new-window flow: called only on a pristine (empty-`roots`) model when a
+    /// Cmd+N-created window drains the launch mailbox on appear, so `addFolders` yields the chosen
+    /// folder as this window's sole root. Cancel is a no-op, leaving the new window empty.
+    func presentNewWindowFolderPanel() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
 
         if panel.runModal() == .OK {
             addFolders(panel.urls)

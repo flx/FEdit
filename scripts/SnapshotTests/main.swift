@@ -141,6 +141,110 @@ do {
     check(false, "decoding an object with an unknown extra key threw: \(error)")
 }
 
+// MARK: - Equatable ⟺ byte-identical JSON (currentSnapshot dedupe safety, memory-use-audit Tier 2)
+
+// `ContentView`'s save `.onChange` diffs the cheap `Equatable` `WorkspaceModel.currentSnapshot`
+// and encodes via `snapshotJSON()` only when it changed. That dedupe is safe **only** if
+// Equatable-equality implies byte-identical JSON — otherwise two snapshots that compare equal but
+// encode differently would drop a real save (data loss on restore). Lock the invariant here.
+//
+// `encodeSnapshot` mirrors `WorkspaceModel.snapshotJSON()`'s encoder configuration EXACTLY
+// (`JSONEncoder` + `.sortedKeys` + UTF-8 string). This harness compiles only against
+// `WorkspaceSnapshot` (no `WorkspaceModel` / AppKit), so the equivalence is expressed over the
+// value type plus an identically-configured encoder.
+func encodeSnapshot(_ snapshot: WorkspaceSnapshot) -> String? {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = .sortedKeys
+    guard let data = try? encoder.encode(snapshot),
+          let json = String(data: data, encoding: .utf8) else { return nil }
+    return json
+}
+
+section("Equivalence: currentSnapshot equality ⟺ byte-identical snapshotJSON")
+// Representative values covering equal pairs AND a difference in each of the four encoded fields
+// (including nil↔non-nil for the two optionals). The all-pairs sweep below then exercises both
+// directions of the biconditional (equal→same bytes, differing→different bytes).
+let base = WorkspaceSnapshot(
+    rootPaths: ["/Users/felix/proj", "/Users/felix/other"],
+    openFilePath: "/Users/felix/proj/main.swift",
+    filterText: ".py OR .swift",
+    cursorLocation: 4213
+)
+let baseCopy = WorkspaceSnapshot(
+    rootPaths: ["/Users/felix/proj", "/Users/felix/other"],
+    openFilePath: "/Users/felix/proj/main.swift",
+    filterText: ".py OR .swift",
+    cursorLocation: 4213
+)
+let diffRoots = WorkspaceSnapshot(
+    rootPaths: ["/Users/felix/proj"],
+    openFilePath: "/Users/felix/proj/main.swift",
+    filterText: ".py OR .swift",
+    cursorLocation: 4213
+)
+let diffRootOrder = WorkspaceSnapshot(
+    rootPaths: ["/Users/felix/other", "/Users/felix/proj"],
+    openFilePath: "/Users/felix/proj/main.swift",
+    filterText: ".py OR .swift",
+    cursorLocation: 4213
+)
+let diffOpenFile = WorkspaceSnapshot(
+    rootPaths: ["/Users/felix/proj", "/Users/felix/other"],
+    openFilePath: "/Users/felix/proj/other.swift",
+    filterText: ".py OR .swift",
+    cursorLocation: 4213
+)
+let nilOpenFile = WorkspaceSnapshot(
+    rootPaths: ["/Users/felix/proj", "/Users/felix/other"],
+    openFilePath: nil,
+    filterText: ".py OR .swift",
+    cursorLocation: 4213
+)
+let diffFilter = WorkspaceSnapshot(
+    rootPaths: ["/Users/felix/proj", "/Users/felix/other"],
+    openFilePath: "/Users/felix/proj/main.swift",
+    filterText: "",
+    cursorLocation: 4213
+)
+let diffCursor = WorkspaceSnapshot(
+    rootPaths: ["/Users/felix/proj", "/Users/felix/other"],
+    openFilePath: "/Users/felix/proj/main.swift",
+    filterText: ".py OR .swift",
+    cursorLocation: 0
+)
+let nilCursor = WorkspaceSnapshot(
+    rootPaths: ["/Users/felix/proj", "/Users/felix/other"],
+    openFilePath: "/Users/felix/proj/main.swift",
+    filterText: ".py OR .swift",
+    cursorLocation: nil
+)
+let allEmpty = WorkspaceSnapshot(rootPaths: [], openFilePath: nil, filterText: "", cursorLocation: nil)
+let allEmptyCopy = WorkspaceSnapshot(rootPaths: [], openFilePath: nil, filterText: "", cursorLocation: nil)
+
+let equivalenceCases: [WorkspaceSnapshot] = [
+    base, baseCopy, diffRoots, diffRootOrder, diffOpenFile, nilOpenFile,
+    diffFilter, diffCursor, nilCursor, allEmpty, allEmptyCopy
+]
+
+var equivalenceHeld = true
+var sawEqualPair = false
+var sawDifferingPair = false
+for a in equivalenceCases {
+    for b in equivalenceCases {
+        guard let ja = encodeSnapshot(a), let jb = encodeSnapshot(b) else {
+            equivalenceHeld = false
+            continue
+        }
+        let equatableEqual = (a == b)
+        let jsonEqual = (ja == jb)
+        if equatableEqual != jsonEqual { equivalenceHeld = false }
+        if equatableEqual { sawEqualPair = true } else { sawDifferingPair = true }
+    }
+}
+check(equivalenceHeld, "a == b (Equatable) iff encode(a) == encode(b) (byte-identical JSON) across all pairs")
+check(sawEqualPair, "the sweep exercised at least one Equatable-equal pair")
+check(sawDifferingPair, "the sweep exercised at least one differing pair")
+
 // MARK: - Summary
 
 print("\n==================================")

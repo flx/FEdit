@@ -203,10 +203,15 @@ struct ContentView: View {
         // before the first restore decision above has run (so it can't race and clobber a
         // snapshot the platform is still in the middle of delivering — the late-arriving rule's
         // whole point). `snapshotJSON() == nil` (encode failure) skips the write, keeping
-        // whatever was last stored (last-good).
-        .onChange(of: workspace.snapshotJSON()) { _, newValue in
-            guard didRestore, let newValue else { return }
-            workspaceSnapshot = newValue
+        // whatever was last stored (last-good). Diffed on the cheap `Equatable` `currentSnapshot`
+        // (no `JSONEncoder`) so `body` passes that don't touch the four persisted fields (scroll,
+        // divider drag) skip the encode entirely; the `JSONEncoder` runs only inside this handler,
+        // on an actual state change. Byte-for-byte equivalent: `snapshotJSON()` is a deterministic
+        // (`.sortedKeys`) function of `currentSnapshot`, so a `currentSnapshot` change is exactly a
+        // JSON-string change — this fires the same set of writes as diffing the string did.
+        .onChange(of: workspace.currentSnapshot) { _, _ in
+            guard didRestore, let json = workspace.snapshotJSON() else { return }
+            workspaceSnapshot = json
         }
     }
 

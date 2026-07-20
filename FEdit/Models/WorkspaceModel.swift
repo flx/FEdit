@@ -950,20 +950,29 @@ final class WorkspaceModel: ObservableObject {
 
     // MARK: - Session restore (SPEC §3, §9)
 
-    /// Builds the current per-window state as `WorkspaceSnapshot` JSON for `@SceneStorage`
-    /// (ContentView, Tier 2). Returns `nil` — never `""` — on encode failure, so the caller skips
-    /// the write and keeps whatever snapshot is already stored; an empty write would erase a
-    /// valid one.
-    func snapshotJSON() -> String? {
-        let snapshot = WorkspaceSnapshot(
+    /// The current restorable state as a plain value — no JSON encoding. Cheap to build and
+    /// `Equatable`, so `ContentView`'s save `.onChange` can diff it on every body pass without
+    /// running a `JSONEncoder`; only the (rarer) actual-change branch encodes, via `snapshotJSON()`.
+    /// This is the single source of truth for the four persisted fields — `snapshotJSON()` encodes
+    /// exactly this value, so their contents can never drift apart.
+    var currentSnapshot: WorkspaceSnapshot {
+        WorkspaceSnapshot(
             rootPaths: roots.map { $0.url.path },
             openFilePath: openFile?.url.path,
             filterText: filterText,
             cursorLocation: cursorLocation
         )
+    }
+
+    /// Builds the current per-window state as `WorkspaceSnapshot` JSON for `@SceneStorage`
+    /// (ContentView, Tier 2). Encodes `currentSnapshot` (the single source of truth). Returns
+    /// `nil` — never `""` — on encode failure, so the caller skips the write and keeps whatever
+    /// snapshot is already stored; an empty write would erase a valid one. `.sortedKeys` keeps the
+    /// byte output deterministic, so a JSON change is exactly a `currentSnapshot` change.
+    func snapshotJSON() -> String? {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
-        guard let data = try? encoder.encode(snapshot),
+        guard let data = try? encoder.encode(currentSnapshot),
               let json = String(data: data, encoding: .utf8) else { return nil }
         return json
     }

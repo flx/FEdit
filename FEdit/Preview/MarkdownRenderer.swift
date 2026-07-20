@@ -363,6 +363,30 @@ enum MarkdownInlineParser {
             literal.removeAll()
         }
 
+        // `parseLink`'s two closer scans (`]` then `)`) are the only quadratic-prone construct in
+        // this scan (see md-link-scan-quadratic plan): on a failed link the driver advances only ONE
+        // character, so the next `[` would otherwise re-scan to EOF. Precompute, in one backward
+        // pass, "nearest `]`/`)` at or after i" so `parseLink` becomes O(1) per call. Built ONLY when
+        // `characters` contains a `[` — `parseLink` is reached only after the driver sees a `[`, so a
+        // bracket-free slice never builds or reads these arrays (zero extra allocation on the hot
+        // path). `nextCloseBracket[i]`/`nextCloseParen[i]` equal exactly what
+        // `firstIndex(of: "]"/")" , from: i)` return today, with the sentinel `count` standing in for
+        // `nil` — this memoization is what keeps the produced tree byte-identical.
+        var nextCloseBracket: [Int] = []
+        var nextCloseParen: [Int] = []
+        if characters.contains("[") {
+            nextCloseBracket = [Int](repeating: 0, count: count + 1)
+            nextCloseParen = [Int](repeating: 0, count: count + 1)
+            nextCloseBracket[count] = count
+            nextCloseParen[count] = count
+            var i = count - 1
+            while i >= 0 {
+                nextCloseBracket[i] = (characters[i] == "]") ? i : nextCloseBracket[i + 1]
+                nextCloseParen[i] = (characters[i] == ")") ? i : nextCloseParen[i + 1]
+                i -= 1
+            }
+        }
+
         while index < count {
             let character = characters[index]
 
@@ -382,7 +406,7 @@ enum MarkdownInlineParser {
 
             // 2. Link — `[title](url)`. Title stored verbatim (not inline-parsed); url verbatim.
             if character == "[" {
-                if let link = parseLink(characters, from: index) {
+                if let link = parseLink(characters, from: index, nextCloseBracket: nextCloseBracket, nextCloseParen: nextCloseParen) {
                     flushLiteral()
                     nodes.append(.link(text: link.title, url: link.url))
                     index = link.end
@@ -462,11 +486,24 @@ enum MarkdownInlineParser {
     /// after `[`, which must be immediately followed by `(`, then the nearest `)` after that.
     /// Returns the verbatim title, verbatim url, and the index just past the closing `)`; nil if
     /// the full form is not present (the caller then emits `[` literally).
-    private static func parseLink(_ characters: [Character], from open: Int) -> (title: String, url: String, end: Int)? {
-        guard let closeBracket = firstIndex(of: "]", in: characters, from: open + 1) else { return nil }
+    ///
+    /// `nextCloseBracket`/`nextCloseParen` are the per-invocation memo built in `parseNodes`:
+    /// `nextCloseBracket[f]`/`nextCloseParen[f]` equal exactly what
+    /// `firstIndex(of: "]"/")" , in: characters, from: f)` would return, with the sentinel
+    /// `characters.count` standing in for `nil`. Guaranteed built and non-empty here because this
+    /// function is only ever called after the driver has seen a `[`.
+    private static func parseLink(
+        _ characters: [Character],
+        from open: Int,
+        nextCloseBracket: [Int],
+        nextCloseParen: [Int]
+    ) -> (title: String, url: String, end: Int)? {
+        let closeBracket = nextCloseBracket[open + 1]
+        guard closeBracket < characters.count else { return nil }
         let paren = closeBracket + 1
         guard paren < characters.count, characters[paren] == "(" else { return nil }
-        guard let closeParen = firstIndex(of: ")", in: characters, from: paren + 1) else { return nil }
+        let closeParen = nextCloseParen[paren + 1]
+        guard closeParen < characters.count else { return nil }
         let title = String(characters[(open + 1)..<closeBracket])
         let url = String(characters[(paren + 1)..<closeParen])
         return (title, url, closeParen + 1)

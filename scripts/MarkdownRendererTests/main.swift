@@ -579,6 +579,463 @@ do {
     check(!a1.output.isEqual(to: b1.output), "distinct inputs produce distinct output")
 }
 
+// MARK: - md-link-scan-quadratic: bracket-heavy output equivalence
+//
+// Locks byte-identical trees for the three pathological families the plan derives (all `[`
+// unmatched; a `]`/`(` exists but the link form still fails; a real link followed by trailing
+// unmatched brackets; nearest-closer semantics with a bracket inside the title; code-span/bold
+// interaction) against the fixed, memoized `parseLink`. N kept small (5-8) so expected trees are
+// written out explicitly.
+
+section("md-link-scan-quadratic: bracket-heavy output equivalence")
+do {
+    let input = String(repeating: "[", count: 6)
+    check(
+        MarkdownInlineParser.parse(input) == [.text(input)],
+        "family 1: `[`×6 with no `]` anywhere -> all literal, coalesced into one .text node"
+    )
+}
+do {
+    let input = String(repeating: "[a](b", count: 5)
+    check(
+        MarkdownInlineParser.parse(input) == [.text(input)],
+        "family 2: `[a](b`×5 with no `)` anywhere -> all literal, coalesced into one .text node"
+    )
+}
+do {
+    let input = String(repeating: "[", count: 6) + "]"
+    check(
+        MarkdownInlineParser.parse(input) == [.text(input)],
+        "family 3: `[`×6 + \"]\" -> the `]` exists but no `(` follows it, still all literal"
+    )
+}
+do {
+    let input = String(repeating: "[", count: 6) + "]("
+    check(
+        MarkdownInlineParser.parse(input) == [.text(input)],
+        "family 3: `[`×6 + \"](\" -> `]` and `(` exist but no `)` follows, still all literal"
+    )
+}
+do {
+    let input = "[a](b)" + String(repeating: "[", count: 5)
+    check(
+        MarkdownInlineParser.parse(input) == [.link(text: "a", url: "b"), .text(String(repeating: "[", count: 5))],
+        "a real link followed by trailing unmatched brackets: link parses, trailing `[`s stay literal"
+    )
+}
+check(
+    MarkdownInlineParser.parse("[[x](y)") == [.link(text: "[x", url: "y")],
+    "nearest-`]` semantics: a `[` inside the title is literal title content, not a nested opener"
+)
+check(
+    MarkdownInlineParser.parse("[[[[[x](y)") == [.link(text: "[[[[x", url: "y")],
+    "nearest-`]` semantics holds with 5 leading brackets: title absorbs the extra 4 `[`"
+)
+check(
+    MarkdownInlineParser.parse("`[a](b)`") == [.code("[a](b)")],
+    "code span precedence: a link shape inside backticks never reaches parseLink"
+)
+check(
+    MarkdownInlineParser.parse("**[[[**") == [.bold([.text("[[[")])],
+    "bold body with unmatched brackets: the per-invocation memo is rebuilt correctly on the recursive slice"
+)
+
+// MARK: - md-link-scan-quadratic: differential fuzz
+//
+// A harness-local reference reimplementing the PRE-FIX `MarkdownInlineParser`/`MarkdownRenderer`
+// semantics (the naive to-EOF `firstIndex` link scan, unmemoized) diffs against the shipped,
+// memoized parser/renderer over a seeded randomized battery of bracket-heavy inputs. This proves
+// the memoization is byte-identical to the old algorithm on thousands of inputs the hand-enumerated
+// battery above does not cover, catching an off-by-one the enumerated cases might miss.
+
+/// The pre-fix `MarkdownInlineParser`, reimplemented standalone: identical code-span -> link ->
+/// bold -> italic scan, but `parseLink`'s closer search is the naive two-to-EOF-scan version that
+/// shipped before md-link-scan-quadratic (no memo arrays). This is the differential oracle.
+enum ReferenceInlineParser {
+    static func parse(_ text: String) -> [InlineNode] {
+        parseNodes(Array(text))
+    }
+
+    private static func parseNodes(_ characters: [Character]) -> [InlineNode] {
+        var nodes: [InlineNode] = []
+        var literal: [Character] = []
+        var index = 0
+        let count = characters.count
+
+        func flushLiteral() {
+            guard !literal.isEmpty else { return }
+            nodes.append(.text(String(literal)))
+            literal.removeAll()
+        }
+
+        while index < count {
+            let character = characters[index]
+
+            if character == "`" {
+                if let close = firstIndex(of: "`", in: characters, from: index + 1) {
+                    flushLiteral()
+                    nodes.append(.code(String(characters[(index + 1)..<close])))
+                    index = close + 1
+                    continue
+                }
+                literal.append(character)
+                index += 1
+                continue
+            }
+
+            if character == "[" {
+                if let link = parseLink(characters, from: index) {
+                    flushLiteral()
+                    nodes.append(.link(text: link.title, url: link.url))
+                    index = link.end
+                    continue
+                }
+                literal.append(character)
+                index += 1
+                continue
+            }
+
+            if character == "*", index + 1 < count, characters[index + 1] == "*" {
+                if let close = firstDoubleIndex(of: "*", in: characters, from: index + 2) {
+                    flushLiteral()
+                    nodes.append(.bold(parseNodes(Array(characters[(index + 2)..<close]))))
+                    index = close + 2
+                    continue
+                }
+                literal.append("*")
+                literal.append("*")
+                index += 2
+                continue
+            }
+
+            if character == "*" {
+                if let close = firstIndex(of: "*", in: characters, from: index + 1) {
+                    flushLiteral()
+                    nodes.append(.italic(parseNodes(Array(characters[(index + 1)..<close]))))
+                    index = close + 1
+                    continue
+                }
+                literal.append(character)
+                index += 1
+                continue
+            }
+
+            literal.append(character)
+            index += 1
+        }
+
+        flushLiteral()
+        return nodes
+    }
+
+    private static func firstIndex(of character: Character, in characters: [Character], from: Int) -> Int? {
+        var index = from
+        while index < characters.count {
+            if characters[index] == character {
+                return index
+            }
+            index += 1
+        }
+        return nil
+    }
+
+    private static func firstDoubleIndex(of character: Character, in characters: [Character], from: Int) -> Int? {
+        var index = from
+        while index + 1 < characters.count {
+            if characters[index] == character, characters[index + 1] == character {
+                return index
+            }
+            index += 1
+        }
+        return nil
+    }
+
+    /// The pre-fix `parseLink`: two to-EOF `firstIndex` scans — exactly the quadratic behavior
+    /// the fix removes, kept here unmemoized on purpose as the differential oracle.
+    private static func parseLink(_ characters: [Character], from open: Int) -> (title: String, url: String, end: Int)? {
+        guard let closeBracket = firstIndex(of: "]", in: characters, from: open + 1) else { return nil }
+        let paren = closeBracket + 1
+        guard paren < characters.count, characters[paren] == "(" else { return nil }
+        guard let closeParen = firstIndex(of: ")", in: characters, from: paren + 1) else { return nil }
+        let title = String(characters[(open + 1)..<closeBracket])
+        let url = String(characters[(paren + 1)..<closeParen])
+        return (title, url, closeParen + 1)
+    }
+}
+
+/// Harness-local reference renderer: identical block parsing + Tier-3 emission logic to
+/// `MarkdownRenderer.render` (block parsing is reused directly from the unmodified, production
+/// `MarkdownBlockParser` since this fix never touches it), but inline nodes come from
+/// `ReferenceInlineParser` (the naive pre-fix scan) instead of `MarkdownInlineParser`. Any
+/// output/anchor divergence from `MarkdownRenderer.render` pinpoints a behavioral change in the
+/// memoized `parseLink`.
+enum ReferenceRenderer {
+    private static let blockSpacing: CGFloat = 8
+    private static let listItemSpacing: CGFloat = 3
+    private static let listIndent: CGFloat = 22
+    private static let quoteIndent: CGFloat = 16
+    private static let ruleGlyphCount = 32
+
+    private static let bodyParagraph: NSParagraphStyle = {
+        let style = NSMutableParagraphStyle()
+        style.paragraphSpacing = blockSpacing
+        return style
+    }()
+
+    private static let headingParagraph: NSParagraphStyle = {
+        let style = NSMutableParagraphStyle()
+        style.paragraphSpacing = blockSpacing
+        return style
+    }()
+
+    private static let codeParagraph: NSParagraphStyle = {
+        let style = NSMutableParagraphStyle()
+        style.paragraphSpacing = blockSpacing
+        return style
+    }()
+
+    private static let listParagraph: NSParagraphStyle = {
+        let style = NSMutableParagraphStyle()
+        style.paragraphSpacing = listItemSpacing
+        style.firstLineHeadIndent = 0
+        style.headIndent = listIndent
+        style.tabStops = [NSTextTab(textAlignment: .left, location: listIndent)]
+        style.defaultTabInterval = listIndent
+        return style
+    }()
+
+    private static let quoteParagraph: NSParagraphStyle = {
+        let style = NSMutableParagraphStyle()
+        style.paragraphSpacing = blockSpacing
+        style.firstLineHeadIndent = quoteIndent
+        style.headIndent = quoteIndent
+        return style
+    }()
+
+    private static let ruleAttributes: [NSAttributedString.Key: Any] = [
+        .font: Theme.bodyFont,
+        .foregroundColor: Theme.mutedText,
+        .paragraphStyle: bodyParagraph,
+    ]
+
+    private static let bodyBold: NSFont = {
+        let descriptor = Theme.bodyFont.fontDescriptor.withSymbolicTraits(.bold)
+        return NSFont(descriptor: descriptor, size: Theme.bodyFont.pointSize) ?? Theme.bodyFont
+    }()
+
+    private static let bodyItalic: NSFont = {
+        let descriptor = Theme.bodyFont.fontDescriptor.withSymbolicTraits(.italic)
+        let candidate = NSFont(descriptor: descriptor, size: Theme.bodyFont.pointSize) ?? Theme.bodyFont
+        return candidate.fontDescriptor.symbolicTraits.contains(.italic) ? candidate : Theme.bodyFont
+    }()
+
+    private struct InlineStyle {
+        let font: NSFont
+        let boldFont: NSFont
+        let italicFont: NSFont
+        let color: NSColor
+        let paragraphStyle: NSParagraphStyle
+    }
+
+    private static let bodyStyle = InlineStyle(
+        font: Theme.bodyFont, boldFont: bodyBold, italicFont: bodyItalic,
+        color: Theme.text, paragraphStyle: bodyParagraph
+    )
+    private static let listStyle = InlineStyle(
+        font: Theme.bodyFont, boldFont: bodyBold, italicFont: bodyItalic,
+        color: Theme.text, paragraphStyle: listParagraph
+    )
+    private static let quoteStyle = InlineStyle(
+        font: Theme.bodyFont, boldFont: bodyBold, italicFont: bodyItalic,
+        color: Theme.mutedText, paragraphStyle: quoteParagraph
+    )
+
+    private static func headingStyle(level: Int) -> InlineStyle {
+        let font = Theme.headingFont(level: level)
+        return InlineStyle(font: font, boldFont: font, italicFont: font, color: Theme.text, paragraphStyle: headingParagraph)
+    }
+
+    static func render(_ source: String) -> (output: NSAttributedString, anchors: [MarkdownAnchor]) {
+        let blocks = MarkdownBlockParser.parse(source)
+        let output = NSMutableAttributedString()
+        var anchors: [MarkdownAnchor] = []
+
+        for (index, block) in blocks.enumerated() {
+            anchors.append(MarkdownAnchor(sourceLine: block.line, location: output.length))
+            emit(block, into: output)
+            if index < blocks.count - 1 {
+                output.append(NSAttributedString(string: "\n"))
+            }
+        }
+
+        return (output, anchors)
+    }
+
+    private static func emit(_ block: MarkdownBlock, into output: NSMutableAttributedString) {
+        switch block {
+        case let .heading(level, text, _):
+            emitInline(ReferenceInlineParser.parse(text), style: headingStyle(level: level), into: output)
+
+        case let .paragraph(text, _):
+            emitInline(ReferenceInlineParser.parse(text), style: bodyStyle, into: output)
+
+        case let .listItem(marker, text, _):
+            output.append(NSAttributedString(string: marker + "\t", attributes: [
+                .font: Theme.bodyFont,
+                .foregroundColor: Theme.text,
+                .paragraphStyle: listParagraph,
+            ]))
+            emitInline(ReferenceInlineParser.parse(text), style: listStyle, into: output)
+
+        case let .blockquote(text, _):
+            emitInline(ReferenceInlineParser.parse(text), style: quoteStyle, into: output)
+
+        case let .codeBlock(code, _):
+            output.append(NSAttributedString(string: code, attributes: [
+                .font: Theme.codeFont,
+                .foregroundColor: Theme.text,
+                .backgroundColor: Theme.codeBackground,
+                .paragraphStyle: codeParagraph,
+            ]))
+
+        case .rule:
+            output.append(NSAttributedString(
+                string: String(repeating: "─", count: ruleGlyphCount),
+                attributes: ruleAttributes
+            ))
+        }
+    }
+
+    private static func emitInline(_ nodes: [InlineNode], style: InlineStyle, into output: NSMutableAttributedString) {
+        for node in nodes {
+            switch node {
+            case let .text(value):
+                output.append(NSAttributedString(string: value, attributes: [
+                    .font: style.font,
+                    .foregroundColor: style.color,
+                    .paragraphStyle: style.paragraphStyle,
+                ]))
+
+            case let .bold(children):
+                let boldStyle = InlineStyle(
+                    font: style.boldFont, boldFont: style.boldFont, italicFont: style.italicFont,
+                    color: style.color, paragraphStyle: style.paragraphStyle
+                )
+                emitInline(children, style: boldStyle, into: output)
+
+            case let .italic(children):
+                let italicStyle = InlineStyle(
+                    font: style.italicFont, boldFont: style.boldFont, italicFont: style.italicFont,
+                    color: style.color, paragraphStyle: style.paragraphStyle
+                )
+                emitInline(children, style: italicStyle, into: output)
+
+            case let .code(value):
+                output.append(NSAttributedString(string: value, attributes: [
+                    .font: Theme.codeFont,
+                    .foregroundColor: Theme.text,
+                    .backgroundColor: Theme.codeBackground,
+                    .paragraphStyle: style.paragraphStyle,
+                ]))
+
+            case let .link(title, url):
+                if let parsed = URL(string: url) {
+                    output.append(NSAttributedString(string: title, attributes: [
+                        .font: style.font,
+                        .foregroundColor: Theme.link,
+                        .underlineStyle: NSUnderlineStyle.single.rawValue,
+                        .link: parsed,
+                        .paragraphStyle: style.paragraphStyle,
+                    ]))
+                } else {
+                    output.append(NSAttributedString(string: title, attributes: [
+                        .font: style.font,
+                        .foregroundColor: style.color,
+                        .paragraphStyle: style.paragraphStyle,
+                    ]))
+                }
+            }
+        }
+    }
+}
+
+/// A tiny deterministic LCG (Numerical Recipes constants), seeded by a fixed constant so the fuzz
+/// below is fully reproducible run to run (no `Date`/system-entropy seeding).
+struct SeededLCG {
+    private var state: UInt64
+    init(seed: UInt64) { self.state = seed }
+    mutating func next() -> UInt64 {
+        state = 6_364_136_223_846_793_005 &* state &+ 1_442_695_040_888_963_407
+        return state
+    }
+    mutating func nextInt(upperBound: Int) -> Int {
+        Int(next() % UInt64(upperBound))
+    }
+}
+
+section("md-link-scan-quadratic: differential fuzz (seeded, vs naive nearest-firstIndex reference)")
+do {
+    let alphabet: [Character] = ["[", "]", "(", ")", "a", "*", "`", " "]
+    var rng = SeededLCG(seed: 0x5EED_1234_ABCD_9876)
+    let fuzzCount = 5000
+    var treeMismatches = 0
+    var renderMismatches = 0
+
+    for _ in 0..<fuzzCount {
+        let length = rng.nextInt(upperBound: 48)
+        var chars: [Character] = []
+        chars.reserveCapacity(length)
+        for _ in 0..<length {
+            chars.append(alphabet[rng.nextInt(upperBound: alphabet.count)])
+        }
+        let input = String(chars)
+
+        let actualTree = MarkdownInlineParser.parse(input)
+        let referenceTree = ReferenceInlineParser.parse(input)
+        if actualTree != referenceTree {
+            treeMismatches += 1
+            print("  FUZZ TREE MISMATCH on \(input.debugDescription): actual=\(actualTree) reference=\(referenceTree)")
+        }
+
+        let actualRender = MarkdownRenderer.render(input)
+        let referenceRender = ReferenceRenderer.render(input)
+        if !actualRender.output.isEqual(to: referenceRender.output) || actualRender.anchors != referenceRender.anchors {
+            renderMismatches += 1
+            print("  FUZZ RENDER MISMATCH on \(input.debugDescription)")
+        }
+    }
+
+    check(
+        treeMismatches == 0,
+        "\(fuzzCount) seeded random bracket-heavy inputs: MarkdownInlineParser.parse matches the naive reference tree (0 mismatches)"
+    )
+    check(
+        renderMismatches == 0,
+        "\(fuzzCount) seeded random bracket-heavy inputs: MarkdownRenderer.render output+anchors match the reference renderer (0 mismatches)"
+    )
+}
+
+// MARK: - md-link-scan-quadratic: no quadratic cliff (advisory)
+//
+// ADVISORY tripwire only (plan criterion 5): the ceiling below is deliberately loose (~100x margin
+// over expected linear time) to avoid CI flakiness on slow/loaded machines. The real guarantee is
+// the O(n) complexity argument in the plan's "Chosen algorithm & why" section, not this wall-clock
+// number — a slow-but-still-linear run must never fail this check. Pre-fix, the first case alone
+// took ~6s (quadratic); this ceiling sits between comfortably-linear and that cliff.
+
+section("md-link-scan-quadratic: no quadratic cliff (advisory)")
+func measureRender(_ label: String, ceiling: TimeInterval, _ source: String) {
+    let start = Date()
+    _ = MarkdownRenderer.render(source)
+    let elapsed = Date().timeIntervalSince(start)
+    print("  TIME: \(label) took \(elapsed)s (advisory ceiling \(ceiling)s)")
+    check(elapsed < ceiling, "\(label) renders in under \(ceiling)s (advisory; got \(elapsed)s)")
+}
+
+measureRender("[×40000 (no ], family 1)", ceiling: 1.0, String(repeating: "[", count: 40_000))
+measureRender("[a](b×10000 (no ), family 2)", ceiling: 1.0, String(repeating: "[a](b", count: 10_000))
+measureRender("[×40000 + \"]\" (family 3)", ceiling: 1.0, String(repeating: "[", count: 40_000) + "]")
+
 // MARK: - Summary
 
 print("\n==================================")

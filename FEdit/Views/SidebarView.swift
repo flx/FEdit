@@ -66,7 +66,7 @@ struct SidebarView: View {
     }
 
     private var searchField: some View {
-        TextField("Filter files (e.g. .py OR .swift)", text: $workspace.filterText)
+        TextField("Filter files (e.g. .swift$ OR ^src/)", text: $workspace.filterText)
             .textFieldStyle(.roundedBorder)
             .padding(8)
     }

@@ -68,12 +68,13 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 - Only files are selectable; clicking a file requests opening it (see §7). The open file's row is highlighted.
 
 ### 5.4 Filter mode (non-empty filter)
-- The search field (standard rounded style, placeholder like `Filter files (e.g. .py OR .swift)`) sits at the top of the sidebar's list content, below the column's folder-name header strip (§4) when one is shown — top-to-bottom order: folder-name strip → search field → list.
+- The search field (standard rounded style, placeholder like `Filter files (e.g. .swift$ OR ^src/)`) sits at the top of the sidebar's list content, below the column's folder-name header strip (§4) when one is shown — top-to-bottom order: folder-name strip → search field → list.
 - While the filter is non-empty, each section shows a **flat list of matching files as paths relative to that top-level folder** (e.g. `swift-source/main.swift`) — the top folder path is not repeated. A section with no matches shows a muted "No matches".
 
 ### 5.5 Filter query language
 - Tokens are separated by whitespace. `AND` and `OR` (uppercase, exact) are operators; everything else is a search term.
 - A term matches if it is a **case-insensitive substring of the file's relative path** (so `.py` matches extension, `main` matches the name, `src/` matches a folder segment).
+- A term may be **anchored** to the root-relative path, mirroring fzf/regex: a leading `^` anchors the match to the **start** of the path (`^src/` matches `src/a.swift`, not `lib/src/a.swift`); a trailing `$` anchors to the **end** (`.swift$` matches `foo.swift`, not `foo.swiftdep`); both together (`^main.swift$`) require the whole path to **equal** the anchored text (case-insensitively) — `^main.swift$` matches only the path `main.swift`, not `src/main.swift` and not a longer path that repeats it at both ends like `main.swift/main.swift`; a term longer than the path never matches. Anchored matching is still case-insensitive. Anchoring is a per-term property, independent of `AND`/`OR` grouping (`^src/ AND .swift$` is a valid AND-group of two anchored terms).
 - Grammar (AND binds tighter than OR; adjacency = implicit OR):
   ```
   query   := orExpr
@@ -81,7 +82,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
   andExpr := term ("AND" term)*
   ```
 - Consequences: `.py .swift` and `.py OR .swift` both show the union; `.py AND .swift` is (almost always) empty; `.swift AND main OR .md` = (`.swift` AND `main`) OR `.md`.
-- Malformed input degrades gracefully: leading/trailing/duplicate operators are ignored; an operator with a missing operand keeps the side that exists.
+- Malformed input degrades gracefully: leading/trailing/duplicate operators are ignored; an operator with a missing operand keeps the side that exists; a term that is only `^` or only `$` with no other characters, or has a `^`/`$` appearing anywhere other than the very first/last character, is matched literally rather than treated as an anchor (only one leading `^` and one trailing `$` per term are ever consumed as anchors).
 
 ### 5.6 File status (git)
 - When an opened top-level root **directly contains `.git`** (it is itself the root of a git repository), each **file** row whose working-tree content differs from `HEAD` — modified, staged, untracked, or the **new** side of a rename — shows a small right-aligned **"(changed)"** badge. Directories are **never** badged, even when they contain changed files. A long file name truncates (tail) before the badge is clipped; the badge is never truncated.

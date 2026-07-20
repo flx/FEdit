@@ -55,7 +55,11 @@ struct SidebarView: View {
                         }
                     }
                 }
-                .listStyle(.sidebar)
+                // `.inset` (not `.sidebar`): the source-list `.sidebar` style computes its own
+                // AppKit row metrics and ignores `defaultMinListRowHeight`, so it can't be
+                // tightened; `.inset` honors the floor. Custom selection (no `List(selection:)`)
+                // and OutlineGroup disclosure are unaffected by the style change.
+                .listStyle(.inset)
                 .environment(\.defaultMinListRowHeight, 20)
             }
         }

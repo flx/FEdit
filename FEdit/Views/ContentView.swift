@@ -21,6 +21,7 @@
 //
 
 import SwiftUI
+import AppKit
 
 /// The three-column window skeleton (SPEC §4): sidebar | editor | (optional) markdown
 /// preview, separated by two draggable dividers. Columns are placeholders — their real
@@ -146,10 +147,23 @@ struct ContentView: View {
         // (session-restore) SPEC §3, §9: restore this scene's state once, on first appear. A
         // freshly created (Cmd+N) scene's `@SceneStorage` value is empty, so `restore` is a
         // no-op there — the pristine-scene guarantee this relies on.
+        // (git-changed-badge) App activation is the cheap HEAD-move signal (SPEC §5.6): the user
+        // switches to Terminal, runs commit/checkout/reset, switches back → `didBecomeActive` fires
+        // (app-level, inactive→active only) and each window's `ContentView` recomputes its own
+        // roots' changed-set, so post-commit badges clear (criterion 5b). Coalesced through the
+        // Tier 2 debounce. Reconciles *modification* badges on already-present rows only — external
+        // adds/deletes need a manual Refresh (the sole tree-rescan trigger; criterion 5d).
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            workspace.scheduleGitRefresh()
+        }
         .onAppear {
             guard !didRestore else { return }
             didRestore = true
             workspace.restore(fromJSON: workspaceSnapshot)
+            // (git-changed-badge) Compute badges on first launch without waiting for a
+            // deactivate/reactivate cycle. A restored window's `restore` → `addFolders` already
+            // scheduled one; this covers the no-restore path and is coalesced regardless.
+            workspace.scheduleGitRefresh()
             // "Open Folder…" (Cmd+N) new-window flow: the menu command incremented the launch
             // mailbox immediately before opening this window. Drain exactly one pending pick if
             // this window is genuinely pristine (nothing restored above), then present the

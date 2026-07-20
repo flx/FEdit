@@ -81,6 +81,12 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 - Consequences: `.py .swift` and `.py OR .swift` both show the union; `.py AND .swift` is (almost always) empty; `.swift AND main OR .md` = (`.swift` AND `main`) OR `.md`.
 - Malformed input degrades gracefully: leading/trailing/duplicate operators are ignored; an operator with a missing operand keeps the side that exists.
 
+### 5.6 File status (git)
+- When an opened top-level root **directly contains `.git`** (it is itself the root of a git repository), each **file** row whose working-tree content differs from `HEAD` — modified, staged, untracked, or the **new** side of a rename — shows a small right-aligned **"(changed)"** badge. Directories are **never** badged, even when they contain changed files. A long file name truncates (tail) before the badge is clipped; the badge is never truncated.
+- The changed-set is computed by shelling out to `git status --porcelain=v1 -z -uall` (permitted since the app is unsandboxed, §2) **off the main thread on a dedicated serial queue with a bounded 5 s watchdog timeout** — a hung or pathologically slow git is terminated and the window simply shows no badges (it never blocks or crashes). Results are cached per window as a set of absolute file URLs and refreshed on **save**, **manual Refresh**, **app activation** (the HEAD-move signal — no polling, no `.git` watch), and — via the §5.2 file-system watcher — external-change events.
+- Reconcile scope: save and activation recompute only the changed-*set* against the **already-present** tree rows; they reconcile *modification* badges on files that still have a row but do not rescan the tree. Externally **created** or **deleted** files (which have no row / a stale row) are picked up automatically by the §5.2 file-system watcher — which rescans the tree and recomputes badges — or by a manual **Refresh**.
+- Non-git roots, nested repos (only the top-level root's own `.git` is detected), and `.gitignore`'d files show **no** badge. The badge is uniform (no change-type or color coding) and read-only — it never modifies repository or file state.
+
 ## 6. Editor column
 
 ### 6.1 Core
@@ -178,7 +184,7 @@ Commands act on the focused window's state (`focusedSceneObject`), except **Open
 
 ## 12. Non-goals (v1)
 
-Tabs, split editors, find/replace, file create/rename/delete from the sidebar, git integration, LSP/completion, themes/dark mode, printing, preview→editor scroll sync, encodings beyond UTF-8/Latin-1 fallback. (File-system watching of the open file and sidebar roots is now in v1 — see §5.2 — and no longer a non-goal.)
+Tabs, split editors, find/replace, file create/rename/delete from the sidebar, git integration **beyond the single read-only "(changed)" file-status badge of §5.6** (no branch/ahead-behind/staging UI, no diff, no commit — the §5.6 badge is the one sanctioned exception to this non-goal), LSP/completion, themes/dark mode, printing, preview→editor scroll sync, encodings beyond UTF-8/Latin-1 fallback. (File-system watching of the open file and sidebar roots is now in v1 — see §5.2 — and no longer a non-goal.)
 
 ## 13. Planned project structure
 

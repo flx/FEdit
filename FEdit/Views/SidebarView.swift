@@ -143,7 +143,22 @@ private struct FileRow: View {
                     .resizable()
                     .frame(width: 16, height: 16)
                 Text(label)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                     .foregroundStyle(isSelected ? Color(nsColor: .selectedMenuItemTextColor) : .primary)
+                // (git-changed-badge) A right-aligned "(changed)" badge on a file whose working-tree
+                // content differs from HEAD (SPEC §5.6). The `Spacer` pushes it to the trailing edge
+                // and lets the name truncate (tail) *first*, so a long name never clips the badge
+                // (criterion 10). `.fixedSize()` keeps the badge intrinsic-width. Directories never
+                // reach this branch (criterion 2).
+                Spacer(minLength: 6)
+                if isChanged {
+                    Text("(changed)")
+                        .font(.system(size: 11))
+                        .lineLimit(1)
+                        .fixedSize()
+                        .foregroundStyle(isSelected ? Color(nsColor: .selectedMenuItemTextColor) : .secondary)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             // Give the row a defined height that meets the list's row-height floor, so the
@@ -164,5 +179,12 @@ private struct FileRow: View {
 
     private var isSelected: Bool {
         node.url == workspace.selectedFileURL
+    }
+
+    /// (git-changed-badge) Whether this row's file is in the window's changed-set (SPEC §5.6).
+    /// Directories are excluded outright, so the badge only ever shows on file rows — in both the
+    /// `OutlineGroup` tree and the flat filtered list, which share this view (criteria 2, 4).
+    private var isChanged: Bool {
+        !node.isDirectory && workspace.changedFileURLs.contains(node.url)
     }
 }

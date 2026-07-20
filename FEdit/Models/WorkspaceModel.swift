@@ -97,6 +97,13 @@ final class WorkspaceModel: ObservableObject {
     /// only during continuous typing that keeps the buffer dirty across the external write.
     @Published var openFileChangedOnDisk = false
 
+    /// (git-changed-badge) The per-window cache of changed file URLs, read by `FileRow` to show the
+    /// "(changed)" badge (SPEC §5.6). A single flattened union across **all** repo-root roots in
+    /// this window; membership is O(1). Non-git roots contribute nothing, so a row under a non-git
+    /// root is simply never present (no per-row repo check needed). Recomputed off-main by
+    /// `scheduleGitRefresh()`; empty whenever the window has no git roots or every recompute failed.
+    @Published private(set) var changedFileURLs: Set<URL> = []
+
     /// The editor's last-reported caret offset (UTF-16, `NSRange.location`), sunk here by
     /// (session-restore) via `noteCursorMoved(_:)`. Drives `snapshotJSON()`'s `cursorLocation`.
     @Published private(set) var cursorLocation: Int = 0
@@ -144,6 +151,19 @@ final class WorkspaceModel: ObservableObject {
     /// buffer the moment the user leaves FEdit (Tier 3), collapsing the leave-app exposure window
     /// to ~0. Removed in `deinit`.
     private var resignActiveObserver: NSObjectProtocol?
+
+    /// (git-changed-badge) A **dedicated serial** GCD queue — the *only* place the blocking git
+    /// `Process` runs. Serial ⇒ at most one git job at a time (this alone bounds the app to a single
+    /// live git process per window). It is **not** the Swift cooperative pool, so a blocking
+    /// `readDataToEndOfFile()` never occupies a cooperative worker thread (see `GitStatus`).
+    private let gitQueue = DispatchQueue(label: "com.fedit.git-status")
+
+    /// (git-changed-badge) Burst coalescing without cancellation: `isRecomputing` is set while a git
+    /// job is in flight, and any trigger during that window sets `recomputeAgain` so the in-flight
+    /// job re-runs **exactly once** when it finishes. A `Task.cancel()` cannot stop an already-
+    /// launched git `Process`, so cancellation-based coalescing is deliberately not used.
+    private var isRecomputing = false
+    private var recomputeAgain = false
 
     /// Real language stub (SPEC §6.3's full enum arrives with (syntax-highlighting)): `true` for
     /// a `.md`/`.markdown` extension (case-insensitive), driving the preview column's visibility
@@ -241,6 +261,9 @@ final class WorkspaceModel: ObservableObject {
         // session-restore path too: the watcher uses `kFSEventStreamEventIdSinceNow`, so this does
         // not replay historical events into a launch-time rescan.
         treeWatcher.watch(roots: roots.map(\.url))
+
+        // (git-changed-badge) A freshly added git root badges without waiting for activation.
+        scheduleGitRefresh()
     }
 
     /// Removes `root` from the sidebar. Disk untouched. Clears `selectedFileURL` if it points
@@ -255,6 +278,11 @@ final class WorkspaceModel: ObservableObject {
         // (external-change-watch, Tier 3) Re-point the watcher at the reduced root set so the
         // removed root is no longer watched (an empty set tears the stream down entirely).
         treeWatcher.watch(roots: roots.map(\.url))
+
+        // (git-changed-badge) Recompute the badge set for the reduced root set, mirroring
+        // `addFolders`: a removed git root's file URLs would otherwise linger in `changedFileURLs`.
+        // The coalescing re-run this schedules also self-corrects any stale in-flight result.
+        scheduleGitRefresh()
     }
 
     /// Rescans every root in place (SPEC §5.1: Refresh rescans all folders). Republishes `roots`
@@ -269,8 +297,65 @@ final class WorkspaceModel: ObservableObject {
     /// paths call it with the default so a structure-neutral event doesn't thrash the sidebar.
     func refreshAll(force: Bool = false) {
         let rescanned = roots.map { FileNode.scan(directory: $0.url) }
-        guard force || rescanned != roots else { return }
-        roots = rescanned
+        if force || rescanned != roots {
+            roots = rescanned
+        }
+        // (git-changed-badge) The changed-set is a separate `@Published` property, **independent of
+        // the structural diff**: a structure-neutral event (an in-place content edit to a tracked
+        // file) leaves `roots` unchanged yet still changes git status, so recompute the badge set
+        // unconditionally here even when the tree republish above was skipped.
+        scheduleGitRefresh()
+    }
+
+    /// (git-changed-badge) The one public trigger for recomputing the changed-file badge set (SPEC
+    /// §5.6). Every caller — save, manual Refresh, add-folders, app activation, and the best-effort
+    /// external-change hook — funnels here. Runs on the main actor; the blocking git work hops to
+    /// the dedicated `gitQueue` and back.
+    ///
+    /// Coalescing: while a recompute is in flight (`isRecomputing`), further triggers set
+    /// `recomputeAgain` and the running job re-runs exactly once when it finishes — so a burst never
+    /// spawns concurrent git processes. A 200 ms debounce collapses an event storm before the git
+    /// job launches. `repoRoots` is recomputed on each entry, so a roots change mid-flight is
+    /// honored by the pending re-run. Capturing `gitQueue` strongly in the continuation means a
+    /// deallocated window can never strand an unresumed continuation.
+    func scheduleGitRefresh() {
+        let repoRoots = roots.map(\.url).filter(GitStatus.isRepositoryRoot)
+        guard !repoRoots.isEmpty else {
+            // A window with no git roots clears cheaply — no git job spawned.
+            changedFileURLs = []
+            recomputeAgain = false
+            return
+        }
+        if isRecomputing {
+            recomputeAgain = true
+            return
+        }
+        isRecomputing = true
+        let queue = gitQueue
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(200))
+            let result = await withCheckedContinuation { (continuation: CheckedContinuation<Set<URL>, Never>) in
+                queue.async {
+                    var union = Set<URL>()
+                    for root in repoRoots {
+                        union.formUnion(GitStatus.changedFileURLs(inRepositoryRoot: root))
+                    }
+                    continuation.resume(returning: union)
+                }
+            }
+            guard let self else { return }
+            // (git-changed-badge) If every git root was removed while this job was in flight (e.g.
+            // the last git root removed, whose early-return clear this stale non-empty `result`
+            // would otherwise overwrite), re-derive repo-root existence on the main actor at
+            // assignment time and assign the empty set instead of restaling the cleared one.
+            let stillHasRepoRoots = self.roots.map(\.url).contains(where: GitStatus.isRepositoryRoot)
+            self.changedFileURLs = stillHasRepoRoots ? result : []
+            self.isRecomputing = false
+            if self.recomputeAgain {
+                self.recomputeAgain = false
+                self.scheduleGitRefresh()
+            }
+        }
     }
 
     /// (external-change-watch, Tier 3) The tree watcher's main-actor consumer + skip gate. FSEvents
@@ -490,6 +575,13 @@ final class WorkspaceModel: ObservableObject {
         } else {
             reloadOpenFileFromDisk(text: diskText, signature: currentSignature)
         }
+
+        // (git-changed-badge) Best-effort liveness: a genuine external edit to the open file (from
+        // another tool while FEdit stays active) changes working-tree vs HEAD, so recompute the
+        // badge set. Reached only past the self-write gate above, so FEdit's own autosave never
+        // double-fires here (that write triggers `scheduleGitRefresh()` from `saveOpenFile`). This
+        // is a bonus trigger, not a core one — save/Refresh/activation stand on their own.
+        scheduleGitRefresh()
     }
 
     /// (external-change-watch, Tier 1) The clean-buffer reload path. Deliberately does **not** route
@@ -687,6 +779,9 @@ final class WorkspaceModel: ObservableObject {
                 fileWatcher.watch(resolved)
             }
             cancelPendingAutosave()
+            // (git-changed-badge) A save changes working-tree vs HEAD, so recompute the badge set;
+            // the target file's row gains "(changed)" with no manual action (criterion 5a).
+            scheduleGitRefresh()
             return true
         } catch {
             if alertOnFailure {

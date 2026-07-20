@@ -56,6 +56,7 @@ struct SidebarView: View {
                     }
                 }
                 .listStyle(.sidebar)
+                .environment(\.defaultMinListRowHeight, 20)
             }
         }
     }

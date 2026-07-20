@@ -53,6 +53,10 @@ struct CodeEditorView: NSViewRepresentable {
     /// synthetic reports issued right after a programmatic file switch.
     var onCursorChange: ((Int) -> Void)? = nil
 
+    /// Fires with the line-number gutter width whenever it changes, so `ContentView` can indent the
+    /// editor column's header strip to align the file name with the text pane.
+    var onGutterWidthChange: ((CGFloat) -> Void)? = nil
+
     /// (editor-font-zoom) The current editor font size (SPEC §6.1), owned as the global
     /// `@AppStorage(SettingsKey.editorFontSize)` by `ContentView` and passed in already clamped to
     /// 8–32. Defaulted so any other call site stays source-compatible. A change reaches
@@ -127,6 +131,16 @@ struct CodeEditorView: NSViewRepresentable {
         // (editor-font-zoom): the gutter tracks the editor font size. Set after construction
         // (font was already applied above), so the ruler's number font matches from first paint.
         ruler.editorFontSize = fontSize
+        // Report the gutter width up so ContentView can align the editor header strip's file name
+        // with the text pane. Dispatched async so the resulting SwiftUI @State write never lands
+        // mid-layout. `coordinator.parent` is refreshed at the top of every `updateNSView`.
+        ruler.onThicknessChange = { [weak coordinator] width in
+            DispatchQueue.main.async { coordinator?.parent.onGutterWidthChange?(width) }
+        }
+        let initialGutterWidth = ruler.ruleThickness
+        DispatchQueue.main.async { [weak coordinator] in
+            coordinator?.parent.onGutterWidthChange?(initialGutterWidth)
+        }
         scrollView.verticalRulerView = ruler
         scrollView.hasVerticalRuler = true
         scrollView.rulersVisible = true

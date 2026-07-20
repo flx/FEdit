@@ -27,6 +27,10 @@ import AppKit
 final class LineNumberRulerView: NSRulerView {
     private weak var textView: NSTextView?
 
+    /// Reports the gutter width whenever it changes (digit-count boundary, font zoom, file switch),
+    /// so the editor column's header strip can indent the file name to align with the text pane.
+    var onThicknessChange: ((CGFloat) -> Void)?
+
     /// (editor-font-zoom) The current editor font size, pushed in by `CodeEditorView` on every
     /// zoom. The gutter number font is `editorFontSize − 3` (floored at 8 pt) — the `−3` offset
     /// reproduces the historical 10-pt gutter at the 13-pt default, and the floor keeps the number
@@ -118,6 +122,7 @@ final class LineNumberRulerView: NSRulerView {
 
         if newThickness != ruleThickness {
             ruleThickness = newThickness
+            onThicknessChange?(newThickness)
         }
     }
 

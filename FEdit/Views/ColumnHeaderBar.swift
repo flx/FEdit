@@ -27,6 +27,10 @@ import SwiftUI
 /// the caller decides whether to render it (mirrors `SplitDivider` owning no state).
 struct ColumnHeaderBar: View {
     let title: String
+    /// Extra leading inset for the title. The editor strip passes the live line-number gutter
+    /// width so the file name aligns with the text pane (starting just past the gutter), instead
+    /// of sitting over the gutter. Defaults to 0 (sidebar/preview strips use the standard 8 pt).
+    var leadingInset: CGFloat = 0
 
     var body: some View {
         Text(title)
@@ -35,7 +39,8 @@ struct ColumnHeaderBar: View {
             .lineLimit(1)
             .truncationMode(.tail)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 8)
+            .padding(.leading, max(leadingInset, 8))
+            .padding(.trailing, 8)
             .frame(height: LayoutMetrics.columnHeaderHeight)
             .background(Color(nsColor: .windowBackgroundColor))
             .overlay(alignment: .bottom) {

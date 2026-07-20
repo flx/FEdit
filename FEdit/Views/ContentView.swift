@@ -122,8 +122,8 @@ struct ContentView: View {
             }
         }
         // Exposes this window's workspace to `FileCommands` via `@FocusedObject`, so
-        // File → Add Folder to Window…/Save always target the focused window (SPEC §10).
-        // (Open Folder…/Cmd+N is app-level — it creates a new window — and is not scoped here.)
+        // File → New…/Add Folder to Window…/Save always target the focused window (SPEC §10).
+        // (Open Folder…/Cmd+O is app-level — it creates a new window — and is not scoped here.)
         .focusedSceneObject(workspace)
         // Window title/subtitle (SPEC §7): the open file's name, with an "Edited" marker while
         // dirty. Sidebar row taps route through `WorkspaceModel.requestOpen` directly — there is
@@ -137,6 +137,15 @@ struct ContentView: View {
         // its close button / Cmd+W (SPEC §7). See `WindowCloseGuard` for why this can't just
         // replace `window.delegate`.
         .background(WindowCloseGuard(model: workspace))
+        // (new-file) File → New… sheet (SPEC §7, §10). `onDismiss` runs after the sheet is fully
+        // gone, so `openPendingNewFileIfNeeded()` → `requestOpen` (and any dirty-switch guard UI it
+        // might surface on the outgoing file) never stacks under a live sheet. On Cancel nothing is
+        // pending, so it is a no-op.
+        .sheet(isPresented: $workspace.isPresentingNewFileSheet, onDismiss: {
+            workspace.openPendingNewFileIfNeeded()
+        }) {
+            NewFileSheet(workspace: workspace)
+        }
         // (markdown-preview) High defect #1: without this, `editorFirstVisibleLine` would keep
         // holding the *previous* file's line for ~100–200 ms after a switch (until the editor's
         // throttled report for the new file arrives), and that stale value must not drive the
@@ -145,8 +154,8 @@ struct ContentView: View {
             editorFirstVisibleLine = 0
         }
         // (session-restore) SPEC §3, §9: restore this scene's state once, on first appear. A
-        // freshly created (Cmd+N) scene's `@SceneStorage` value is empty, so `restore` is a
-        // no-op there — the pristine-scene guarantee this relies on.
+        // freshly created (Open Folder…/Cmd+O) scene's `@SceneStorage` value is empty, so `restore`
+        // is a no-op there — the pristine-scene guarantee this relies on.
         // (git-changed-badge) App activation is the cheap HEAD-move signal (SPEC §5.6): the user
         // switches to Terminal, runs commit/checkout/reset, switches back → `didBecomeActive` fires
         // (app-level, inactive→active only) and each window's `ContentView` recomputes its own
@@ -164,7 +173,7 @@ struct ContentView: View {
             // deactivate/reactivate cycle. A restored window's `restore` → `addFolders` already
             // scheduled one; this covers the no-restore path and is coalesced regardless.
             workspace.scheduleGitRefresh()
-            // "Open Folder…" (Cmd+N) new-window flow: the menu command incremented the launch
+            // "Open Folder…" (Cmd+O) new-window flow: the menu command incremented the launch
             // mailbox immediately before opening this window. Drain exactly one pending pick if
             // this window is genuinely pristine (nothing restored above), then present the
             // folder picker one runloop turn later so the window is on screen first — Cancel

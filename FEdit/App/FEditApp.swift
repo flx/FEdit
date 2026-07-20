@@ -104,6 +104,18 @@ struct FileCommands: Commands {
         // runs on the main actor immediately before `openWindow`, so the new window's appear
         // observes it.
         CommandGroup(replacing: .newItem) {
+            // (new-file) File → New… (SPEC §7, §10) — first in the group, so the File menu reads
+            // New… → Open Folder…. Focused-window-scoped (unlike Open Folder…): `@FocusedObject`
+            // resolves the key window's model (reusing Save's focused-model resolution) and flipping
+            // its published `isPresentingNewFileSheet` presents ContentView's `.sheet` in that
+            // window only. `.disabled` covers both "no window focused" (`workspace == nil`) and
+            // "nowhere to create" (`!canCreateNewFile`).
+            Button("New…") {
+                workspace?.presentNewFileSheet()
+            }
+            .keyboardShortcut("n", modifiers: [.command])
+            .disabled(workspace?.canCreateNewFile != true)
+
             Button("Open Folder…") {
                 LaunchCoordinator.shared.pendingNewWindowPicks += 1
                 openWindow(id: "editor")

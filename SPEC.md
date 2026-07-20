@@ -19,6 +19,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 ## 3. Windows
 
 - `WindowGroup`-based: **multiple editor windows** opened via File → Open Folder… (Cmd+O), which opens a new window and prompts for a folder that becomes the new window's sole root (Cancel leaves an empty window).
+- File → New… (Cmd+N) is focused-window-scoped — it creates a file in the key window's target directory (§7) rather than opening a new window.
 - Each window owns its own independent state: folder list, filter text, open file, cursor.
 - Default window size 1100×700, minimum 700×400.
 - Window frames restored by the system's window restoration.
@@ -60,6 +61,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
   - **Sidebar roots:** each root is watched recursively with FSEvents; an external add/remove (including in subdirectories) is reflected in the tree without manual Refresh, debounced so a burst of changes coalesces into a single rescan. Removing a root stops watching it. Manual Refresh remains.
 - Hidden files (dotfiles) are skipped. Additionally skipped directory names: `node_modules`, `.build`, `DerivedData`.
 - Sort order within a directory: folders first, then files, each alphabetically (`localizedStandardCompare`).
+- A file created via File → New… (§7) appears in the tree after the automatic refresh that creation triggers; its row is visible when its containing folder is expanded (a file created into a collapsed nested folder still opens, but its row is revealed only on expand).
 
 ### 5.3 Tree mode (empty filter)
 - Expandable/collapsible tree (disclosure triangles), folders with a folder icon, files with a type-appropriate icon.
@@ -120,6 +122,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 ## 7. Open / save / autosave
 
 - **Opening:** any file readable as text (UTF-8, fallback Latin-1). Files containing NUL bytes are treated as binary and refused with an alert. Read errors are alerted.
+- **Creating a file:** File → New… (Cmd+N) presents a per-window sheet with a filename field. On confirm it writes an **empty** file at the target directory — the open file's parent, or the first top-level root when nothing is open — then refreshes the sidebar so the new row appears (subject to §5.2's disclosure caveat) and opens the file through the same dirty-switch guard as a sidebar-row tap. Validation keeps the sheet open with an inline error on failure: the name must be non-empty, contain no `/` or `:`, and not start with a dot (a dotfile would be hidden from the sidebar, §5.2). A name collision shows an "already exists" error and **never overwrites** the existing file; other write failures show an inline error. Cancel closes the sheet with no change. New… is disabled when there is neither an open file nor any root.
 - **Dirty tracking:** any edit marks the file dirty; the window subtitle shows an "Edited" marker.
 - The window `.navigationTitle` is always **"FEdit"** (not the file name — the open file's name is shown in the editor column's fixed top strip, §4). The window `.navigationSubtitle` still carries the "Edited" dirty marker.
 - **Save:** Cmd+S, atomic write, UTF-8. Cmd+S is immediate. Write errors are alerted and the file stays dirty.
@@ -168,11 +171,12 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 
 | Menu item | Shortcut | Behavior |
 |---|---|---|
+| File → New… | Cmd+N | create a new file in the open file's folder, or the first root; disabled when neither exists (§7) |
 | File → Open Folder… | Cmd+O | opens a new window and prompts for a folder (its sole root); Cancel leaves an empty window |
 | File → Add Folder to Window… | Cmd+Shift+O | add top-level folder(s) to the focused window |
 | File → Save | Cmd+S | save open file (disabled when none/clean; autosave is unconditional, §7) |
 
-Commands act on the focused window's state (`focusedSceneObject`), except **Open Folder… (Cmd+O)**, which is app-level — it creates a new window and is not focused-window-scoped.
+Commands act on the focused window's state (`focusedSceneObject`), except **Open Folder… (Cmd+O)**, which is app-level — it creates a new window and is not focused-window-scoped. **New… (Cmd+N)** is focused-window-scoped: it presents its sheet in the key window and creates in that window's target directory only.
 
 ## 11. Error handling & edge cases
 
@@ -184,7 +188,7 @@ Commands act on the focused window's state (`focusedSceneObject`), except **Open
 
 ## 12. Non-goals (v1)
 
-Tabs, split editors, find/replace, file create/rename/delete from the sidebar, git integration **beyond the single read-only "(changed)" file-status badge of §5.6** (no branch/ahead-behind/staging UI, no diff, no commit — the §5.6 badge is the one sanctioned exception to this non-goal), LSP/completion, themes/dark mode, printing, preview→editor scroll sync, encodings beyond UTF-8/Latin-1 fallback. (File-system watching of the open file and sidebar roots is now in v1 — see §5.2 — and no longer a non-goal.)
+Tabs, split editors, find/replace, file **rename/delete** and sidebar-driven file create (file **create** is supported via File → New… (§7) — creating from a sidebar context menu, and rename/delete, remain non-goals), git integration **beyond the single read-only "(changed)" file-status badge of §5.6** (no branch/ahead-behind/staging UI, no diff, no commit — the §5.6 badge is the one sanctioned exception to this non-goal), LSP/completion, themes/dark mode, printing, preview→editor scroll sync, encodings beyond UTF-8/Latin-1 fallback. (File-system watching of the open file and sidebar roots is now in v1 — see §5.2 — and no longer a non-goal.)
 
 ## 13. Planned project structure
 

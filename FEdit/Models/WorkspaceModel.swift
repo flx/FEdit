@@ -25,7 +25,7 @@ import SwiftUI
 
 /// Per-window state for the folder sidebar (SPEC §5, §10) and the open document (SPEC §7). One
 /// instance lives per window (SPEC §3) and is exposed to `Commands` via `.focusedSceneObject` so
-/// File → Add Folder to Window…/Save always target the focused window. (Open Folder…/Cmd+N is
+/// File → New…/Add Folder to Window…/Save always target the focused window. (Open Folder…/Cmd+O is
 /// app-level — it opens a new window — and is not focused-window-scoped.)
 @MainActor
 final class WorkspaceModel: ObservableObject {
@@ -83,6 +83,18 @@ final class WorkspaceModel: ObservableObject {
     /// than view `@State` because SPEC §9 persists filter text per window, and (session-restore)
     /// snapshots from `WorkspaceModel` — parking it here now avoids a later move.
     @Published var filterText: String = ""
+
+    /// (new-file) Per-window flag driving ContentView's `.sheet(isPresented:)` for File → New…
+    /// (SPEC §7, §10). The app-level menu command reaches the focused window's model and flips this
+    /// true; the sheet flips it false on Create/Cancel. This published flag is the seam by which an
+    /// app-level `Commands` button presents UI in the key window only.
+    @Published var isPresentingNewFileSheet: Bool = false
+
+    /// (new-file) The just-created file's (standardized) URL, stashed by `createFile` and consumed
+    /// by `openPendingNewFileIfNeeded()` from the sheet's `onDismiss` — so the open (and any
+    /// dirty-switch guard UI `requestOpen` might surface on the outgoing file) runs only after the
+    /// sheet is fully gone, never stacked under a live sheet. Nil except in that brief window.
+    private var pendingNewFileURL: URL?
 
     /// The file currently loaded into the editor, or `nil` if none (SPEC §6.1, §7).
     @Published var openFile: OpenFile?
@@ -182,6 +194,21 @@ final class WorkspaceModel: ObservableObject {
     /// Whether File → Save should be enabled (SPEC §10): a file is open and has unsaved edits.
     var canSave: Bool {
         openFile?.isDirty == true
+    }
+
+    /// (new-file) The directory a File → New… file is created in (SPEC §7): the open file's parent
+    /// when a file is open, else the first top-level root. `nil` only when there is neither an open
+    /// file nor any root — the sole case where New… is disabled (`canCreateNewFile`). Because
+    /// `removeRoot` leaves `openFile` intact, the open-file branch can still hold with `roots` empty
+    /// (target = the open file's parent).
+    var newFileTargetDirectory: URL? {
+        openFile?.url.deletingLastPathComponent() ?? roots.first?.url
+    }
+
+    /// (new-file) Whether File → New… is enabled (SPEC §10): there is a target directory to create
+    /// the file in (an open file's parent, or at least one root).
+    var canCreateNewFile: Bool {
+        newFileTargetDirectory != nil
     }
 
     /// The editor's full text buffer (SPEC §6.1), backed by `openFile`. The setter only marks
@@ -813,8 +840,8 @@ final class WorkspaceModel: ObservableObject {
     }
 
     /// Presents an `NSOpenPanel` restricted to directories, **single-select**, for the "Open
-    /// Folder…" (Cmd+N) new-window flow: called only on a pristine (empty-`roots`) model when a
-    /// Cmd+N-created window drains the launch mailbox on appear, so `addFolders` yields the chosen
+    /// Folder…" (Cmd+O) new-window flow: called only on a pristine (empty-`roots`) model when a
+    /// Cmd+O-created window drains the launch mailbox on appear, so `addFolders` yields the chosen
     /// folder as this window's sole root. Cancel is a no-op, leaving the new window empty.
     func presentNewWindowFolderPanel() {
         let panel = NSOpenPanel()
@@ -825,6 +852,100 @@ final class WorkspaceModel: ObservableObject {
         if panel.runModal() == .OK {
             addFolders(panel.urls)
         }
+    }
+
+    // MARK: - New file creation (SPEC §7, §10)
+
+    /// (new-file) The outcome of `createFile(named:)`. `.created` carries no inline message (the
+    /// sheet dismisses itself); every failure case supplies the error the sheet shows while staying
+    /// open.
+    enum NewFileResult {
+        case created
+        case invalidName
+        case duplicateName
+        case writeFailed(String)
+
+        /// The inline error to show in the sheet, or `nil` on success.
+        var message: String? {
+            switch self {
+            case .created:
+                return nil
+            case .invalidName:
+                return "Enter a file name that isn't empty, contains no “/” or “:”, and doesn't start with a dot."
+            case .duplicateName:
+                return "A file with that name already exists."
+            case .writeFailed(let message):
+                return message
+            }
+        }
+    }
+
+    /// (new-file) Presents the File → New… sheet in this (the focused) window. Defensively guards on
+    /// `canCreateNewFile` even though the menu item is already `.disabled` when it is false.
+    func presentNewFileSheet() {
+        guard canCreateNewFile else { return }
+        isPresentingNewFileSheet = true
+    }
+
+    /// (new-file) Validates `rawName` and, on success, writes an empty file in
+    /// `newFileTargetDirectory` (SPEC §7). Rejects (→ `.invalidName`) an empty/whitespace name, a
+    /// name containing `/` or `:`, `.`/`..`, or a leading-dot name — the last because `FileNode.scan`
+    /// skips hidden files (SPEC §5.2), so a dotfile would be created but never appear in the sidebar.
+    /// A name collision returns `.duplicateName` **without overwriting** (`.withoutOverwriting` also
+    /// closes the check→write TOCTOU window); any other write failure returns `.writeFailed`. On
+    /// success it rescans the roots (`force`, so the explicit action always republishes and the new
+    /// row appears — subject to the target folder being expanded), stashes the standardized URL in
+    /// `pendingNewFileURL` for `openPendingNewFileIfNeeded()`, and returns `.created`. It does
+    /// **not** touch `isPresentingNewFileSheet` (the sheet dismisses itself) or open the file (that
+    /// runs from the sheet's `onDismiss`).
+    func createFile(named rawName: String) -> NewFileResult {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty,
+              !name.contains("/"),
+              !name.contains(":"),
+              name != ".", name != "..",
+              !name.hasPrefix(".") else {
+            return .invalidName
+        }
+
+        guard let dir = newFileTargetDirectory else {
+            return .writeFailed("No folder is open to create the file in.")
+        }
+
+        // Standardized so it compares equal to the sidebar's `FileNode.url` (also standardized) for
+        // selection/highlight; the same URL is both the write target and the stashed pending URL.
+        let fileURL = dir.appendingPathComponent(name).standardizedFileURL
+
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            return .duplicateName
+        }
+
+        do {
+            // `.withoutOverwriting` (not `.atomic`): an existing file is never clobbered — closing
+            // the TOCTOU window between the check above and this write — and the content is 0 bytes,
+            // so atomicity is moot. `.atomic`'s temp-then-rename would clobber an existing file.
+            try Data().write(to: fileURL, options: .withoutOverwriting)
+        } catch CocoaError.fileWriteFileExists {
+            return .duplicateName
+        } catch {
+            return .writeFailed(error.localizedDescription)
+        }
+
+        refreshAll(force: true)
+        pendingNewFileURL = fileURL
+        return .created
+    }
+
+    /// (new-file) Opens the file `createFile` just created, called from ContentView's
+    /// `.sheet(onDismiss:)` so it runs only after the sheet is fully dismissed. Routes through
+    /// `requestOpen` exactly like a sidebar-row tap — honoring the current dirty-switch behavior on
+    /// the outgoing file (SPEC §7); on a `.cancel` outcome the new file stays created and visible but
+    /// unopened and selection reverts. A no-op when nothing is pending (e.g. the sheet was
+    /// cancelled).
+    func openPendingNewFileIfNeeded() {
+        guard let url = pendingNewFileURL else { return }
+        pendingNewFileURL = nil
+        requestOpen(url)
     }
 
     // MARK: - Session restore (SPEC §3, §9)

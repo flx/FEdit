@@ -144,6 +144,10 @@ private struct FileRow: View {
                     .foregroundStyle(isSelected ? Color(nsColor: .selectedMenuItemTextColor) : .primary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            // Give the row a defined height that meets the list's row-height floor, so the
+            // selection pill below can inset within it for a little top/bottom breathing room
+            // instead of filling the row edge-to-edge (which reads as cramped at tight density).
+            .padding(.vertical, 2)
             .contentShape(Rectangle())
             .onTapGesture {
                 workspace.requestOpen(node.url)
@@ -151,6 +155,7 @@ private struct FileRow: View {
             .background(
                 RoundedRectangle(cornerRadius: 4)
                     .fill(isSelected ? Color(nsColor: .selectedContentBackgroundColor) : Color.clear)
+                    .padding(.vertical, 2)
             )
         }
     }

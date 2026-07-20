@@ -49,11 +49,25 @@ final class WorkspaceModel: ObservableObject {
     /// that isn't an ordinary bounded text file (see `loadText(from:)`).
     private static let maxReadableFileSize = 100 * 1024 * 1024
 
-    /// Outcome of `resolveDirtyFile()` (SPEC §7): whether the caller (a file switch, window
-    /// close, or app quit) may proceed, or must stop where it is.
+    /// Autosave debounce interval (SPEC §7): the open file is written this long after the last
+    /// keystroke. Within the plan's 0.5–1 s band — short enough that the on-disk file tracks the
+    /// editor within a second, long enough to coalesce a typing burst into a single write.
+    private static let autosaveInterval: TimeInterval = 0.75
+
+    /// Outcome of `resolveDirtyFile(context:)` (SPEC §7): whether the caller (a file switch,
+    /// window close, or app quit) may proceed, or must stop where it is.
     enum DirtyResolution {
         case proceed
         case cancel
+    }
+
+    /// Which boundary is invoking `resolveDirtyFile(context:)`. The flush is identical; only the
+    /// **failure** behavior forks: a file switch aborts and preserves the buffer, while a
+    /// close/quit offers the minimal "Close Without Saving / Cancel" escape so a persistently
+    /// -failing save can never make the app un-quittable.
+    enum DirtyContext {
+        case fileSwitch
+        case closeOrQuit
     }
 
     @Published private(set) var roots: [FileNode] = []
@@ -83,6 +97,17 @@ final class WorkspaceModel: ObservableObject {
     /// callback, which fires `noteCursorMoved` and clears this).
     private(set) var pendingCursorRestore: Int?
 
+    /// The in-flight debounced autosave write, cancel-and-rescheduled on every edit (mirrors
+    /// `CodeEditorView`'s `pendingHighlight` idiom). Nil when nothing is pending. Cancelled by
+    /// `cancelPendingAutosave()` on a file switch / explicit save, and its work item re-checks
+    /// dirtiness at fire time so a straggler that outlives a switch or reload is a no-op.
+    private var pendingAutosave: DispatchWorkItem?
+
+    /// Token for the `NSApplication.didResignActiveNotification` observer that flushes a dirty
+    /// buffer the moment the user leaves FEdit (Tier 3), collapsing the leave-app exposure window
+    /// to ~0. Removed in `deinit`.
+    private var resignActiveObserver: NSObjectProtocol?
+
     /// Real language stub (SPEC §6.3's full enum arrives with (syntax-highlighting)): `true` for
     /// a `.md`/`.markdown` extension (case-insensitive), driving the preview column's visibility
     /// (SPEC §8).
@@ -105,6 +130,8 @@ final class WorkspaceModel: ObservableObject {
     /// The editor's full text buffer (SPEC §6.1), backed by `openFile`. The setter only marks
     /// the file dirty when the value actually changed, so programmatic loads — which replace
     /// `openFile` wholesale — never go through here and never mark a freshly opened file dirty.
+    /// On a real edit it (re)arms the debounced autosave, so the on-disk file tracks the editor
+    /// within `autosaveInterval` of the last keystroke (SPEC §7).
     var editorText: String {
         get { openFile?.text ?? "" }
         set {
@@ -112,6 +139,33 @@ final class WorkspaceModel: ObservableObject {
             file.text = newValue
             file.isDirty = true
             openFile = file
+            scheduleAutosave()
+        }
+    }
+
+    init() {
+        // Flush a dirty buffer the instant the user leaves FEdit for another app (Tier 3), so an
+        // external tool (Terminal, Claude) that then edits the same file starts from the editor's
+        // latest text — the leave-app exposure window collapses to ~0. `didResignActiveNotification`
+        // is app-wide, so every per-window model observes it and each flushes its own buffer; a
+        // clean or unfocused-file buffer is a cheap no-op inside `flushPendingAutosave`. AppKit
+        // posts this on the main thread; `assumeIsolated` just states that to the compiler.
+        resignActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.flushPendingAutosave() }
+        }
+    }
+
+    deinit {
+        // No window-scoped model outlives its window, but cancel defensively so a fired-but-not-yet
+        // -run debounce can't touch a torn-down model. (`[weak self]` in the work item already
+        // guards the closure body; this releases the retained `DispatchWorkItem` too.)
+        pendingAutosave?.cancel()
+        if let resignActiveObserver {
+            NotificationCenter.default.removeObserver(resignActiveObserver)
         }
     }
 
@@ -196,7 +250,14 @@ final class WorkspaceModel: ObservableObject {
     /// (session-restore)'s silent restore-open: replaces `openFile` with a clean (non-dirty)
     /// buffer and syncs `selectedFileURL` to `url`. Factored out so the two routes' success
     /// behavior can never drift apart.
+    ///
+    /// Cancels any pending autosave **first** (coordination seam): this is the file-switch load
+    /// path, so a stale debounced write armed against the previous buffer must never fire and
+    /// clobber the file being loaded here. (External reloads do **not** route through this — they
+    /// re-arm the watcher — so (external-change-watch) has its own reload path that likewise calls
+    /// `cancelPendingAutosave()` first.)
     private func applyLoadedFile(url: URL, text: String) {
+        cancelPendingAutosave()
         openFile = OpenFile(url: url, text: text, isDirty: false)
         selectedFileURL = url
     }
@@ -230,14 +291,15 @@ final class WorkspaceModel: ObservableObject {
     /// The sidebar's single entry point for opening a file (both tree rows and filter-query's
     /// flat filtered rows share `FileRow`'s tap action, so both route through here — criterion
     /// 9a). No-op if `url` is already the open file (criterion 18: re-clicking the open file's
-    /// own row never reloads or resets the caret). Otherwise runs `resolveDirtyFile()` first:
-    /// `.proceed` loads `url`; `.cancel` reverts the published selection back to the file that's
-    /// still open — because writing `selectedFileURL` has zero side effects (see its doc
-    /// comment), this only moves the sidebar highlight and cannot itself trigger another load.
+    /// own row never reloads or resets the caret). Otherwise runs `resolveDirtyFile(context:)`
+    /// with the `.fileSwitch` context: `.proceed` loads `url`; `.cancel` (a failed autosave flush)
+    /// reverts the published selection back to the file that's still open — because writing
+    /// `selectedFileURL` has zero side effects (see its doc comment), this only moves the sidebar
+    /// highlight and cannot itself trigger another load.
     func requestOpen(_ url: URL) {
         guard url != openFile?.url else { return }
 
-        switch resolveDirtyFile() {
+        switch resolveDirtyFile(context: .fileSwitch) {
         case .proceed:
             loadFile(url)
         case .cancel:
@@ -245,38 +307,59 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
-    /// Shared dirty-file guard (SPEC §7): runs before a file switch, and reused verbatim by
-    /// `windowShouldClose`/`applicationShouldTerminate` (Tier 4) since it is synchronous and
-    /// already app-modal. Clean or no open file needs no confirmation. Autosave ON saves
-    /// silently — a failed save aborts (criterion 15). Autosave OFF shows the app-modal
-    /// four-button dialog (criterion 9); Cancel gets Escape automatically from being the last
-    /// button added with a default-looking title.
+    /// The dirty-file guard (SPEC §7): run before a file switch, and — via the `WindowCloseGuard`
+    /// proxy — before a window close or app quit. Synchronous and app-modal, so the close/quit
+    /// path reuses it unchanged. Autosave is unconditional now, so this is a **silent flush-and-
+    /// check**, not the old four-button prompt: a clean or absent buffer proceeds untouched; a
+    /// dirty buffer is flushed through `saveOpenFile`.
     ///
-    /// **Dialog order (accepted for v1):** this runs before the target file's readability is
-    /// known, so choosing Save and then hitting a binary/unreadable target means a "wasted" save
-    /// followed by the refusal alert — accepted, not fixed, per the plan's recorded decision.
-    func resolveDirtyFile() -> DirtyResolution {
+    /// Cancels any pending debounced autosave **first** (D3): the flush writes the buffer
+    /// synchronously, so a straggler debounce firing behind whatever the caller does next must not
+    /// re-write a buffer a discard/close is about to abandon.
+    ///
+    /// On a flush **failure** the behavior forks on `context`:
+    /// - `.fileSwitch` aborts the switch (`.cancel`); `saveOpenFile` has already shown the "Cannot
+    ///   Save File" alert and the caller reverts the sidebar selection — no second dialog.
+    /// - `.closeOrQuit` shows the sole surviving unsaved-changes dialog — the minimal two-button
+    ///   "Close Without Saving / Cancel" escape — so a persistently-unwritable location (read-only
+    ///   dir, full or unmounted volume) can never make the app un-quittable.
+    func resolveDirtyFile(context: DirtyContext) -> DirtyResolution {
         guard openFile?.isDirty == true else { return .proceed }
 
-        if autosaveOnFileSwitch {
-            return saveOpenFile() ? .proceed : .cancel
+        cancelPendingAutosave()
+        // `.fileSwitch` wants the "Cannot Save File" alert on a flush failure (criterion 8);
+        // `.closeOrQuit` flushes silently so its sole `presentUnsavedCloseEscape()` dialog is the
+        // only modal — SPEC's single-escape-dialog rule.
+        let alertOnFail = (context == .fileSwitch)
+        if saveOpenFile(alertOnFailure: alertOnFail) {
+            return .proceed
         }
 
+        switch context {
+        case .fileSwitch:
+            return .cancel
+        case .closeOrQuit:
+            return presentUnsavedCloseEscape()
+        }
+    }
+
+    /// The sole surviving unsaved-changes dialog — shown only when a **close/quit** flush keeps
+    /// failing (`resolveDirtyFile(context: .closeOrQuit)`), never on a plain file switch. Minimal
+    /// by design: it exists solely so a persistently-failing save can't make the app un-quittable.
+    /// "Cancel" (first, the default) keeps the window open / aborts the quit and owns the Return key;
+    /// it also gets the Escape key equivalent automatically from AppKit for its title, so both Return
+    /// and Escape resolve to the safe action. "Close Without Saving" (last) discards the unsaved
+    /// buffer and proceeds.
+    private func presentUnsavedCloseEscape() -> DirtyResolution {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Save changes to '\(openFile?.url.lastPathComponent ?? "")'?"
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Always Autosave")
-        alert.addButton(withTitle: "Don't Save")
+        alert.messageText = "Couldn't save '\(openFile?.url.lastPathComponent ?? "")'"
         alert.addButton(withTitle: "Cancel")
+        let closeButton = alert.addButton(withTitle: "Close Without Saving")
+        closeButton.hasDestructiveAction = true
 
         switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            return saveOpenFile() ? .proceed : .cancel
         case .alertSecondButtonReturn:
-            autosaveOnFileSwitch = true
-            return saveOpenFile() ? .proceed : .cancel
-        case .alertThirdButtonReturn:
             return .proceed
         default:
             return .cancel
@@ -300,13 +383,65 @@ final class WorkspaceModel: ObservableObject {
         alert.runModal()
     }
 
-    /// Writes the open file's text to disk atomically (SPEC §7: Cmd+S). Recreating a file that
-    /// was deleted out from under the app needs no special handling — an atomic write to a path
-    /// with nothing there just (re)creates it. On success clears `isDirty`; on failure alerts
-    /// with the underlying error and leaves the file dirty. `false` means "still dirty" for
-    /// callers that need to abort a switch/close/quit on a failed save.
+    /// Debounces an autosave write `autosaveInterval` after the last edit (mirrors
+    /// `CodeEditorView.scheduleHighlight`): cancels any already-pending write and reschedules, so a
+    /// typing burst coalesces into a single write ~0.75 s after the last keystroke. The work item
+    /// re-checks `openFile?.isDirty` **at fire time** (not schedule time), so a straggler that
+    /// outlives a file switch, an explicit save, or an (external-change-watch) reload finds a clean
+    /// buffer and is a no-op. Saves silently (`alertOnFailure: false`) — a failing autosave in a
+    /// read-only location must not throw a modal every tick; the persistent "Edited" subtitle is
+    /// the passive signal, and the failure is surfaced at the next explicit save boundary (Cmd+S or
+    /// the `resolveDirtyFile` flush). `[weak self]` so a closed window's model is neither kept
+    /// alive nor fired.
+    private func scheduleAutosave() {
+        pendingAutosave?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            // Dispatched to `DispatchQueue.main` below, so this body runs on the main actor;
+            // `assumeIsolated` states that to the compiler (matching the resign-active observer and
+            // WindowCloseGuardProxy) so the `@MainActor` `openFile`/`saveOpenFile` access is sound.
+            MainActor.assumeIsolated {
+                guard let self, self.openFile?.isDirty == true else { return }
+                self.saveOpenFile(alertOnFailure: false)
+            }
+        }
+        pendingAutosave = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.autosaveInterval, execute: workItem)
+    }
+
+    /// Cancels and clears any pending debounced autosave. **Exposed and required** — part of the
+    /// coordination seam: `applyLoadedFile` and `saveOpenFile`'s success branch call it internally
+    /// so a stale timer from the previous buffer can never write the current one, and
+    /// (external-change-watch) calls it at the top of its own reload path so a straggler autosave
+    /// can't clobber a just-applied external reload.
+    func cancelPendingAutosave() {
+        pendingAutosave?.cancel()
+        pendingAutosave = nil
+    }
+
+    /// Flushes a dirty buffer immediately, replacing the pending debounce with an eager write —
+    /// used when the app resigns active (Tier 3), so leaving FEdit doesn't leave the last edits
+    /// exposed for up to `autosaveInterval`. Cancels the debounce first (this write supersedes it),
+    /// then writes silently (`alertOnFailure: false`, the same anti-spam rule as the debounce —
+    /// resign-active is not an explicit save boundary, so a failure stays passive as "Edited" and
+    /// surfaces at the next Cmd+S / switch / close / quit). A clean or absent buffer is a no-op.
+    func flushPendingAutosave() {
+        cancelPendingAutosave()
+        if openFile?.isDirty == true {
+            saveOpenFile(alertOnFailure: false)
+        }
+    }
+
+    /// Writes the open file's text to disk atomically (SPEC §7: Cmd+S, and the always-on autosave
+    /// flushes). Recreating a file that was deleted out from under the app needs no special
+    /// handling — an atomic write to a path with nothing there just (re)creates it. On success
+    /// clears `isDirty`, republishes `openFile`, and cancels any pending debounced write (an
+    /// explicit/flush save makes it redundant). On failure alerts **only if `alertOnFailure`**
+    /// (the debounced and resign-active autosaves pass `false` to stay silent — see
+    /// `scheduleAutosave`) and leaves the file dirty. `false` means "still dirty" for callers that
+    /// must abort a switch/close/quit on a failed save. `alertOnFailure` defaults to `true` so
+    /// Cmd+S and the `resolveDirtyFile` flush stay source-compatible and always surface a failure.
     @discardableResult
-    func saveOpenFile() -> Bool {
+    func saveOpenFile(alertOnFailure: Bool = true) -> Bool {
         guard var file = openFile else { return false }
 
         do {
@@ -318,9 +453,15 @@ final class WorkspaceModel: ObservableObject {
             try Data(file.text.utf8).write(to: file.url.resolvingSymlinksInPath(), options: .atomic)
             file.isDirty = false
             openFile = file
+            // The single shared post-write success branch: (external-change-watch) will hang its
+            // `FileSignature` echo-suppression capture here when it ships. This item captures
+            // nothing — it only cancels the now-redundant pending debounce.
+            cancelPendingAutosave()
             return true
         } catch {
-            presentSaveErrorAlert(for: file.url, error: error)
+            if alertOnFailure {
+                presentSaveErrorAlert(for: file.url, error: error)
+            }
             return false
         }
     }
@@ -331,14 +472,6 @@ final class WorkspaceModel: ObservableObject {
         alert.messageText = "Cannot Save File"
         alert.informativeText = "\"\(url.lastPathComponent)\" could not be saved: \(error.localizedDescription)"
         alert.runModal()
-    }
-
-    /// Global autosave-on-file-switch setting (SPEC §7, §9): shared with the File menu's
-    /// `@AppStorage` toggle via the same `UserDefaults` key, so either side flipping it is
-    /// immediately visible to the other.
-    var autosaveOnFileSwitch: Bool {
-        get { UserDefaults.standard.bool(forKey: SettingsKey.autosaveOnFileSwitch) }
-        set { UserDefaults.standard.set(newValue, forKey: SettingsKey.autosaveOnFileSwitch) }
     }
 
     /// Presents an `NSOpenPanel` restricted to directories, multi-select enabled, and adds the

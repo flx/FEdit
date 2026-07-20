@@ -96,10 +96,6 @@ struct FileCommands: Commands {
     // with no window focused (e.g. after closing the last window).
     @Environment(\.openWindow) private var openWindow
 
-    // Same `UserDefaults` key the model reads/writes directly (`WorkspaceModel.autosaveOnFileSwitch`)
-    // — this `@AppStorage` is just the menu's live view onto it, not a second source of truth.
-    @AppStorage(SettingsKey.autosaveOnFileSwitch) private var autosaveOnFileSwitch = false
-
     var body: some Commands {
         // Replace SwiftUI's default "New Window" (which `.newItem` auto-installs at Cmd+N) with
         // "Open Folder…": creates a fresh empty window and flags intent via the launch mailbox so
@@ -129,8 +125,6 @@ struct FileCommands: Commands {
             }
             .keyboardShortcut("s", modifiers: [.command])
             .disabled(workspace?.canSave != true)
-
-            Toggle("Autosave on File Switch", isOn: $autosaveOnFileSwitch)
         }
     }
 }
@@ -139,7 +133,6 @@ struct FileCommands: Commands {
 enum SettingsKey {
     static let sidebarWidth = "sidebarWidth"
     static let editorFraction = "editorFraction"
-    static let autosaveOnFileSwitch = "autosaveOnFileSwitch"
     // (editor-font-zoom) One global default (not per-window scene state), so every open editor
     // updates live on change and the size survives relaunch.
     static let editorFontSize = "editorFontSize"

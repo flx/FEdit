@@ -113,16 +113,13 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 - **Opening:** any file readable as text (UTF-8, fallback Latin-1). Files containing NUL bytes are treated as binary and refused with an alert. Read errors are alerted.
 - **Dirty tracking:** any edit marks the file dirty; the window subtitle shows an "Edited" marker.
 - The window `.navigationTitle` is always **"FEdit"** (not the file name — the open file's name is shown in the editor column's fixed top strip, §4). The window `.navigationSubtitle` still carries the "Edited" dirty marker.
-- **Save:** Cmd+S, atomic write, UTF-8. Write errors are alerted and the file stays dirty.
-- **Switching files with unsaved changes:**
-  - If autosave is ON: save silently, then switch (a failed save aborts the switch).
-  - If autosave is OFF: modal dialog "Save changes to '<name>'?" with buttons:
-    1. **Save** — save, then switch.
-    2. **Always Autosave** — turn the persistent autosave setting on, save, switch.
-    3. **Don't Save** — discard changes, switch.
-    4. **Cancel** — stay on the current file, sidebar selection reverts.
-- **Autosave setting:** global, persisted, toggleable via File → "Autosave on File Switch" (checkmark menu item). Default off.
-- Same flow applies when closing a window / quitting with a dirty file (v1 may route quit through the same dialog per window).
+- **Save:** Cmd+S, atomic write, UTF-8. Cmd+S is immediate. Write errors are alerted and the file stays dirty.
+- **Autosave is unconditional and always-on** (no setting, no toggle): the open file is written on a ~0.75 s debounce after typing stops, and is also flushed silently on file switch, on app focus loss, and on window close / quit. The debounce coalesces a typing burst into a single write. "Dirty" is therefore a transient state, not a mode — the "Edited" subtitle clears on its own within ~1 s of the last keystroke.
+- A **failed** save is surfaced (the "Cannot Save File" alert) only at an explicit save boundary — Cmd+S, file switch, close, or quit — not on every debounce tick, so a persistently-unwritable location can't spam a modal; the file simply stays dirty (the persistent "Edited" subtitle is the passive signal).
+- **Switching files with unsaved changes:** the buffer is flushed silently, then the switch happens — no dialog. If the flush **fails**, the switch is aborted: the app stays on the current file (still dirty) and the sidebar selection reverts.
+- **Closing / quitting with unsaved changes:** the buffer is flushed silently. If the flush **fails**, a single minimal two-button escape dialog appears — "Couldn't save '<name>'" with **Close Without Saving** (discard and close/quit) and **Cancel** (keep the window open / abort the quit; Escape). This is the only surviving unsaved-changes dialog, and it exists solely so a persistently-failing save (read-only dir, full or unmounted volume) can never make the app un-quittable.
+
+> This unconditional-autosave model **supersedes the earlier opt-in design** ((open-save) acceptance criteria 9–16): the four-button "Save changes?" dialog, the "Always Autosave" action, the "Don't Save" discard-on-switch, and the "Autosave on File Switch" toggle/persisted setting no longer exist. The only discard path that survives is the close/quit "Close Without Saving" escape above.
 
 ## 8. Markdown preview column
 
@@ -150,7 +147,6 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 | What | Scope | Mechanism |
 |---|---|---|
 | Sidebar width, editor/preview split fraction | global | `UserDefaults` (`@AppStorage`) |
-| Autosave on/off | global | `UserDefaults` |
 | Open top-level folders | per window | `@SceneStorage` (JSON snapshot) |
 | Open file + cursor position | per window | `@SceneStorage` (JSON snapshot) |
 | Filter text | per window | `@SceneStorage` (JSON snapshot) |
@@ -165,8 +161,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 |---|---|---|
 | File → Open Folder… | Cmd+N | opens a new window and prompts for a folder (its sole root); Cancel leaves an empty window |
 | File → Add Folder to Window… | Cmd+Shift+O | add top-level folder(s) to the focused window |
-| File → Save | Cmd+S | save open file (disabled when none) |
-| File → Autosave on File Switch | — | checkmark toggle, global |
+| File → Save | Cmd+S | save open file (disabled when none/clean; autosave is unconditional, §7) |
 
 Commands act on the focused window's state (`focusedSceneObject`), except **Open Folder… (Cmd+N)**, which is app-level — it creates a new window and is not focused-window-scoped.
 
@@ -204,7 +199,7 @@ FEdit/
 
 1. Xcode project scaffold; empty three-column layout with persisted draggable dividers.
 2. Folder sidebar: open/scan/tree, then filter query + flat mode.
-3. Editor: text view wrapper, line numbers, open/save/dirty + autosave dialog.
+3. Editor: text view wrapper, line numbers, open/save/dirty + always-on debounced autosave.
 4. Syntax highlighting (Swift, Python, Markdown).
 5. Markdown renderer + preview column + scroll sync.
 6. Session persistence (scene snapshots, defaults) and multi-window polish.

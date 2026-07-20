@@ -23,9 +23,9 @@
 import AppKit
 import SwiftUI
 
-/// Runs `WorkspaceModel.resolveDirtyFile()` before a window is allowed to close (SPEC §7: "same
-/// flow applies when closing a window"). Placed invisibly in `ContentView`'s background so it
-/// can walk up to `view.window` and install the guard there.
+/// Runs `WorkspaceModel.resolveDirtyFile(context: .closeOrQuit)` before a window is allowed to
+/// close (SPEC §7: "same flow applies when closing a window"). Placed invisibly in `ContentView`'s
+/// background so it can walk up to `view.window` and install the guard there.
 ///
 /// SwiftUI installs its **own** `NSWindowDelegate` on every `WindowGroup` window — its scene
 /// lifecycle and `@SceneStorage` machinery depend on it — so this never replaces `window.delegate`
@@ -120,7 +120,7 @@ final class WindowCloseGuardProxy: NSObject, NSWindowDelegate {
             guard let model else {
                 return wrapped?.windowShouldClose?(sender) ?? true
             }
-            guard model.resolveDirtyFile() == .proceed else { return false }
+            guard model.resolveDirtyFile(context: .closeOrQuit) == .proceed else { return false }
             return wrapped?.windowShouldClose?(sender) ?? true
         }
     }

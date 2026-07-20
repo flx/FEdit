@@ -27,7 +27,24 @@ import AppKit
 final class LineNumberRulerView: NSRulerView {
     private weak var textView: NSTextView?
 
-    private let numberFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+    /// (editor-font-zoom) The current editor font size, pushed in by `CodeEditorView` on every
+    /// zoom. The gutter number font is `editorFontSize − 3` (floored at 8 pt) — the `−3` offset
+    /// reproduces the historical 10-pt gutter at the 13-pt default, and the floor keeps the number
+    /// legible at the 8-pt minimum. A change re-measures the gutter width and redraws; the vertical
+    /// centering comes from the layout manager's fragment rects, which already reflect the resized
+    /// editor font, so numbers re-center for free.
+    var editorFontSize: CGFloat = 13 {
+        didSet {
+            guard editorFontSize != oldValue else { return }
+            updateThickness()
+            needsDisplay = true
+        }
+    }
+
+    private var numberFont: NSFont {
+        NSFont.monospacedSystemFont(ofSize: max(8, editorFontSize - 3), weight: .regular)
+    }
+
     private let backgroundColor = NSColor(white: 0.95, alpha: 1)
     private let separatorColor = NSColor(white: 0.8, alpha: 1)
     private let numberColor = NSColor.secondaryLabelColor

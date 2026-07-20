@@ -30,6 +30,12 @@ struct ContentView: View {
     @AppStorage(SettingsKey.sidebarWidth) private var sidebarWidth: Double = LayoutMetrics.defaultSidebarWidth
     @AppStorage(SettingsKey.editorFraction) private var editorFraction: Double = LayoutMetrics.defaultEditorFraction
 
+    // (editor-font-zoom) The single global editor font size (SPEC §6.1 default 13 pt). One
+    // `@AppStorage` view onto `SettingsKey.editorFontSize`: the View menu writes it, this reads it
+    // (clamped) and passes it down — every open window observes the same key, so a change in one
+    // window relays out every other window's editor live.
+    @AppStorage(SettingsKey.editorFontSize) private var editorFontSize: Double = EditorMetrics.defaultFontSize
+
     // Drag baselines: captured on the first callback of a gesture, cleared on drag end. This
     // makes clamping absolute, so dragging past a stop and back does not accumulate drift.
     @State private var sidebarDragBase: Double?
@@ -207,7 +213,11 @@ struct ContentView: View {
                     },
                     onCursorChange: { location in
                         workspace.noteCursorMoved(location)
-                    }
+                    },
+                    // (editor-font-zoom): the live global editor font size, clamped at this read
+                    // site (mirrors `clampSidebar`/`clampFraction`) so a bogus persisted value
+                    // renders bounded, not at its raw magnitude.
+                    fontSize: CGFloat(clampFontSize(editorFontSize))
                 )
             } else {
                 Color.white
@@ -237,6 +247,12 @@ struct ContentView: View {
         // NaN fails every comparison, so min/max alone would pass it straight through.
         guard value.isFinite else { return LayoutMetrics.defaultEditorFraction }
         return min(max(value, LayoutMetrics.editorFractionMin), LayoutMetrics.editorFractionMax)
+    }
+
+    private func clampFontSize(_ value: Double) -> Double {
+        // NaN fails every comparison, so min/max alone would pass it straight through.
+        guard value.isFinite else { return EditorMetrics.defaultFontSize }
+        return min(max(value, EditorMetrics.minFontSize), EditorMetrics.maxFontSize)
     }
 }
 

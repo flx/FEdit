@@ -53,6 +53,13 @@ struct CodeEditorView: NSViewRepresentable {
     /// synthetic reports issued right after a programmatic file switch.
     var onCursorChange: ((Int) -> Void)? = nil
 
+    /// (editor-font-zoom) The current editor font size (SPEC §6.1), owned as the global
+    /// `@AppStorage(SettingsKey.editorFontSize)` by `ContentView` and passed in already clamped to
+    /// 8–32. Defaulted so any other call site stays source-compatible. A change reaches
+    /// `updateNSView`, whose independent size block re-lays-out this window's editor (re-font,
+    /// re-highlight, ruler, gutter) with caret and top line preserved.
+    var fontSize: CGFloat = 13
+
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
     }
@@ -95,9 +102,9 @@ struct CodeEditorView: NSViewRepresentable {
         // (syntax-highlighting): re-pointed at `Theme` so these defaults and the highlighter's
         // reset pass (`Theme.baseAttributes`) can never drift apart — no visual change from the
         // literals editor-core shipped with.
-        textView.font = Theme.editorFont
+        textView.font = Theme.editorFont(size: fontSize)
         textView.textColor = Theme.text
-        textView.typingAttributes = [.font: Theme.editorFont, .foregroundColor: Theme.text]
+        textView.typingAttributes = [.font: Theme.editorFont(size: fontSize), .foregroundColor: Theme.text]
         textView.backgroundColor = Theme.background
 
         // Plain text only — every smart substitution, correction, and detector disabled
@@ -117,12 +124,21 @@ struct CodeEditorView: NSViewRepresentable {
         scrollView.documentView = textView
 
         let ruler = LineNumberRulerView(textView: textView, scrollView: scrollView)
+        // (editor-font-zoom): the gutter tracks the editor font size. Set after construction
+        // (font was already applied above), so the ruler's number font matches from first paint.
+        ruler.editorFontSize = fontSize
         scrollView.verticalRulerView = ruler
         scrollView.hasVerticalRuler = true
         scrollView.rulersVisible = true
 
         coordinator.textView = textView
         coordinator.rulerView = ruler
+        // (editor-font-zoom): seed both size fields here so (D2) the size block in the FIRST
+        // `updateNSView` — which coincides with file load / session-restore cursor+scroll — sees
+        // `appliedFontSize == fontSize` and is skipped, never overriding the deferred
+        // restore-scroll. `currentFontSize` is the value `highlightNow` reads on that first pass.
+        coordinator.currentFontSize = fontSize
+        coordinator.appliedFontSize = fontSize
         coordinator.observeClipViewBounds(scrollView.contentView)
 
         return scrollView
@@ -144,6 +160,12 @@ struct CodeEditorView: NSViewRepresentable {
         // could highlight `b.py`'s content with Swift rules forever (the classic
         // stale-representable bug).
         coordinator.currentLanguage = language ?? .plain
+
+        // (editor-font-zoom) same ownership discipline as `currentLanguage`: written before any
+        // `highlightNow` in this pass, so both the file-switch highlight below and any debounced
+        // pass scheduled by a previous update run at the *current* size — never a stale
+        // struct-copy value (criterion 14: a mid-debounce zoom highlights at the final size).
+        coordinator.currentFontSize = fontSize
 
         if documentID != coordinator.currentDocumentID {
             // File switch: full reload, undo reset, selection to either the restored cursor or
@@ -217,6 +239,50 @@ struct CodeEditorView: NSViewRepresentable {
             coordinator.pendingHighlight = nil
             coordinator.highlightNow(textView)
         }
+
+        // (editor-font-zoom) Independent of the branches above (an `if`, not `else if`): a
+        // simultaneous file-switch + size-change must both resolve, and on a pure zoom neither
+        // branch above runs. Guarded by `appliedFontSize != fontSize` (owned solely here — seeded
+        // in `makeNSView` so it does not fire on first load, D2) so it is a no-op unless the size
+        // actually changed. Wrapped in `isProgrammaticUpdate` so the attribute-only re-apply can
+        // never round-trip through `textDidChange` into a highlight reschedule (criterion 12) and
+        // so the selection restore does not emit a spurious cursor report.
+        if coordinator.appliedFontSize != fontSize {
+            coordinator.isProgrammaticUpdate = true
+
+            // 1. Capture anchors: the caret/selection, and the first-visible character (its
+            //    logical line is re-pinned to the viewport top after relayout).
+            let ranges = textView.selectedRanges
+            let anchorChar = coordinator.firstVisibleCharIndex(textView)
+
+            // 2. New typing/caret font. Deliberately NOT `textView.font = …`: the `font` setter
+            //    routes through `shouldChangeText`/`didChangeText`, which registers an undo action
+            //    and dirties the document (violating criterion 7). The sized font reaches existing
+            //    text via the re-highlight in step 3 (raw `NSTextStorage` attribute writes — no
+            //    undo, no `didChangeText`) and reaches typed/empty-document text via these typing
+            //    attributes (D4).
+            textView.typingAttributes = [.font: Theme.editorFont(size: fontSize), .foregroundColor: Theme.text]
+
+            // 3. Re-highlight at the new size (read from `coordinator.currentFontSize`, set above).
+            //    The reset pass re-applies `Theme.baseAttributes(fontSize:)` across the whole
+            //    storage, so even a `.plain` file re-sizes uniformly (criterion 9). Cancel any
+            //    pending debounced pass first so it cannot re-run at a stale size.
+            coordinator.pendingHighlight?.cancel()
+            coordinator.pendingHighlight = nil
+            coordinator.highlightNow(textView)
+
+            // 4. Gutter tracks the new size (recomputes number font + thickness + redraws).
+            coordinator.rulerView?.editorFontSize = fontSize
+
+            // 5. Restore selection, then re-pin the captured line to the viewport top once the
+            //    resized layout exists (deferred one runloop pass if layout is not yet complete —
+            //    the same pattern as the file-switch cursor-restore scroll).
+            textView.selectedRanges = ranges
+            coordinator.scrollCharToTop(textView, characterIndex: anchorChar)
+
+            coordinator.appliedFontSize = fontSize
+            coordinator.isProgrammaticUpdate = false
+        }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -237,6 +303,18 @@ struct CodeEditorView: NSViewRepresentable {
         /// `highlightNow` call in the same pass — never read from a captured `CodeEditorView`
         /// struct copy (see the ownership note at the `updateNSView` call site).
         var currentLanguage: SyntaxLanguage = .plain
+
+        /// (editor-font-zoom) The size a highlight pass reads at execution time — same ownership
+        /// discipline as `currentLanguage`. Written by `updateNSView` before any `highlightNow` in
+        /// the same pass (and seeded in `makeNSView`), so a debounced pass fires at the current
+        /// size even if the size changed mid-debounce (criterion 14).
+        var currentFontSize: CGFloat = 13
+
+        /// (editor-font-zoom) The last size for which the live re-apply block in `updateNSView`
+        /// ran; owned solely by that block. Seeded in `makeNSView` to the initial size so the
+        /// block is skipped on the first update (D2 — must not override session-restore's deferred
+        /// cursor scroll).
+        var appliedFontSize: CGFloat? = nil
 
         /// The pending ~150 ms debounced highlight pass (criterion 5), if any. Exposed
         /// (non-private) so `updateNSView`'s two programmatic-content paths can cancel it before
@@ -284,7 +362,58 @@ struct CodeEditorView: NSViewRepresentable {
         /// restore here.
         func highlightNow(_ textView: NSTextView) {
             guard let textStorage = textView.textStorage else { return }
-            SyntaxHighlighter.highlight(textStorage, language: currentLanguage)
+            SyntaxHighlighter.highlight(textStorage, language: currentLanguage, fontSize: currentFontSize)
+        }
+
+        /// (editor-font-zoom) The UTF-16 index of the first character whose glyph is visible —
+        /// the exact computation `reportFirstVisibleLineIfChanged` uses (visible glyph range →
+        /// character range → `.location`), reused here as the anchor for scroll preservation
+        /// across a zoom relayout. Returns 0 when the layout stack is unavailable.
+        func firstVisibleCharIndex(_ textView: NSTextView) -> Int {
+            guard let layoutManager = textView.layoutManager,
+                  let textContainer = textView.textContainer
+            else { return 0 }
+            let visibleRect = textView.visibleRect
+            let visibleGlyphRange = layoutManager.glyphRange(forBoundingRect: visibleRect, in: textContainer)
+            let visibleCharRange = layoutManager.characterRange(forGlyphRange: visibleGlyphRange, actualGlyphRange: nil)
+            return visibleCharRange.location
+        }
+
+        /// (editor-font-zoom) Pins the line fragment containing `characterIndex` to the top of the
+        /// viewport after a zoom relayout. Anchoring on the logical line (not a pixel offset) keeps
+        /// content from drifting when line heights change. Forces layout first; if the anchor's
+        /// glyph is not yet laid out, defers exactly one runloop pass and retries once — the same
+        /// deferral pattern as the file-switch cursor-restore scroll.
+        func scrollCharToTop(_ textView: NSTextView, characterIndex: Int, retry: Bool = true) {
+            guard let layoutManager = textView.layoutManager,
+                  let textContainer = textView.textContainer
+            else { return }
+
+            let length = (textView.string as NSString).length
+            guard length > 0 else {
+                // Empty document: nothing to anchor; keep the origin at the top.
+                textView.scroll(.zero)
+                return
+            }
+
+            let clamped = min(max(characterIndex, 0), length - 1)
+
+            // Force layout for the resized text so the fragment rect below is valid.
+            layoutManager.ensureLayout(for: textContainer)
+            if retry, layoutManager.firstUnlaidCharacterIndex() <= clamped {
+                DispatchQueue.main.async { [weak self, weak textView] in
+                    guard let self, let textView else { return }
+                    self.scrollCharToTop(textView, characterIndex: clamped, retry: false)
+                }
+                return
+            }
+
+            let glyphIndex = layoutManager.glyphIndexForCharacter(at: clamped)
+            let fragmentRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+            let containerOrigin = textView.textContainerOrigin
+            // `NSView.scroll(_:)` moves the enclosing clip view so this point sits at the top-left
+            // of the viewport; `fragmentRect` is in container space, offset into text-view space.
+            textView.scroll(NSPoint(x: 0, y: fragmentRect.minY + containerOrigin.y))
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {

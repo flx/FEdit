@@ -31,13 +31,22 @@ import AppKit
 enum Theme {
     // MARK: - Fonts
 
-    /// The editor's base font (SPEC §6.1): monospaced system, 13 pt, regular weight.
-    static let editorFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+    /// The editor's base font (SPEC §6.1): monospaced system, regular weight, at the requested
+    /// point size. Size-parametric (editor-font-zoom): the editor's font is now driven by the
+    /// live `@AppStorage(SettingsKey.editorFontSize)` (default 13 pt) rather than a fixed literal,
+    /// so callers pass the current size and no window's highlight pass can read another window's
+    /// stale global. Keeping this a pure `static func` of its argument preserves `Theme`'s
+    /// stateless contract (no mutable shared font state).
+    static func editorFont(size: CGFloat) -> NSFont {
+        NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+    }
 
-    /// Bold variant of `editorFont`, used for keywords and Markdown headings/bold spans.
-    static let editorBoldFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .bold)
+    /// Bold variant of `editorFont(size:)`, used for keywords and Markdown headings/bold spans.
+    static func editorBoldFont(size: CGFloat) -> NSFont {
+        NSFont.monospacedSystemFont(ofSize: size, weight: .bold)
+    }
 
-    /// A visually slanted variant of `editorFont` for Markdown italic spans.
+    /// A visually slanted variant of `editorFont(size:)` for Markdown italic spans.
     ///
     /// `withSymbolicTraits(.italic)` on a monospaced system font does **not** fail by returning
     /// nil — a failure would hand back a non-italic font, so a nil-fallback alone can't be
@@ -45,23 +54,30 @@ enum Theme {
     /// resolved descriptor actually reports `.italic`, that real italic face is used; otherwise a
     /// synthesized oblique is produced via `NSFontManager.convert(_:toHaveTrait:)`, which reliably
     /// applies a shear even without a dedicated italic face. The acceptance test is "visually
-    /// slanted", not "descriptor non-nil".
-    static let editorItalic: NSFont = {
-        let descriptor = editorFont.fontDescriptor.withSymbolicTraits(.italic)
-        let candidate = NSFont(descriptor: descriptor, size: editorFont.pointSize) ?? editorFont
+    /// slanted", not "descriptor non-nil". The real-italic-vs-synthesized-oblique *decision* is
+    /// size-invariant (SF Mono has no italic face at any size); only the resolved point size
+    /// changes with `size`.
+    static func editorItalic(size: CGFloat) -> NSFont {
+        let base = editorFont(size: size)
+        let descriptor = base.fontDescriptor.withSymbolicTraits(.italic)
+        let candidate = NSFont(descriptor: descriptor, size: size) ?? base
         if candidate.fontDescriptor.symbolicTraits.contains(.italic) {
             return candidate
         }
-        return NSFontManager.shared.convert(editorFont, toHaveTrait: .italicFontMask)
-    }()
+        return NSFontManager.shared.convert(base, toHaveTrait: .italicFontMask)
+    }
 
     /// Preview-facing body text font (system, 13 pt) — speculative-but-cheap: kept here so
     /// `markdown-renderer` doesn't grow its own palette file.
     static let bodyFont = NSFont.systemFont(ofSize: 13)
 
-    /// Preview-facing code font, identical to the editor's own font so inline/fenced code in the
-    /// rendered Markdown preview visually matches the editor.
-    static let codeFont = editorFont
+    /// Preview-facing code font (SPEC §8.2), for inline `` `code` `` and fenced blocks in the
+    /// rendered Markdown preview. Decoupled from the editor font (editor-font-zoom decision 3):
+    /// the editor's zoom scopes to the editor only, so this stays fixed at 13 pt and the preview's
+    /// appearance is unchanged. Defined with a literal size on purpose — `Theme` is compiled
+    /// standalone by the `markdown-renderer` test harness, so this must not reference any symbol
+    /// outside `Theme` (e.g. `EditorMetrics` in `App/FEditApp.swift`).
+    static let codeFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
 
     /// Preview-facing heading font, bold system sized by heading level (`1`...`6`, clamped).
     static func headingFont(level: Int) -> NSFont {
@@ -108,8 +124,10 @@ enum Theme {
     // MARK: - Convenience
 
     /// The attribute set a full syntax-highlight reset pass applies before any rule runs —
-    /// clears stale bold/color left over from a previous language or a previous pass.
-    static var baseAttributes: [NSAttributedString.Key: Any] {
-        [.font: editorFont, .foregroundColor: text]
+    /// clears stale bold/color left over from a previous language or a previous pass. Built at the
+    /// requested editor font size (editor-font-zoom): the reset pass re-applies the sized base font
+    /// across the whole storage so even a `.plain` file scales uniformly.
+    static func baseAttributes(fontSize: CGFloat) -> [NSAttributedString.Key: Any] {
+        [.font: editorFont(size: fontSize), .foregroundColor: text]
     }
 }

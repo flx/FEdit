@@ -44,6 +44,44 @@ struct FEditApp: App {
         .defaultSize(width: CGFloat(LayoutMetrics.defaultWindowWidth), height: 700)
         .commands {
             FileCommands()
+            ViewCommands()
+        }
+    }
+}
+
+/// View menu additions (editor-font-zoom): editor font-size zoom. App-level (global setting) — no
+/// `.disabled(workspace == nil)`; like "Open Folder…", zoom must work with no window focused. The
+/// items are injected into AppKit's auto-installed "View" menu via `CommandGroup(after:)`; a
+/// `CommandMenu("View")` would create a DUPLICATE View menu (D3). Because a `Commands` body
+/// re-evaluates when its `@AppStorage` changes, the `.disabled(...)` enablement stays live; the
+/// clamp inside each action is the correctness guarantee, the disabling is UX polish (belt-and-braces).
+struct ViewCommands: Commands {
+    // The single source of truth — the same `UserDefaults` key `ContentView` reads (clamped) to
+    // drive the editor. This is the menu's live *writer* onto it, not a second copy.
+    @AppStorage(SettingsKey.editorFontSize) private var editorFontSize: Double = EditorMetrics.defaultFontSize
+
+    private func increase() {
+        editorFontSize = min(editorFontSize + EditorMetrics.fontSizeStep, EditorMetrics.maxFontSize)
+    }
+
+    var body: some Commands {
+        CommandGroup(after: .toolbar) {
+            Button("Increase Font Size", action: increase)
+                // Displays ⌘+ (i.e. Cmd-Shift-=).
+                .keyboardShortcut("+", modifiers: .command)
+                .disabled(editorFontSize >= EditorMetrics.maxFontSize)
+
+            Button("Decrease Font Size") {
+                editorFontSize = max(editorFontSize - EditorMetrics.fontSizeStep, EditorMetrics.minFontSize)
+            }
+            .keyboardShortcut("-", modifiers: .command)
+            .disabled(editorFontSize <= EditorMetrics.minFontSize)
+
+            Button("Reset Font Size") {
+                editorFontSize = EditorMetrics.defaultFontSize
+            }
+            .keyboardShortcut("0", modifiers: .command)
+            .disabled(editorFontSize == EditorMetrics.defaultFontSize)
         }
     }
 }
@@ -102,6 +140,18 @@ enum SettingsKey {
     static let sidebarWidth = "sidebarWidth"
     static let editorFraction = "editorFraction"
     static let autosaveOnFileSwitch = "autosaveOnFileSwitch"
+    // (editor-font-zoom) One global default (not per-window scene state), so every open editor
+    // updates live on change and the size survives relaunch.
+    static let editorFontSize = "editorFontSize"
+}
+
+/// Editor font-zoom constants (editor-font-zoom). Storage-backed values are `Double` to match the
+/// `@AppStorage` boundary without cast noise. The 1-pt step and 8–32 clamp are fixed constants for v1.
+enum EditorMetrics {
+    static let defaultFontSize: Double = 13 // SPEC §6.1
+    static let minFontSize: Double = 8
+    static let maxFontSize: Double = 32
+    static let fontSizeStep: Double = 1
 }
 
 /// Shared layout constants for the three-column window (SPEC §4). Storage-backed values are

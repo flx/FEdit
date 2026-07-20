@@ -84,7 +84,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 - AppKit `NSTextView` with an explicitly built **TextKit 1** stack (`NSTextStorage` + `NSLayoutManager` + `NSTextContainer`), wrapped in `NSViewRepresentable`.
 - Plain text only; all smart substitutions (quotes, dashes, spell correction, text replacement) disabled. Undo enabled, reset when switching files.
 - **Line wrapping:** always on (container tracks view width, no horizontal scrolling).
-- Font: monospaced system font, 13 pt. Background white, near-black text.
+- Font: monospaced system font, default 13 pt. The size is adjustable via View → Increase/Decrease/Reset Font Size (Cmd-+ / Cmd-− / Cmd-0), clamped 8–32 pt; the chosen size is **application-wide** (shared across windows) and persisted across relaunch. Background white, near-black text.
 - Exactly **one file open at a time** (per window), always the sidebar-selected file.
 
 ### 6.2 Line numbers

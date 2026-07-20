@@ -48,6 +48,11 @@ struct ContentView: View {
     // preview before its first throttled report arrives.
     @State private var editorFirstVisibleLine = 0
 
+    // The editor's live line-number gutter width, reported by `CodeEditorView`. The editor column's
+    // header strip is inset by this so the file name clears the gutter and sits a standard margin to
+    // the right of the gutter/text separator (matching the folder-name strip's margin from its edge).
+    @State private var editorGutterWidth: CGFloat = 0
+
     // One per window (SPEC §3) — holds the open folders and selection for this window.
     @StateObject private var workspace = WorkspaceModel()
 
@@ -223,11 +228,10 @@ struct ContentView: View {
     private var editorColumn: some View {
         VStack(spacing: 0) {
             if let name = workspace.openFileName {
-                // Same 8 pt leading inset as the sidebar's folder-name strip, so the file name has
-                // the same margin from the editor column's left edge that the folder name has from
-                // the window's left edge (rather than being pushed to the text-pane x, which parked
-                // it against the gutter/text boundary).
-                ColumnHeaderBar(title: name)
+                // Inset past the line-number gutter; `ColumnHeaderBar` then adds the standard 8 pt on
+                // top, so the file name sits that same margin to the RIGHT of the gutter/text
+                // separator — not on it (the old gutter-width-exact inset) and not over the gutter.
+                ColumnHeaderBar(title: name, leadingInset: editorGutterWidth)
             }
             if workspace.openFile != nil {
                 CodeEditorView(
@@ -247,6 +251,9 @@ struct ContentView: View {
                     },
                     onCursorChange: { location in
                         workspace.noteCursorMoved(location)
+                    },
+                    onGutterWidthChange: { width in
+                        editorGutterWidth = width
                     },
                     // (editor-font-zoom): the live global editor font size, clamped at this read
                     // site (mirrors `clampSidebar`/`clampFraction`) so a bogus persisted value

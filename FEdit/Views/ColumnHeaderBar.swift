@@ -27,9 +27,11 @@ import SwiftUI
 /// the caller decides whether to render it (mirrors `SplitDivider` owning no state).
 struct ColumnHeaderBar: View {
     let title: String
-    /// Extra leading inset for the title. The editor strip passes the live line-number gutter
-    /// width so the file name aligns with the text pane (starting just past the gutter), instead
-    /// of sitting over the gutter. Defaults to 0 (sidebar/preview strips use the standard 8 pt).
+    /// Leading offset of the title's content edge, ON TOP OF which a standard 8 pt margin is always
+    /// added. Sidebar/preview strips leave it 0 → an 8 pt margin from the column's left edge. The
+    /// editor strip passes the live line-number gutter width so the file name clears the gutter and
+    /// sits 8 pt to the right of the gutter/text separator — the same margin each strip's title has
+    /// from its own column's content edge.
     var leadingInset: CGFloat = 0
 
     var body: some View {
@@ -39,7 +41,7 @@ struct ColumnHeaderBar: View {
             .lineLimit(1)
             .truncationMode(.tail)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, max(leadingInset, 8))
+            .padding(.leading, leadingInset + 8)
             .padding(.trailing, 8)
             .frame(height: LayoutMetrics.columnHeaderHeight)
             .background(Color(nsColor: .windowBackgroundColor))

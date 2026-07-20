@@ -66,10 +66,12 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 ### 5.3 Tree mode (empty filter)
 - Expandable/collapsible tree (disclosure triangles), folders with a folder icon, files with a type-appropriate icon.
 - Only files are selectable; clicking a file requests opening it (see §7). The open file's row is highlighted.
+- A file or folder row whose name is wider than the sidebar column **wraps to multiple lines** (rather than truncating); the row grows to fit so the full name is readable.
 
 ### 5.4 Filter mode (non-empty filter)
 - The search field (standard rounded style, placeholder like `Filter files (e.g. .swift$ OR ^src/)`) sits at the top of the sidebar's list content, below the column's folder-name header strip (§4) when one is shown — top-to-bottom order: folder-name strip → search field → list.
 - While the filter is non-empty, each section shows a **flat list of matching files as paths relative to that top-level folder** (e.g. `swift-source/main.swift`) — the top folder path is not repeated. A section with no matches shows a muted "No matches".
+- A flat-mode row's relative path likewise wraps to multiple lines when wider than the column, so the full relative path (including the trailing filename) stays readable.
 
 ### 5.5 Filter query language
 - Tokens are separated by whitespace. `AND` and `OR` (uppercase, exact) are operators; everything else is a search term.
@@ -85,7 +87,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 - Malformed input degrades gracefully: leading/trailing/duplicate operators are ignored; an operator with a missing operand keeps the side that exists; a term that is only `^` or only `$` with no other characters, or has a `^`/`$` appearing anywhere other than the very first/last character, is matched literally rather than treated as an anchor (only one leading `^` and one trailing `$` per term are ever consumed as anchors).
 
 ### 5.6 File status (git)
-- When an opened top-level root **directly contains `.git`** (it is itself the root of a git repository), each **file** row whose working-tree content differs from `HEAD` — modified, staged, untracked, or the **new** side of a rename — shows a small right-aligned **"(changed)"** badge. Directories are **never** badged, even when they contain changed files. A long file name truncates (tail) before the badge is clipped; the badge is never truncated.
+- When an opened top-level root **directly contains `.git`** (it is itself the root of a git repository), each **file** row whose working-tree content differs from `HEAD` — modified, staged, untracked, or the **new** side of a rename — shows a small right-aligned **"(changed)"** badge. Directories are **never** badged, even when they contain changed files. A long file name wraps to multiple lines; the badge stays at the trailing edge of the row (aligned to the first line) and is never clipped or truncated.
 - The changed-set is computed by shelling out to `git status --porcelain=v1 -z -uall` (permitted since the app is unsandboxed, §2) **off the main thread on a dedicated serial queue with a bounded 5 s watchdog timeout** — a hung or pathologically slow git is terminated and the window simply shows no badges (it never blocks or crashes). Results are cached per window as a set of absolute file URLs and refreshed on **save**, **manual Refresh**, **app activation** (the HEAD-move signal — no polling, no `.git` watch), and — via the §5.2 file-system watcher — external-change events.
 - Reconcile scope: save and activation recompute only the changed-*set* against the **already-present** tree rows; they reconcile *modification* badges on files that still have a row but do not rescan the tree. Externally **created** or **deleted** files (which have no row / a stale row) are picked up automatically by the §5.2 file-system watcher — which rescans the tree and recomputes badges — or by a manual **Refresh**.
 - Non-git roots, nested repos (only the top-level root's own `.git` is detected), and `.gitignore`'d files show **no** badge. The badge is uniform (no change-type or color coding) and read-only — it never modifies repository or file state.

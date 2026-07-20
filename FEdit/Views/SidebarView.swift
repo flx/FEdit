@@ -133,24 +133,23 @@ private struct FileRow: View {
 
     var body: some View {
         if node.isDirectory {
-            HStack {
+            HStack(alignment: .top) {
                 Image(systemName: "folder")
                 Text(label)
             }
         } else {
-            HStack {
+            HStack(alignment: .top) {
                 Image(nsImage: NSWorkspace.shared.icon(forFile: node.url.path))
                     .resizable()
                     .frame(width: 16, height: 16)
                 Text(label)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
                     .foregroundStyle(isSelected ? Color(nsColor: .selectedMenuItemTextColor) : .primary)
                 // (git-changed-badge) A right-aligned "(changed)" badge on a file whose working-tree
-                // content differs from HEAD (SPEC §5.6). The `Spacer` pushes it to the trailing edge
-                // and lets the name truncate (tail) *first*, so a long name never clips the badge
-                // (criterion 10). `.fixedSize()` keeps the badge intrinsic-width. Directories never
-                // reach this branch (criterion 2).
+                // content differs from HEAD (SPEC §5.6). The `Spacer` pushes it to the trailing edge;
+                // the name wraps (sidebar-hscroll) within the remaining width and the enclosing
+                // `HStack(alignment: .top)` pins the badge beside the name's first line, so a long
+                // name never clips the badge (criterion 10). `.fixedSize()` keeps the badge
+                // intrinsic-width. Directories never reach this branch (criterion 2).
                 Spacer(minLength: 6)
                 if isChanged {
                     Text("(changed)")

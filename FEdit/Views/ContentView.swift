@@ -48,10 +48,6 @@ struct ContentView: View {
     // preview before its first throttled report arrives.
     @State private var editorFirstVisibleLine = 0
 
-    // The editor's live line-number gutter width, reported by `CodeEditorView`, used to indent the
-    // editor column's header strip so the file name aligns with the text pane (past the gutter).
-    @State private var editorGutterWidth: CGFloat = 0
-
     // One per window (SPEC §3) — holds the open folders and selection for this window.
     @StateObject private var workspace = WorkspaceModel()
 
@@ -227,7 +223,11 @@ struct ContentView: View {
     private var editorColumn: some View {
         VStack(spacing: 0) {
             if let name = workspace.openFileName {
-                ColumnHeaderBar(title: name, leadingInset: editorGutterWidth)
+                // Same 8 pt leading inset as the sidebar's folder-name strip, so the file name has
+                // the same margin from the editor column's left edge that the folder name has from
+                // the window's left edge (rather than being pushed to the text-pane x, which parked
+                // it against the gutter/text boundary).
+                ColumnHeaderBar(title: name)
             }
             if workspace.openFile != nil {
                 CodeEditorView(
@@ -247,9 +247,6 @@ struct ContentView: View {
                     },
                     onCursorChange: { location in
                         workspace.noteCursorMoved(location)
-                    },
-                    onGutterWidthChange: { width in
-                        editorGutterWidth = width
                     },
                     // (editor-font-zoom): the live global editor font size, clamped at this read
                     // site (mirrors `clampSidebar`/`clampFraction`) so a bogus persisted value

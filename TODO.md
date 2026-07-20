@@ -10,7 +10,6 @@ files an item touches so overlapping items don't get batched in parallel.
 
 ## Features
 
-- [ ] (new-file) File → New… — create a new file via a filename sheet. Location: if a file is currently open, create the new file NEXT TO it, in the open file's parent directory (e.g. root `~/Documents` with `todo/2026-01.txt` open → new file lands in `~/Documents/todo/`); if no file is open, create it in the first top-level root folder. New `File → New…` menu item on Cmd+N (freed by (open-cmd-o)); choosing it presents a SHEET asking for the filename (validated: non-empty, no path separators, no collision with an existing file — on collision re-prompt/alert). On confirm: create the empty file on disk, refresh the sidebar tree so it appears, then select+open it in the editor routing through the existing dirty-guard/`requestOpen`. Cancel closes the sheet with no change. Empty-window case (no root open): New… is disabled or prompts to open a folder first — decide in plan. New `Views/NewFileSheet.swift`; `Models/WorkspaceModel.swift` (target-dir computation + a `createFile(named:)` that writes, refreshes, opens); `Views/ContentView.swift` (present the sheet); `App/FEditApp.swift` (the menu item + Cmd+N, focused-window model). Update SPEC §3/§5/§7. Depends on (folder-sidebar), (open-save), (open-cmd-o).
 
 ## Bugs
 

@@ -193,27 +193,41 @@ Commands act on the focused window's state (`focusedSceneObject`), except **Open
 
 Tabs, split editors, find/replace, file **rename/delete** and sidebar-driven file create (file **create** is supported via File → New… (§7) — creating from a sidebar context menu, and rename/delete, remain non-goals), git integration **beyond the single read-only "(changed)" file-status badge of §5.6** (no branch/ahead-behind/staging UI, no diff, no commit — the §5.6 badge is the one sanctioned exception to this non-goal), LSP/completion, themes/dark mode, printing, preview→editor scroll sync, encodings beyond UTF-8/Latin-1 fallback. (File-system watching of the open file and sidebar roots is now in v1 — see §5.2 — and no longer a non-goal.)
 
-## 13. Planned project structure
+## 13. Project structure
 
 ```
 FEdit.xcodeproj
 FEdit/
   App/FEditApp.swift            app entry, commands (menus), settings keys
+  App/LaunchCoordinator.swift   mailbox draining Cmd+O's pending folder-pick into a pristine new window
+  App/WindowCloseGuard.swift    NSWindowDelegate proxy: flush-on-close/quit, Close-Without-Saving escape
   Models/WorkspaceModel.swift   per-window state: roots, open file, dirty/save/autosave logic
   Models/FileNode.swift         tree node + recursive scanner
-  Models/FilterQuery.swift      boolean filter parser/evaluator
+  Models/FilterQuery.swift      boolean filter parser/evaluator (terms, AND/OR, ^/$ anchors)
   Models/FileWatcher.swift      open-file vnode watcher + FileSignature (self-write key)
   Models/DirectoryTreeWatcher.swift  recursive FSEvents watcher for sidebar roots
+  Models/GitStatus.swift        off-main `git status --porcelain=v1 -z` shell-out + parse for §5.6
+  Models/WorkspaceSnapshot.swift  Codable per-window session snapshot (roots, open file, cursor, filter)
   Views/ContentView.swift       three-column layout, dividers, persistence wiring
   Views/SidebarView.swift       search field, tree mode, filtered flat mode
+  Views/ColumnHeaderBar.swift    fixed-height column header strip (§4)
+  Views/SplitDivider.swift      draggable divider (hit area, cursor, persistence hookup)
+  Views/NewFileSheet.swift      File → New… filename sheet (§7)
   Editor/CodeEditorView.swift   NSTextView wrapper (representable + coordinator)
   Editor/LineNumberRulerView.swift
+  Editor/LogicalLine.swift      logical-line counting/lookup shared by the ruler and cursor restore
   Editor/SyntaxHighlighter.swift  languages, rules, light theme colors
+  Editor/Theme.swift             shared light-theme fonts/colors (editor + preview)
   Preview/MarkdownRenderer.swift  markdown → NSAttributedString + line anchors
   Preview/MarkdownPreviewView.swift  read-only text view + scroll-to-anchor
+scripts/
+  FileNodeTests, FilterQueryTests, GitStatusTests, LogicalLineTests,
+  MarkdownRendererTests, SnapshotTests    standalone swiftc-run regression harnesses (no XCTest target)
 ```
 
 ## 14. Implementation order
+
+All items below have shipped, in this order (see [DONE.md](DONE.md) for the detailed record of what each step actually delivered):
 
 1. Xcode project scaffold; empty three-column layout with persisted draggable dividers.
 2. Folder sidebar: open/scan/tree, then filter query + flat mode.
@@ -221,3 +235,4 @@ FEdit/
 4. Syntax highlighting (Swift, Python, Markdown).
 5. Markdown renderer + preview column + scroll sync.
 6. Session persistence (scene snapshots, defaults) and multi-window polish.
+7. Font-size zoom, column header bars, the Cmd+O-opens-a-new-window rework, file-system watching, always-on autosave, the git "(changed)" badge, the Cmd+N/Cmd+O shortcut swap, File → New…, filter-query anchors, and sidebar row wrapping — each folded its own spec updates into the sections above; see `TODO.md`/`DONE.md` for anything still open.

@@ -27,7 +27,7 @@ v1 feature-complete: every planned item has shipped (see [DONE.md](DONE.md); [TO
 
 Open `FEdit.xcodeproj` in Xcode and Run. No third-party dependencies.
 
-A handful of pure-logic modules (filter query, markdown renderer, git status parsing, file tree scanning, session snapshots, line counting, command-line path mapping) also have standalone `swiftc`-run regression harnesses under `scripts/*/main.swift`, used in place of an XCTest target; the `fedit` shim has a shell one at `scripts/FeditShimTests/run.sh`.
+A handful of pure-logic modules (filter query, markdown renderer, git status parsing, file tree scanning, per-root scan scheduling, session snapshots, line counting, command-line path mapping) also have standalone `swiftc`-run regression harnesses under `scripts/*/main.swift`, used in place of an XCTest target; the `fedit` shim has a shell one at `scripts/FeditShimTests/run.sh`.
 
 ## Installing
 

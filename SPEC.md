@@ -210,6 +210,8 @@ FEdit/
                                 escape; app delegate's external-open (odoc) sink
   Models/WorkspaceModel.swift   per-window state: roots, open file, dirty/save/autosave logic
   Models/FileNode.swift         tree node + recursive scanner
+  Models/RootScanScheduler.swift  per-root scan state machine: coalescing gates, damping,
+                                generations, cancellation tokens (owns the scan teardown)
   Models/FilterQuery.swift      boolean filter parser/evaluator (terms, AND/OR, ^/$ anchors)
   Models/FileWatcher.swift      open-file vnode watcher + FileSignature (self-write key)
   Models/DirectoryTreeWatcher.swift  recursive FSEvents watcher for sidebar roots
@@ -231,7 +233,7 @@ scripts/
   install.sh                    Release build + install of FEdit.app and the fedit shim
   fedit                         /bin/sh command-line shim around `open -a` (§3 external opens)
   FileNodeTests, FilterQueryTests, GitStatusTests, LogicalLineTests,
-  MarkdownRendererTests, OpenRequestTests, SnapshotTests
+  MarkdownRendererTests, OpenRequestTests, RootScanTests, SnapshotTests
                                 standalone swiftc-run regression harnesses (no XCTest target)
   FeditShimTests                shell harness for scripts/fedit (stub `open`, no GUI)
 ```

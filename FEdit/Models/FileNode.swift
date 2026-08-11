@@ -23,8 +23,8 @@
 import Foundation
 
 /// A single entry in the folder sidebar's directory tree (SPEC §5.2–§5.3). Value type so a tree
-/// built off the main thread on `WorkspaceModel`'s scan queue can be handed back to the main actor
-/// **by value** and straight to `OutlineGroup` (async-root-scan).
+/// built off the main thread on `RootScanScheduler`'s scan queue can be handed back to the main
+/// actor **by value** and straight to `OutlineGroup` (async-root-scan).
 ///
 /// The `Sendable` conformance is load-bearing, not decoration: every stored property is a value
 /// type with no reference payload and no lazily-populated cache, and that is the *only* reason the
@@ -51,12 +51,13 @@ struct FileNode: Identifiable, Equatable, Sendable {
     /// Recursively scans `directory` into a `FileNode` tree.
     ///
     /// **Threading contract (async-root-scan).** This is `nonisolated` and *pure with respect to app
-    /// state*: it reads the filesystem and returns a fresh value, holds no reference to
-    /// `WorkspaceModel`, and so can neither observe nor mutate main-actor state — a walk in flight
+    /// state*: it reads the filesystem and returns a fresh value, holds no reference to the model or
+    /// the scan scheduler, and so can neither observe nor mutate main-actor state — a walk in flight
     /// owns a private local tree that no other thread can see until it is handed back. It is still
     /// **synchronous within its own thread**, and a blocking one (`contentsOfDirectory` is a
     /// syscall; a home-scale root measured ~135 s), so the app target calls it from exactly one
-    /// place — `WorkspaceModel.requestScan(of:force:damped:)`, on `WorkspaceModel.scanQueue`. Never
+    /// place — `RootScanScheduler`'s walk launcher, on `RootScanScheduler.scanQueue`, reached only
+    /// through `RootScanScheduler.requestScan(of:force:damped:)` (root-scan-consolidation). Never
     /// call it on the main actor; SPEC §11 no longer accepts a main-thread walk.
     ///
     /// This no-argument entry point is deliberately behavior-identical to the pre-async scanner and
@@ -69,7 +70,7 @@ struct FileNode: Identifiable, Equatable, Sendable {
     /// (async-root-scan, Tier 2) `scan(directory:)` plus cooperative cancellation: the walk checks
     /// `cancellation` once per directory entry and unwinds early when it is set, so removing a
     /// home-scale root does not leave a scan-queue thread walking it for minutes. A cancelled walk
-    /// returns a **partial** tree — by contract the caller must discard it (`WorkspaceModel` does,
+    /// returns a **partial** tree — by contract the caller must discard it (`RootScanScheduler` does,
     /// via the root's scan generation), never publish it.
     static func scan(directory: URL, cancellation: ScanCancellationToken?) -> FileNode {
         let standardized = directory.standardizedFileURL
@@ -158,14 +159,17 @@ struct FileNode: Identifiable, Equatable, Sendable {
 }
 
 /// (async-root-scan, Tier 2) The **only** cross-thread mutable state the asynchronous scan
-/// introduces: a one-way "stop walking" flag, set on the main actor (`WorkspaceModel.removeRoot`
-/// and `deinit`) and read on the scan queue once per directory entry.
+/// introduces: a one-way "stop walking" flag, set on the main actor by
+/// `RootScanScheduler.noteRootRemoved` — or, at window teardown, from the scheduler's nonisolated
+/// token registry `deinit` (root-scan-consolidation) — and read on the scan queue once per directory
+/// entry.
 ///
 /// `NSLock` rather than `os_unfair_lock`/`Synchronization`'s `Atomic` for one concrete reason:
 /// `FileNode.swift` must keep compiling against **Foundation alone**, because
-/// `scripts/FileNodeTests` builds it standalone with `swiftc`. One-way by construction — there is
-/// no `uncancel()` — so a walk can never observe cancellation un-happening mid-unwind, and the flag
-/// needs no generation of its own (`WorkspaceModel` allocates a fresh token per job).
+/// `scripts/FileNodeTests` (and `scripts/RootScanTests`) build it standalone with `swiftc`. One-way
+/// by construction — there is no `uncancel()` — so a walk can never observe cancellation
+/// un-happening mid-unwind, and the flag needs no generation of its own (`RootScanScheduler`
+/// allocates a fresh token per job).
 final class ScanCancellationToken: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false

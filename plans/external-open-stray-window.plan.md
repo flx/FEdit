@@ -550,3 +550,54 @@ All dated 2026-08-11, folding the adversarial plan review (verdict REVISE).
   variant proves flaky in S4/S5, Tier 2 is reverted — unchanged from Revision 1.
 - **LB5's evidence staleness recorded** (review #5): the zero-windows 0→1 evidence is
   pre-token-redesign; S8 re-establishes it in Tier 1 before Tier 2 builds on it.
+
+---
+
+# Revision 3 (2026-08-11) — Tier 0 probe results: CLOSED AS NOT-REPRODUCIBLE
+
+Tier 0 ran in full (P1–P6, including the Revision 2 suppression spike). Raw per-run logs:
+job-archived under the orchestrating session's tmp (`logs/p1*…p6*`); summarized here because the
+logs are ephemeral.
+
+**P1 — the bug does not reproduce.** Cold, genuinely-no-session `fedit notes.md` settles at
+**1 window** — 6/6 runs across two launch methods (shim odoc and `open -F -a`). The stray
+`"editor"`-group scene IS created (its `onAppear` fires ~5 ms before the odoc, cliToken nil,
+snapshot empty — P1's identity question answered: it is the editor group), but it is torn down
+before ever becoming visible (`visible=false`, no delegate, at +3 s). LB8 is false. Per S1 and
+LB8, pre-committed in both revisions: **the item closes as not-reproducible; Tiers 1–3 are not
+built.**
+
+**The likely original observation, explained.** The machine carried a stale 12-scene restorable
+session from the (cli-open) verification — including **5 nil-token cli-open scenes, which restore
+blank by (cli-open)'s documented accepted consequence** (a CLI window quit before its first
+`@SceneStorage` write restores empty). Those blank windows at launch are indistinguishable from
+"a stray blank window on launch-by-open". The TODO's premise ("AppKit/SwiftUI creates the blank
+startup window before the odoc arrives") was half-right — the scene is created (P2 ordering:
+willFinish → didFinishRestoringWindows → stray onAppear → odoc → didFinishLaunching, LB6 true) —
+but it does not survive to be the reported window.
+
+**Probe facts worth keeping (they retire this plan's open assumptions):**
+- LB1 TRUE: `.defaultLaunchBehavior(.suppressed)` does NOT break session restore (3/3 two-window
+  restores under the spike, zero strays). LB2 TRUE (no cli-open promotion). LB4 TRUE
+  (`@Environment(\.openWindow)` resolves in `App.body`, runs before everything). LB5 TRUE — the
+  app-level opener created the process's FIRST window with no scene ever mounted.
+- Suppression is honoured on plain launches but the editor scene still appears (invisibly) on odoc
+  launches — so even the built fix would have been suppressing something already invisible.
+- P3/LB3 data: both restored `NSWindow`s exist by `didFinishRestoringWindows`; the proxy/appear
+  counts do NOT (0-of-2) — Revision 2's D-R4 live-count predicate (`isVisible && canBecomeKey`)
+  was correct in every measurement; the review's finding #3 was empirically right.
+- P5: `applicationShouldOpenUntitledFile` is never called on any launch shape on this platform.
+- Saved state lives at `$TMPDIR/com.felixmatschke.FEdit.savedState` on this machine — NOT
+  `~/Library/Saved Application State/` (which does not exist) — and deleting it does not clear
+  the restorable session; only `open -F` does. Every "rm -rf the savedState dir" criterion in
+  this plan was a no-op as written.
+- P4 extra baseline, NEW pre-existing bug: quit with zero windows → ordinary relaunch → **0
+  windows** on HEAD (S11 expected 1). The spike turns this 0 into 1. Filed as
+  `(zero-window-session-relaunch)` with the spike as design evidence.
+
+**Caveat / verification owed:** every probe ran with the display locked/asleep. In-app
+`NSApp.windows` predicates were the counting method (osascript silently returns 0 when the
+screen is locked — do not trust it there) and read consistently, but a human at an awake screen
+re-running P1 (cold, no session, `fedit /tmp/fedit-stray/notes.md`, count the windows) is the
+one check that would reopen this item. If it reproduces awake, reopen against THIS plan —
+Revision 2's design survives review and its load-bearing assumptions are now all probe-verified.

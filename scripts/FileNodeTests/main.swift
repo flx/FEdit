@@ -211,6 +211,18 @@ if let skipNameVariantsNode = rootChildren.first(where: { $0.name == "skip-name-
 
 teardown()
 
+// MARK: - path(_:isContainedIn:) (root-slash-prefix-match)
+
+print("\n== path(_:isContainedIn:) containment, including the \"/\" root ==")
+check(FileNode.path("/a/b/c.txt", isContainedIn: "/a/b"), "descendant is contained")
+check(FileNode.path("/a/b", isContainedIn: "/a/b"), "the root itself counts as contained (equality)")
+check(!FileNode.path("/a/bc", isContainedIn: "/a/b"), "a sibling sharing the prefix string is NOT contained")
+check(!FileNode.path("/a", isContainedIn: "/a/b"), "an ancestor is NOT contained")
+check(!FileNode.path("/x/y", isContainedIn: "/a/b"), "an unrelated path is NOT contained")
+check(FileNode.path("/usr/lib/x.dylib", isContainedIn: "/"), "a \"/\" root contains every absolute path (the old inline `+ \"/\"` idiom built \"//\" and matched nothing)")
+check(FileNode.path("/", isContainedIn: "/"), "\"/\" is contained in itself")
+check(!FileNode.path("/a/b", isContainedIn: "/a/b/c"), "containment is not symmetric")
+
 // MARK: - Summary
 
 print("\n==================================")

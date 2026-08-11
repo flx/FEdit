@@ -449,7 +449,7 @@ final class WorkspaceModel: ObservableObject {
     func removeRoot(_ root: FileNode) {
         roots.removeAll { $0.id == root.id }
         if let selectedFileURL,
-           selectedFileURL.path == root.url.path || selectedFileURL.path.hasPrefix(root.url.path + "/") {
+           FileNode.path(selectedFileURL.path, isContainedIn: root.url.path) {
             self.selectedFileURL = nil
         }
 
@@ -621,7 +621,7 @@ final class WorkspaceModel: ObservableObject {
         // (SPEC §11), left as-is here rather than crashing. The `isActive == false` guard prevents
         // double-arming an already-active watcher.
         if let openURL, let openFilePath, !fileWatcher.isActive,
-           rootPaths.contains(where: { openFilePath == $0 || openFilePath.hasPrefix($0 + "/") }),
+           rootPaths.contains(where: { FileNode.path(openFilePath, isContainedIn: $0) }),
            changedPaths.contains(openFilePath) {
             fileWatcher.watch(openURL.resolvingSymlinksInPath())
             fileDidChangeOnDisk()
@@ -644,9 +644,10 @@ final class WorkspaceModel: ObservableObject {
 
     /// Whether a rescan would ignore `path` — an **approximation** of `FileNode`'s scan skip rules.
     /// A path outside every watched root is skipped (nothing a rescan touches); otherwise only the
-    /// components **below** the containing root are tested (so a root that itself lives under a
-    /// hidden ancestor is not wrongly filtered out), skipping any hidden (`.`-prefixed) component —
-    /// covering `.git`, `.build`, and dotfiles — or any name in `FileNode.skippedDirectoryNames`.
+    /// components **below** the longest containing root are tested (so a root that itself lives
+    /// under a hidden ancestor — or under another, broader root — is not wrongly filtered out),
+    /// skipping any hidden (`.`-prefixed) component — covering `.git`, `.build`, and dotfiles —
+    /// or any name in `FileNode.skippedDirectoryNames`.
     ///
     /// **Known divergence, measured not suspected (async-root-scan, filed as
     /// (watcher-scan-skip-parity)).** `FileNode.scanChildren` passes `.skipsHiddenFiles`, which also
@@ -657,9 +658,19 @@ final class WorkspaceModel: ObservableObject {
     /// no-syscall-per-changed-path constraint forbids; until that item lands, what bounds the cost
     /// is `RootScanScheduler`'s damping (see its `minRescanGap`), not this gate.
     private func isSkippedTreePath(_ path: String, rootPaths: [String]) -> Bool {
-        guard let root = rootPaths.first(where: { path == $0 || path.hasPrefix($0 + "/") }) else {
+        // The LONGEST containing root wins (root-slash-prefix-match review): roots can nest — and a
+        // "/" root contains everything — so a shorter ancestor root must not shadow a more specific
+        // one, or the components *between* the two (say, a dot-directory the specific root
+        // deliberately lives under) would be tested here and wrongly skip the event. Longest-match
+        // is equivalent to "skipped only if skipped under every containing root": the longest
+        // root's relative components are a suffix of every other containing root's, so whenever any
+        // containing root reads the path as clean, the longest one does too.
+        let containingRoots = rootPaths.filter { FileNode.path(path, isContainedIn: $0) }
+        guard let root = containingRoots.max(by: { $0.count < $1.count }) else {
             return true
         }
+        // `dropFirst(root.count)` leaves a leading "/" that `split` discards — except under a "/"
+        // root, where it leaves no leading slash; both shapes split into the same components.
         let relativeComponents = path.dropFirst(root.count).split(separator: "/")
         for component in relativeComponents {
             if component.hasPrefix(".") { return true }
@@ -1142,13 +1153,14 @@ final class WorkspaceModel: ObservableObject {
         // appears (SPEC §5.2). Plural, not `first(where:)`: roots may nest (`addFolders` dedupes on
         // exact path equality only), and each containing root renders its own section, so every one
         // of them gains the row. Rescanning the rest would re-walk — and reset the damping backoff
-        // of — roots that provably cannot contain the file. The prefix match is the same path-string
-        // idiom `removeRoot` uses. The fallback is reachable, not defensive: `newFileTargetDirectory`
-        // is the open file's parent, and an open file can sit outside every root (e.g. after its
-        // root was removed), in which case no root shows the new file and the full refresh is simply
-        // the honest superset.
+        // of — roots that provably cannot contain the file. The containment test is the shared
+        // `FileNode.path(_:isContainedIn:)` helper (root-slash-prefix-match) — the same one
+        // `removeRoot` and the tree-skip gate use. The fallback is reachable, not defensive:
+        // `newFileTargetDirectory` is the open file's parent, and an open file can sit outside
+        // every root (e.g. after its root was removed), in which case no root shows the new file
+        // and the full refresh is simply the honest superset.
         let parent = fileURL.deletingLastPathComponent().path
-        let containingRoots = roots.filter { parent == $0.url.path || parent.hasPrefix($0.url.path + "/") }
+        let containingRoots = roots.filter { FileNode.path(parent, isContainedIn: $0.url.path) }
         if containingRoots.isEmpty {
             refreshAll(force: true)
         } else {

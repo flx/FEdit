@@ -134,6 +134,24 @@ struct FileNode: Identifiable, Equatable, Sendable {
         return directories.sorted(by: byName) + files.sorted(by: byName)
     }
 
+    /// (root-slash-prefix-match) Whether `path` names the same entry as `rootPath` or anything
+    /// beneath it, by string comparison alone — no syscalls, because two callers run per-path
+    /// inside FSEvents burst handling (`WorkspaceModel.handleTreeChange` / `isSkippedTreePath`)
+    /// under a no-syscall-per-changed-path constraint. Both arguments must be absolute and
+    /// consistently canonicalized (standardized, and realpath'd where the caller compares against
+    /// FSEvents paths); equality counts as contained, which every call site wants.
+    ///
+    /// The containment prefix is `rootPath + "/"` — **except** when `rootPath` already ends in
+    /// `"/"`, which among standardized absolute paths is exactly the filesystem root `"/"`:
+    /// appending another slash there would build `"//"`, which no standardized path starts with,
+    /// so a `/` root would contain nothing (the bug this helper exists to fix — previously this
+    /// idiom was inlined at four `WorkspaceModel` sites, all wrong for a `/` root, silently).
+    static func path(_ path: String, isContainedIn rootPath: String) -> Bool {
+        if path == rootPath { return true }
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        return path.hasPrefix(prefix)
+    }
+
     /// Every file under `self`, paired with its path relative to `self` — `self`'s own name is
     /// excluded from every path (callable directly on a root: yields `swift-source/main.swift`,
     /// never `FEdit/swift-source/main.swift`; a root-name leak would corrupt filter matching,

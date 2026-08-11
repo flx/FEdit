@@ -1,0 +1,116 @@
+#!/bin/sh
+#
+#  fedit
+#  FEdit
+#
+#  Copyright © 2026 Felix Matschke
+#
+#  This file is part of FEdit.
+#
+#  FEdit is free software: you can redistribute it and/or modify it under
+#  the terms of the GNU General Public License as published by the Free
+#  Software Foundation, either version 3 of the License, or (at your
+#  option) any later version.
+#
+#  FEdit is distributed in the hope that it will be useful, but WITHOUT
+#  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+#  FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License
+#  for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with FEdit. If not, see <https://www.gnu.org/licenses/>.
+#
+#  Opens files or folders in FEdit from the command line:
+#
+#      fedit [path ...]
+#
+#  A thin wrapper around `open -a`: it encodes no FEdit-specific protocol at
+#  all. Its whole contract is "hand `open` the app bundle and zero or more
+#  existing, absolute paths"; everything about which window a path lands in is
+#  the app's business (it always makes a new one).
+#
+#  Exit codes: 0 (or `open`'s own status) on success, 64 (EX_USAGE) for too
+#  many paths, 66 (EX_NOINPUT) for a path that does not exist, 69
+#  (EX_UNAVAILABLE) when FEdit.app cannot be found.
+#
+
+set -eu
+
+# Rewritten by scripts/install.sh to the directory FEdit.app was actually
+# installed into; FEDIT_APP overrides it either way.
+APP=${FEDIT_APP:-/Applications/FEdit.app}
+
+# One window (and one recursive folder scan) per path, so a stray `fedit *.md`
+# in a big folder must not be taken literally. The app enforces the same cap
+# silently; here it is a usage error, which is the more useful answer.
+MAX_PATHS=8
+
+usage() {
+    printf 'usage: fedit [path ...]\n'
+    printf '\n'
+    printf 'Opens each file or folder in its own FEdit window (at most %s per call).\n' "$MAX_PATHS"
+    printf 'A file opens with its containing folder as the window sidebar root; a\n'
+    printf 'folder opens as the root with no file open. With no arguments, FEdit is\n'
+    printf 'just launched or activated.\n'
+    printf '\n'
+    printf 'Set FEDIT_APP to point at FEdit.app if it is not at %s.\n' "$APP"
+}
+
+# `-h`/`--help` as the first argument only: after it, everything is a path (a
+# file really can be called "--help").
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+if [ "$#" -gt "$MAX_PATHS" ]; then
+    printf 'fedit: too many paths (%s given, at most %s)\n' "$#" "$MAX_PATHS" >&2
+    usage >&2
+    exit 64
+fi
+
+# Validate and absolutize in one pass over the argument list, rotating each
+# argument to the back: no `for`/array, so paths containing spaces or newlines
+# survive intact, and an absolute path can never be mistaken for a flag.
+#
+# Validation is all-or-nothing and happens strictly before `open` is invoked —
+# a typo in the third of three paths must open nothing at all.
+argument_count=$#
+processed=0
+while [ "$processed" -lt "$argument_count" ]; do
+    argument=$1
+    shift
+
+    if [ ! -e "$argument" ]; then
+        printf 'fedit: no such file or directory: %s\n' "$argument" >&2
+        exit 66
+    fi
+
+    # `realpath`'s own diagnostic is suppressed in favour of this script's
+    # message, so every "bad path" failure reads the same way.
+    if ! absolute=$(/bin/realpath "$argument" 2>/dev/null); then
+        printf 'fedit: no such file or directory: %s\n' "$argument" >&2
+        exit 66
+    fi
+
+    set -- "$@" "$absolute"
+    processed=$((processed + 1))
+done
+
+# With no arguments this is just "launch or activate FEdit", which is what
+# `code`/`subl` do too — FEdit has a real empty-window state, so it is not a
+# dead end. The exit status is `open`'s, so a broken install still reports.
+if [ -d "$APP" ]; then
+    exec open -a "$APP" "$@"
+fi
+
+# No bundle at $APP: fall back to asking LaunchServices for an app named FEdit
+# (a copy installed somewhere else, still registered).
+if open -a FEdit "$@"; then
+    exit 0
+fi
+
+printf 'fedit: FEdit.app not found (looked in %s and LaunchServices); set FEDIT_APP\n' "$APP" >&2
+exit 69

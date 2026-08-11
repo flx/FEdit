@@ -21,7 +21,8 @@
 #  along with FEdit. If not, see <https://www.gnu.org/licenses/>.
 #
 #  Builds the Release configuration and installs FEdit.app into /Applications
-#  (or into the directory given as the single optional argument):
+#  (or into the directory given as the single optional argument), then installs
+#  the `fedit` command-line shim into the first writable directory it finds:
 #
 #      scripts/install.sh [destination-directory]
 #
@@ -49,6 +50,98 @@ readonly DEFAULT_DEST="/Applications"
 die() {
     printf 'install.sh: %s\n' "$*" >&2
     exit 1
+}
+
+warn() {
+    printf 'install.sh: %s\n' "$*" >&2
+}
+
+# (cli-open) Installs the `fedit` shim next to the app, with its APP= default
+# rewritten to wherever the app actually went — so a non-default destination
+# still yields a working command. Deliberately NON-FATAL and never `sudo`: a
+# shim that cannot be placed must not fail an otherwise-good app install.
+install_cli_shim() {
+    local shim_source="$SCRIPT_DIR/fedit"
+    if [ ! -f "$shim_source" ]; then
+        warn "CLI shim not found at $shim_source — skipping (the app itself is installed)"
+        return 0
+    fi
+
+    # /opt/homebrew/bin before /usr/local/bin: on Apple Silicon the former is
+    # the one that is normally on PATH. $HOME/.local/bin is the last resort and
+    # the only one created on demand.
+    local candidates=()
+    if [ -n "${FEDIT_BIN_DIR:-}" ]; then
+        candidates+=("$FEDIT_BIN_DIR")
+    fi
+    candidates+=("/opt/homebrew/bin" "/usr/local/bin" "$HOME/.local/bin")
+
+    local bin_dir=""
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if [ ! -d "$candidate" ]; then
+            [ "$candidate" = "$HOME/.local/bin" ] || continue
+            mkdir -p "$candidate" 2>/dev/null || continue
+        fi
+        [ -w "$candidate" ] || continue
+        bin_dir="$candidate"
+        break
+    done
+
+    if [ -z "$bin_dir" ]; then
+        warn "no writable directory for the fedit command (tried ${candidates[*]}) — skipping"
+        warn "install it yourself with: install -m 0755 '$shim_source' <a-directory-on-your-PATH>/fedit"
+        return 0
+    fi
+
+    local staged
+    staged=$(mktemp "${TMPDIR:-/tmp}/fedit-shim.XXXXXX") || {
+        warn "could not create a temporary file for the fedit shim — skipping"
+        return 0
+    }
+
+    # `&`, `|` and `\` are special on sed's replacement side; the destination is
+    # an arbitrary path, so escape them.
+    local app_escaped
+    app_escaped=$(printf '%s' "$INSTALLED_APP" | sed -e 's/[\\&|]/\\&/g')
+    if ! sed "s|^APP=\${FEDIT_APP:-.*}\$|APP=\${FEDIT_APP:-$app_escaped}|" "$shim_source" > "$staged"; then
+        rm -f "$staged"
+        warn "could not stage the fedit shim — skipping"
+        return 0
+    fi
+
+    # Verify by EVALUATION, not by string match: what has to be true is that the
+    # staged shim, run with no FEDIT_APP in the environment, ends up with APP
+    # pointing at the bundle we just installed. Evaluating its own APP= line in a
+    # clean shell asserts exactly that, and keeps working if the line's spelling
+    # (quoting, a different parameter expansion) ever changes. Fail loudly rather
+    # than installing a shim that silently points at /Applications while the app
+    # went somewhere else.
+    local app_line resolved
+    app_line=$(grep -m 1 '^APP=' "$staged") || app_line=""
+    resolved=""
+    if [ -n "$app_line" ]; then
+        resolved=$(env -i /bin/sh -c "FEDIT_APP=''; $app_line; printf '%s' \"\$APP\"" 2>/dev/null) || resolved=""
+    fi
+    if [ "$resolved" != "$INSTALLED_APP" ]; then
+        rm -f "$staged"
+        warn "the staged fedit shim resolves APP to '$resolved', not '$INSTALLED_APP' — skipping"
+        warn "install it yourself and set FEDIT_APP=$INSTALLED_APP"
+        return 0
+    fi
+
+    if ! install -m 0755 "$staged" "$bin_dir/fedit"; then
+        rm -f "$staged"
+        warn "could not install the fedit command into $bin_dir — skipping"
+        return 0
+    fi
+    rm -f "$staged"
+
+    printf 'Installed %s\n' "$bin_dir/fedit"
+    case ":$PATH:" in
+        *":$bin_dir:"*) ;;
+        *) printf '%s is not on your PATH — add it to run `fedit` directly.\n' "$bin_dir" ;;
+    esac
 }
 
 usage() {
@@ -110,4 +203,7 @@ printf 'Copying %s to %s\n' "$BUILT_APP" "$INSTALLED_APP"
 ditto "$BUILT_APP" "$INSTALLED_APP" || die "could not copy $APP_NAME to $DEST"
 
 printf '\nInstalled %s\n' "$INSTALLED_APP"
+
+install_cli_shim
+
 printf 'If FEdit is already running, quit it and relaunch to pick up this build.\n'

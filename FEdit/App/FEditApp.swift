@@ -43,9 +43,23 @@ struct FEditApp: App {
         }
         .defaultSize(width: CGFloat(LayoutMetrics.defaultWindowWidth), height: 700)
         .commands {
+            // App-global, not scene-specific: one attachment builds the whole menu bar, and the
+            // commands below resolve their target through `@FocusedObject`/`openWindow` anyway.
             FileCommands()
             ViewCommands()
         }
+
+        // (cli-open) External opens (`fedit`, `open -a FEdit <path>`) get their own window group,
+        // presenting a `CLIOpenToken`: SwiftUI hands the token to exactly the scene it creates for
+        // it, which is what makes "the request lands in ITS window and disturbs no other" a
+        // structural property rather than a timing argument. Every token carries a fresh UUID, so
+        // `openWindow(value:)` never dedups onto an existing window. Same chrome as the editor
+        // group — it *is* an ordinary editor window, only its first content comes from outside.
+        WindowGroup(id: "cli-open", for: CLIOpenToken.self) { $token in
+            ContentView(cliToken: $token)
+                .frame(minWidth: 700, minHeight: 400)
+        }
+        .defaultSize(width: CGFloat(LayoutMetrics.defaultWindowWidth), height: 700)
     }
 }
 

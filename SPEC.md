@@ -20,6 +20,8 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 
 - `WindowGroup`-based: **multiple editor windows** opened via File → Open Folder… (Cmd+O), which opens a new window and prompts for a folder that becomes the new window's sole root (Cancel leaves an empty window).
 - File → New… (Cmd+N) is focused-window-scoped — it creates a file in the key window's target directory (§7) rather than opening a new window.
+- A file or folder handed to the app **from outside** (the `fedit` command, `open -a FEdit <path>`) always opens in a **new** window — no existing window, full or empty, is ever disturbed. The file's containing folder becomes that window's sole root and the file is opened in the editor; a folder argument just becomes the root. Several paths in one invocation give one window each (capped at 8 per delivery); a path that no longer exists is ignored. On a cold launch this window comes up **in addition to** the restored session's windows, and it is an ordinary window from then on — it is restored with the next session like any other.
+- Two window groups back this: `"editor"` (value-less) for Cmd+O/Cmd+N/restore, and `"cli-open"`, which presents the external open as the new window's **value** — the window a request lands in is the window the system created for it. An external open is applied **at most once, only by the process that issued it, and only to a window still empty at that moment**; a restored window — editor or cli-open alike — always wins with its own saved session state, and never re-runs the open it was originally created for (so a cli-open window quit before its first state save comes back empty). Each external open carries a unique identity, so repeating one gives a second window rather than refocusing the first.
 - Each window owns its own independent state: folder list, filter text, open file, cursor.
 - Default window size 1100×700, minimum 700×400.
 - Window frames restored by the system's window restoration.
@@ -51,6 +53,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 - Section header shows the folder path abbreviated with `~` for the home directory (e.g. `~/Programming/swift/FEdit`), truncated head-first if too long.
 - Context menu on a section header: **Remove from Sidebar** (does not touch the disk), **Refresh** (rescans all folders).
 - Adding a folder that is already open is a no-op.
+- A root can also arrive without the panel: from Cmd+O's new-window pick, from session restore (§9), or from an external open (§3) — where it is the argument's containing folder (a file argument) or the argument itself (a folder argument), used verbatim, symlinks unresolved.
 - With no folders open, the sidebar shows a placeholder with an "Add Folder to Window…" button (adds a folder to the current window).
 - The sidebar column's fixed top strip (§4, a name-only summary — each open root's last path component, comma-separated) is **distinct from and complements** these per-root section headers (full `~`-abbreviated path, head-truncated, Remove/Refresh menu); the section headers are unchanged.
 
@@ -199,8 +202,12 @@ Tabs, split editors, find/replace, file **rename/delete** and sidebar-driven fil
 FEdit.xcodeproj
 FEdit/
   App/FEditApp.swift            app entry, commands (menus), settings keys
-  App/LaunchCoordinator.swift   mailbox draining Cmd+O's pending folder-pick into a pristine new window
-  App/WindowCloseGuard.swift    NSWindowDelegate proxy: flush-on-close/quit, Close-Without-Saving escape
+  App/LaunchCoordinator.swift   Cmd+O's pending-folder-pick mailbox, and the external-open (§3)
+                                dispatcher that opens one "cli-open" window per request
+  App/OpenRequest.swift         external-open path → (sidebar root, file to open), resolved on
+                                disk; plus CLIOpenToken, the window's presented value
+  App/WindowCloseGuard.swift    NSWindowDelegate proxy: flush-on-close/quit, Close-Without-Saving
+                                escape; app delegate's external-open (odoc) sink
   Models/WorkspaceModel.swift   per-window state: roots, open file, dirty/save/autosave logic
   Models/FileNode.swift         tree node + recursive scanner
   Models/FilterQuery.swift      boolean filter parser/evaluator (terms, AND/OR, ^/$ anchors)
@@ -221,8 +228,12 @@ FEdit/
   Preview/MarkdownRenderer.swift  markdown → NSAttributedString + line anchors
   Preview/MarkdownPreviewView.swift  read-only text view + scroll-to-anchor
 scripts/
+  install.sh                    Release build + install of FEdit.app and the fedit shim
+  fedit                         /bin/sh command-line shim around `open -a` (§3 external opens)
   FileNodeTests, FilterQueryTests, GitStatusTests, LogicalLineTests,
-  MarkdownRendererTests, SnapshotTests    standalone swiftc-run regression harnesses (no XCTest target)
+  MarkdownRendererTests, OpenRequestTests, SnapshotTests
+                                standalone swiftc-run regression harnesses (no XCTest target)
+  FeditShimTests                shell harness for scripts/fedit (stub `open`, no GUI)
 ```
 
 ## 14. Implementation order

@@ -151,7 +151,31 @@ final class WindowCloseGuardProxy: NSObject, NSWindowDelegate {
 /// through the same dialog per window"). Iterates `NSApp.windows` in order; a `Cancel` in any
 /// window's dialog aborts the whole quit immediately — actions already applied to earlier windows
 /// (saves/discards) stand, and no window is closed (criterion 17a).
+///
+/// (cli-open) Also the app's external-open sink: `application(_:open:)` is the AppKit-level odoc
+/// receive site — app-scoped, window-independent, and delivered even before any scene exists on a
+/// cold launch. Both methods do nothing but forward to `LaunchCoordinator`, which owns the policy.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// (cli-open) Every file/folder handed to the app from outside — `fedit`, `open -a`, Finder —
+    /// arrives here. Scene-scoped `.onOpenURL` is deliberately not used: on a cold launch it would
+    /// deliver into a *restored* window's view hierarchy, which is exactly the window an external
+    /// open must not disturb.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        // AppKit delivers application delegate callbacks on the main thread; `assumeIsolated`
+        // states that to the compiler (the same idiom as `WindowCloseGuardProxy` above).
+        MainActor.assumeIsolated {
+            LaunchCoordinator.shared.enqueueFileOpens(urls)
+        }
+    }
+
+    /// (cli-open) Tells `LaunchCoordinator` there is scene machinery to open a window with: on a
+    /// cold launch the odoc Apple Event above arrives *before* this, so its requests wait here.
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            LaunchCoordinator.shared.noteLaunchFinished()
+        }
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         for window in NSApp.windows {
             guard let proxy = window.delegate as? WindowCloseGuardProxy else { continue }

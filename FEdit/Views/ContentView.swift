@@ -56,6 +56,22 @@ struct ContentView: View {
     // One per window (SPEC §3) — holds the open folders and selection for this window.
     @StateObject private var workspace = WorkspaceModel()
 
+    // (cli-open) Handed to `LaunchCoordinator` on appear so an external open (`fedit`, `open -a`)
+    // can create its own window — it always gets a new one, never an existing window.
+    @Environment(\.openWindow) private var openWindow
+
+    // (cli-open) This scene's presented value, non-nil only for a window of the `"cli-open"`
+    // group: the external open this window was created *for*. Nil for every window of the
+    // ordinary `"editor"` group, so `ContentView()` (Cmd+O, Cmd+N, session restore, the startup
+    // window) is unchanged. A `Binding` because that is what `WindowGroup(for:)` hands its
+    // content, and written through exactly once: `applyCLITokenIfNeeded()` clears the value as
+    // soon as it has decided about it, so the scene never re-presents a live token.
+    private let cliToken: Binding<CLIOpenToken?>?
+
+    init(cliToken: Binding<CLIOpenToken?>? = nil) {
+        self.cliToken = cliToken
+    }
+
     // (session-restore) SPEC §3, §9: this window's persisted state — open folders, open file,
     // filter text, cursor — round-tripped through `WorkspaceModel.snapshotJSON()`/`restore(fromJSON:)`
     // as JSON. `@SceneStorage` keys this per-scene, so each window restores its own snapshot.
@@ -167,6 +183,18 @@ struct ContentView: View {
             workspace.scheduleGitRefresh()
         }
         .onAppear {
+            // (cli-open) Re-registered by **every** scene on every appear, deliberately before the
+            // `didRestore` guard: `LaunchCoordinator` needs some live window's `OpenWindowAction`
+            // to create the window an external open lands in, and re-arming it here keeps that
+            // action fresh as windows come and go. Idempotent — last writer wins. The token is
+            // passed as the new window's *value*, so it is delivered to that window and no other.
+            // Captures the `OpenWindowAction` and nothing else — an implicit `self` capture would
+            // park this whole view (and its `@StateObject` workspace) in the app-lifetime
+            // singleton, keeping a closed window's model alive until the next appear overwrote it.
+            LaunchCoordinator.shared.registerWindowOpener { [openWindow] token in
+                openWindow(id: "cli-open", value: token)
+            }
+
             guard !didRestore else { return }
             didRestore = true
             workspace.restore(fromJSON: workspaceSnapshot)
@@ -180,12 +208,26 @@ struct ContentView: View {
             // folder picker one runloop turn later so the window is on screen first — Cancel
             // then trivially leaves an empty window. Restored / blank-startup windows (counter
             // == 0) skip this, so today's startup behavior is unchanged.
-            if LaunchCoordinator.shared.pendingNewWindowPicks > 0 && workspace.roots.isEmpty && workspace.openFile == nil {
+            //
+            // `cliToken == nil` restricts the mailbox to the `"editor"` group, which is the only
+            // group Cmd+O's `openWindow` targets: a cli-open scene — fresh or restored — never
+            // owes the user a folder panel, so it must not be able to swallow a pick meant for
+            // the editor window that is about to appear.
+            if cliToken == nil, LaunchCoordinator.shared.pendingNewWindowPicks > 0,
+               workspace.roots.isEmpty, workspace.openFile == nil {
                 LaunchCoordinator.shared.pendingNewWindowPicks -= 1
                 DispatchQueue.main.async {
                     workspace.presentNewWindowFolderPanel()
                 }
             }
+            applyCLITokenIfNeeded()
+        }
+        // (cli-open) The window's presented value can also be delivered *after* the first render
+        // (the same way `@SceneStorage` can — see the recovery rule below), and `onAppear` above
+        // is one-shot. Same call, and it is idempotent: it clears the binding on every path, so
+        // whichever of the two runs second finds nothing to do.
+        .onChange(of: cliToken?.wrappedValue) { _, _ in
+            applyCLITokenIfNeeded()
         }
         // Late-arriving `@SceneStorage` recovery rule: the platform can deliver the persisted
         // string *after* the first render (`workspaceSnapshot` starts at `""` and is updated once
@@ -213,6 +255,48 @@ struct ContentView: View {
         .onChange(of: workspace.currentSnapshot) { _, _ in
             guard didRestore, let json = workspace.snapshotJSON() else { return }
             workspaceSnapshot = json
+        }
+    }
+
+    // (cli-open) Applies the external open this window was created for — or drops it. Nothing is
+    // claimed from a shared queue: the token is *this scene's own* presented value, so no other
+    // window can be handed it and this window can hold no one else's. Three layers stand between a
+    // token and a window's contents, because the system persists a `WindowGroup(for:)` value and
+    // hands it back when it restores the window:
+    //
+    //  1. `wasIssuedThisProcess` — a token restored from a previous launch was never issued by
+    //     *this* process, so it is inert. No timing is involved: it can never apply, in any order.
+    //  2. The pristine test — a token applies only to a scene that restored nothing, so a window's
+    //     own later, edited state always wins over the open it was originally created for.
+    //  3. The same test again inside the async block, because `@SceneStorage` can be delivered
+    //     late (see the recovery rule in `body`): if the snapshot landed in the meantime, it wins.
+    //
+    // Every path clears the binding, so the scene never re-presents a live token and a second call
+    // (`onAppear` vs. `onChange`) is a no-op. Accepted consequence of layer 1: a cli-open window
+    // quit before its first `@SceneStorage` write comes back empty rather than re-applying its
+    // file — the window is an ordinary editor window from then on, restored from its snapshot like
+    // any other.
+    private func applyCLITokenIfNeeded() {
+        guard let cliToken, let token = cliToken.wrappedValue else { return }
+        // The pristine test below only means anything once the restore decision has been made, so
+        // a token that changes before the first appear is left in place (not cleared) for the
+        // `onAppear` pass a moment later to read.
+        guard didRestore else { return }
+        cliToken.wrappedValue = nil
+
+        guard LaunchCoordinator.shared.wasIssuedThisProcess(token),
+              workspace.roots.isEmpty, workspace.openFile == nil, workspaceSnapshot.isEmpty else { return }
+
+        // One runloop turn later, mirroring the folder-panel idiom in `onAppear`: the window is on
+        // screen first, so the recursive scan, watcher arming, git shell-out and any "Cannot Open
+        // File" alert run in an ordinary context rather than inside the odoc/appear stack.
+        DispatchQueue.main.async {
+            guard workspace.roots.isEmpty, workspace.openFile == nil, workspaceSnapshot.isEmpty else { return }
+            workspace.addFolders([token.root])
+            if let file = token.file {
+                workspace.requestOpen(file)
+            }
+            LaunchCoordinator.shared.bringWindowToFront(for: workspace)
         }
     }
 

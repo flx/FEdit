@@ -710,3 +710,82 @@ All dated 2026-08-11, folding the adversarial plan review (verdict BUILD WITH FI
   unacceptable later — not built now.
 - **Tensions 3, 4 (verbatim parent scan; A22 measurement-not-gate) accepted as Revision 1 stated
   them**; both are pre-existing Cmd+O-equivalent hazards, and A22's number lands in DONE.md.
+
+---
+
+# Revision 3 (2026-08-11) — post code-review re-cut of the window-targeting mechanism
+
+The adversarial behavior review of the Revision 2 implementation returned DO NOT SHIP with a
+CONFIRMED critical: the pristine-guard claim is blind to a restored scene whose `@SceneStorage`
+snapshot arrives late (the repo's own late-arrival recovery in ContentView proves late snapshots
+are real), so the "a CLI open can never touch a restoring window" criterion was only made
+improbable by the 0.25 s settle timer — a restored root's synchronous scan blocking the main
+thread past the timer, or an odoc delivered after settle, defeats the ordering argument. A missed
+claim additionally poisoned the FIFO `assignments` queue permanently.
+
+## Replacement mechanism (supersedes Revision 2's Tier 1 claim design)
+
+**Typed window payload.** A second scene `WindowGroup(id: "cli-open", for: CLIOpenToken.self)`
+presents `ContentView` with an optional token binding. `CLIOpenToken` is `Codable & Hashable`
+(UUID + root path + optional file path); dispatch wraps each `OpenRequest` in a fresh-UUID token
+and calls `openWindow(id: "cli-open", value: token)`. SwiftUI delivers the value to exactly the
+window it creates for that call — there is NO claim step, no assignments queue, no settle timer.
+A restored "editor"-group scene cannot receive a token by construction; the UUID makes every
+token unequal so value-dedup can never focus or reuse an old (or restored) window. The token is
+applied only to a pristine scene (a restored cli-open window has a snapshot, which wins), one
+runloop turn after appear (unchanged from Revision 2). The existing `WindowGroup(id: "editor")`
+is byte-identical — its scene identity, and therefore session restore, is untouched.
+
+## Finding dispositions (review verdict DO NOT SHIP → fixed and re-gated)
+
+- #1 claim-guard blindness (Critical) + #2 FIFO poisoning (High): ACCEPTED — root-fixed by the
+  token design above; both failure classes are structurally impossible now.
+- #3 retry exhaustion strands requests (Medium): ACCEPTED — `registerWindowOpener` re-enters
+  dispatch when requests are pending, so a late-appearing scene drains the queue.
+- #4 stale OpenWindowAction on zero windows (Medium, SUSPECTED): REJECTED with evidence — the
+  implementer's scripted A24 run showed the real app going 0 → 1 windows on a live `fedit`
+  invocation; L4 holds on this platform.
+- #5 --help hard-codes /Applications (Low): ACCEPTED — uses `$APP`.
+- #6 sed-rewrite verification is textual (Low): ACCEPTED — the installed shim's `APP=` line is
+  now verified by evaluating it in a clean shell and comparing the resolved path.
+- #7 mislabeled shim test / missing fallback-success case (Low): ACCEPTED — test fixed + real
+  fallback-success test added.
+- #8 tautological OpenRequest assertions (Low): ACCEPTED — replaced; token Codable/inequality
+  assertions added.
+- #9 docs overclaim (Low): ACCEPTED — "never disturbed" is now structurally true and stays;
+  added the LaunchServices-fallback caveat, the cold-launch restored-windows-plus-one note, and
+  --help's first-argument-only rule.
+- #10 CLI open during a modal folder panel nests the scan/alert in the modal session (SUSPECTED):
+  DEFERRED, recorded residual — no existing window is mutated; modal-nesting is a pre-existing
+  hazard class in this app; revisit only if it shows in the human GUI pass.
+- #11 cap-before-filter (Nit): ACCEPTED — filter, then cap.
+
+## Revision 3.1 — second review round on the token implementation
+
+The focused re-review of the token implementation returned DO NOT SHIP once more: the late-
+snapshot race had RELOCATED onto restored cli-open windows (a persisted token re-presented at
+restore races that scene's own late @SceneStorage arrival — Revision 3's "structurally
+impossible" was an overclaim; the claim held only for editor-group scenes). Dispositions:
+
+- #1 relocated race (Critical): ACCEPTED, fixed with a stronger invariant than the reviewer's
+  suggestion — LaunchCoordinator records the UUIDs of tokens issued IN THIS PROCESS and a token
+  is applied only if (a) its UUID is in that set, (b) the scene passes the pristine check at
+  onAppear AND re-passes it inside the one-turn-later apply block, and (c) the binding is cleared
+  after any handling. A restored token (previous process) is inert by construction — no timing
+  assumption anywhere. Accepted edge: a CLI window quit before its first snapshot write restores
+  empty rather than re-opening its file.
+- #2 cli-open scene can steal a pending Cmd+O pick (High): ACCEPTED — the folder-pick drain is
+  gated on the scene NOT being a cli-open scene (binding-presence discriminator).
+- #3 opener closure strongly captures the view's WorkspaceModel into the singleton (Medium):
+  ACCEPTED — capture list narrows it to the OpenWindowAction.
+- #4 no failure path when openWindow no-ops / late token delivery dropped (Medium): PARTIAL — an
+  onChange observer (same guards, idempotent) now catches late delivery; window-creation-failure
+  reconciliation DEFERRED as a recorded residual; the zero-windows check remains owed to the
+  human GUI pass (pre-redesign evidence showed 0→1 works; mechanism unchanged).
+- #5 shared retry budget across chains (Low): ACCEPTED — one chain at a time.
+- #6 SPEC "no timing assumptions" overclaim (Low): ACCEPTED — replaced with the actual invariant.
+- #7 non-falsifiable token assertions (Nit): ACCEPTED — hasDirectoryPath assertions + UUID
+  round-trip.
+
+If the verify pass after this round still finds the race, that is AUTONOMY hard stop 4
+(same finding surviving two fixer rounds) and the item stops there.

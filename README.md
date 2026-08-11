@@ -29,6 +29,14 @@ Open `FEdit.xcodeproj` in Xcode and Run. No third-party dependencies.
 
 A handful of pure-logic modules (filter query, markdown renderer, git status parsing, file tree scanning, session snapshots, line counting) also have standalone `swiftc`-run regression harnesses under `scripts/*/main.swift`, used in place of an XCTest target.
 
+## Installing
+
+`scripts/install.sh` builds the Release configuration (derived data goes to a fixed folder under `$TMPDIR`, outside the repo) and installs `FEdit.app` into `/Applications`, replacing any previous copy. Pass a directory as the single optional argument to install somewhere else. If FEdit is already running, quit and relaunch it to pick up the new build.
+
+```sh
+scripts/install.sh
+```
+
 ## License
 
 FEdit is free software, licensed under the [GNU General Public License v3.0](LICENSE) (or, at your option, any later version).

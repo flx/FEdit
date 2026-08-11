@@ -72,6 +72,16 @@ final class WorkspaceModel: ObservableObject {
 
     @Published private(set) var roots: [FileNode] = []
 
+    /// (async-root-scan) Roots whose **first** walk has not landed yet — i.e. roots that are still
+    /// the empty placeholder `addFolders` appended synchronously. This is the *only* scan state the
+    /// UI observes: `SidebarView` shows "Scanning…" for exactly these, in both tree and filter mode.
+    ///
+    /// Deliberately not `scanningRootURLs` (which is private bookkeeping): keying the affordance to
+    /// first scans means a *refresh* of an already-populated root never blanks it, a genuinely empty
+    /// root does not flip to "Scanning…" on every watcher-driven rescan, and — because scan-state
+    /// churn no longer publishes — a rescan that finds nothing changed invalidates no view at all.
+    @Published private(set) var initialScanRootURLs: Set<URL> = []
+
     /// Record-only until requestOpen. Writing this property has **zero side effects at the model
     /// layer** — no `didSet` — by design: the selection→load hook used to live in ContentView's
     /// `.onChange(of:)` (editor-core); it is now `requestOpen`, called directly from the sidebar
@@ -177,6 +187,102 @@ final class WorkspaceModel: ObservableObject {
     private var isRecomputing = false
     private var recomputeAgain = false
 
+    /// (async-root-scan) The **only** place the blocking recursive directory walk runs — the whole
+    /// point of the item: no user action can freeze the window on a home-scale root any more.
+    ///
+    /// `static` (shared app-wide, not per-window) and **concurrent**, not serial: per-root
+    /// serialization is `scanningRootURLs`' job, not the queue's, and a serial queue would park a
+    /// small root's walk — and `createFile`'s "the new row appears" refresh (SPEC §5.2) — behind a
+    /// multi-minute `$HOME` walk. Deliberately **not** the Swift cooperative pool, for the same
+    /// reason `gitQueue` isn't (see `GitStatus`): `contentsOfDirectory` is a blocking syscall and
+    /// must not park a cooperative worker for minutes. Width is bounded by the live root count
+    /// across all windows (a handful in practice) and GCD's own pool; no explicit cap is imposed —
+    /// revisit only if a real session shows contention.
+    private static let scanQueue = DispatchQueue(label: "com.fedit.tree-scan", qos: .userInitiated, attributes: .concurrent)
+
+    /// (async-root-scan) Damping bounds for **watcher-driven** rescans of one root: the minimum gap
+    /// between the end of one walk and the start of the next. The required gap is the **larger** of
+    /// two terms:
+    /// - an exponential component that doubles from `minRescanGap` to `maxRescanGap` for each
+    ///   consecutive rescan that comes back structurally unchanged (reset by a real structural
+    ///   change or an explicit Refresh), and
+    /// - `rescanDurationFactor × lastScanDuration[root]` — the previous walk's own measured cost —
+    ///   applied **only once the backoff has left its floor**, i.e. only after a rescan has come
+    ///   back unchanged, which is the evidence of a no-op drip. A lone genuine change on a quiet
+    ///   root therefore reflects after at most the 1 s floor, never after 3× a home-scale walk.
+    ///
+    /// The second term is what makes the damping *proportional* rather than absolute: a fixed 1–30 s
+    /// gap against a 135 s home-scale walk still leaves a sustained drip running the walk ~82 % of
+    /// the time. Requiring a gap of at least 3× the last walk's duration caps a no-change drip's duty
+    /// cycle at ~1/4 of one core (per dripping root, per window) no matter how big the root is, while
+    /// a root whose walk is cheap (under `minRescanGap`/3 ≈ 333 ms) is governed by the 1 s floor
+    /// exactly as before.
+    ///
+    /// This is what stops a sustained event drip that can never surface anything — `~/Library/**`
+    /// under a `$HOME` root, whose events pass the watcher's dot-prefix gate while the scanner skips
+    /// the `UF_HIDDEN` directory outright (filed as (watcher-scan-skip-parity)) — from re-walking a
+    /// home-scale tree back-to-back forever now that the walk no longer blocks the main thread.
+    private static let minRescanGap: TimeInterval = 1
+    private static let maxRescanGap: TimeInterval = 30
+    private static let rescanDurationFactor: Double = 3
+
+    /// (async-root-scan) Roots with a walk in flight, and the per-root serialization gate: a root
+    /// already in here never enqueues a second walk (the request is recorded in `rescanRequested`
+    /// instead). Entries are removed **only** by the owning job's own apply block — never by
+    /// `removeRoot` — so a remove-then-re-add cannot slip a second concurrent walk past the gate.
+    /// Not `@Published`: it is bookkeeping, not UI state (see `initialScanRootURLs`).
+    private var scanningRootURLs: Set<URL> = []
+
+    /// (async-root-scan) Roots whose scan was superseded (a refresh arrived while a walk was in
+    /// flight) or damped (a watcher event arrived inside the rescan gap) — re-run **exactly once**
+    /// when the walk lands or the gap expires. Mirrors `isRecomputing`/`recomputeAgain` deliberately.
+    ///
+    /// `forcedRescans` carries the `force` bit of such a request forward, so an explicit Refresh
+    /// folded into a running walk still republishes unconditionally. It is **consumed** when the
+    /// re-run fires, so one forced Refresh can never make every later rescan forced.
+    private var rescanRequested: Set<URL> = []
+    private var forcedRescans: Set<URL> = []
+
+    /// (async-root-scan) Per-root scan generation, bumped by `addFolders` (on the placeholder
+    /// append) and by `removeRoot`. A job captures its root's generation at start and its apply
+    /// block discards the result if the generation moved — which is what closes the
+    /// remove-then-re-add splice: remove `U` mid-walk, re-add `U` before the walk unwinds, and the
+    /// stale (possibly partial, possibly cancelled) tree must not land under the fresh placeholder.
+    /// Entries deliberately **survive** removal rather than being cleared: resetting one to zero
+    /// would let a re-add's bump land right back on a stale job's captured value.
+    private var scanGeneration: [URL: Int] = [:]
+
+    /// (async-root-scan, Tier 2) The in-flight walk's cancellation token per root. Created and
+    /// stored by `requestScan`, cleared by its apply block (identity-compared, so only the owning
+    /// job clears its own), cancelled by `removeRoot` and `deinit`. A cancelled walk's partial tree
+    /// is discarded by the generation check — cancellation never has to produce a usable tree.
+    private var scanTokens: [URL: ScanCancellationToken] = [:]
+
+    /// (async-root-scan) The damping clock and its per-root exponential backoff: when the last walk
+    /// of a root landed, how long that walk took, and the gap a watcher-driven rescan must currently
+    /// wait out. `pendingDampedRescans` holds the single armed trailing-edge re-entry per root — a
+    /// damped event is *deferred*, never dropped, so the tree is eventually right.
+    ///
+    /// `lastScanFinish` is a **monotonic** `DispatchTime`, not a wall-clock `Date`, deliberately: the
+    /// trailing-edge timer below is scheduled against the monotonic clock, and a backwards wall-clock
+    /// step (an NTP correction, a manual clock change) would otherwise stall every damped rescan for
+    /// the size of the step — the gap would read as un-served until the wall clock caught back up.
+    /// `lastScanDuration` is measured the same way, around the `FileNode.scan` call on `scanQueue`.
+    private var lastScanFinish: [URL: DispatchTime] = [:]
+    private var lastScanDuration: [URL: TimeInterval] = [:]
+    private var rescanBackoff: [URL: TimeInterval] = [:]
+    private var pendingDampedRescans: [URL: DispatchWorkItem] = [:]
+
+    /// (async-root-scan) Seconds elapsed since a monotonic mark, clamped to `>= 0`. `DispatchTime`
+    /// cannot run backwards, so the clamp only guards the degenerate equal/rounding case (and makes
+    /// the `UInt64` subtraction underflow-proof). Used both to measure a walk (off-main, hence
+    /// `nonisolated`) and to test the damping gap on the main actor.
+    private nonisolated static func secondsElapsed(since start: DispatchTime) -> TimeInterval {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now > start.uptimeNanoseconds else { return 0 }
+        return TimeInterval(now - start.uptimeNanoseconds) / 1_000_000_000
+    }
+
     /// Real language stub (SPEC §6.3's full enum arrives with (syntax-highlighting)): `true` for
     /// a `.md`/`.markdown` extension (case-insensitive), driving the preview column's visibility
     /// (SPEC §8).
@@ -251,6 +357,16 @@ final class WorkspaceModel: ObservableObject {
         if let resignActiveObserver {
             NotificationCenter.default.removeObserver(resignActiveObserver)
         }
+        // (async-root-scan, Tier 2) Stop this window's in-flight directory walks: nothing will
+        // consume their results (the landing `Task` holds only `[weak self]`), and a home-scale walk
+        // would otherwise keep a `scanQueue` thread busy for minutes after the window closed. Same
+        // reasoning as the autosave cancel above for the armed damped-rescan timers.
+        for token in scanTokens.values {
+            token.cancel()
+        }
+        for workItem in pendingDampedRescans.values {
+            workItem.cancel()
+        }
     }
 
     /// Sink for `CodeEditorView`'s `onCursorChange` callback (editor-core), including the
@@ -267,8 +383,21 @@ final class WorkspaceModel: ObservableObject {
     /// Adds each URL as a top-level root, standardizing it and skipping ones already present.
     /// Duplicate comparison resolves symlinks first (`/tmp` vs `/private/tmp` count as the same
     /// root) so it catches more than a plain standardized-path comparison would.
+    ///
+    /// (async-root-scan) Each accepted root is appended **synchronously, as an empty placeholder**,
+    /// and its recursive walk is requested afterwards — so this returns in microseconds even for a
+    /// home-scale folder, and `restore(fromJSON:)` no longer blocks launch behind a directory walk.
+    ///
+    /// The *synchronous* append is load-bearing well beyond the sidebar. Five separate "is this
+    /// window pristine?" tests read `roots.isEmpty` — `restore(fromJSON:)`'s own guard, ContentView's
+    /// Cmd+O mailbox drain and its late-`@SceneStorage` recovery, and `applyCLITokenIfNeeded`'s two
+    /// checks either side of its one-turn hop — and if this were made fully async every one of them
+    /// would report a *restoring* window as pristine for the whole duration of its restore, letting
+    /// a CLI open or a late snapshot land on top of it. That is exactly the (cli-open) defect class.
+    /// Do not "simplify" the placeholder away.
     func addFolders(_ urls: [URL]) {
         var existingResolvedPaths = Set(roots.map { $0.url.resolvingSymlinksInPath().path })
+        var addedRootURLs: [URL] = []
 
         for url in urls {
             let standardized = url.standardizedFileURL
@@ -280,7 +409,15 @@ final class WorkspaceModel: ObservableObject {
             let resolvedPath = standardized.resolvingSymlinksInPath().path
             guard !existingResolvedPaths.contains(resolvedPath) else { continue }
             existingResolvedPaths.insert(resolvedPath)
-            roots.append(FileNode.scan(directory: standardized))
+
+            // (async-root-scan) Placeholder now, walk later. `children: []` (not `nil`) keeps it a
+            // directory node for `OutlineGroup`, and the generation bump makes a re-add of a root
+            // whose previous walk is still unwinding discard that stale tree instead of splicing it
+            // in under this fresh placeholder.
+            scanGeneration[standardized, default: 0] += 1
+            roots.append(FileNode(url: standardized, name: standardized.lastPathComponent, isDirectory: true, children: []))
+            initialScanRootURLs.insert(standardized)
+            addedRootURLs.append(standardized)
         }
 
         // (external-change-watch, Tier 3) Re-point the recursive watcher at the current root set —
@@ -289,19 +426,51 @@ final class WorkspaceModel: ObservableObject {
         // not replay historical events into a launch-time rescan.
         treeWatcher.watch(roots: roots.map(\.url))
 
-        // (git-changed-badge) A freshly added git root badges without waiting for activation.
+        // (git-changed-badge) A freshly added git root badges without waiting for activation. The
+        // placeholder already carries the correct URL, so this needs nothing from the walk.
         scheduleGitRefresh()
+
+        // (async-root-scan) Requested **after** the watcher is armed, deliberately: an external
+        // change that lands mid-walk is then caught by the watcher and folded into the pending
+        // re-run, instead of falling into a gap between "the walk read this directory" and "the
+        // watcher started". Never damped — an initial scan is what the user just asked for.
+        for url in addedRootURLs {
+            requestScan(of: url)
+        }
     }
 
     /// Removes `root` from the sidebar. Disk untouched. Clears `selectedFileURL` if it points
     /// inside the removed root, so a later (open-save) doesn't hold a selection to a folder that
-    /// is no longer shown.
+    /// is no longer shown. The selection test compares path *strings*, not tree contents, so it is
+    /// correct even on a root that is still an unscanned placeholder.
+    ///
+    /// (async-root-scan) Returns immediately even with a walk of `root` in flight: the section
+    /// disappears at once, the generation bump below makes that walk's apply block discard its
+    /// result (the section can never reappear), Tier 2's token stops the walk itself, and every
+    /// other per-root scan record is drained here so nothing survives to fire against a root that
+    /// is gone. `scanningRootURLs` is the one exception — it stays set until the walk's own apply
+    /// block clears it, because it is the gate that keeps a re-add from starting a second
+    /// concurrent walk of the same root.
     func removeRoot(_ root: FileNode) {
         roots.removeAll { $0.id == root.id }
         if let selectedFileURL,
            selectedFileURL.path == root.url.path || selectedFileURL.path.hasPrefix(root.url.path + "/") {
             self.selectedFileURL = nil
         }
+
+        // (async-root-scan) Drain this root's scan state. The generation bump is what invalidates an
+        // in-flight walk; the rest would otherwise linger forever (a permanently-set
+        // `rescanRequested` entry, an armed timer firing against a removed root).
+        scanGeneration[root.url, default: 0] += 1
+        scanTokens.removeValue(forKey: root.url)?.cancel()
+        rescanRequested.remove(root.url)
+        forcedRescans.remove(root.url)
+        initialScanRootURLs.remove(root.url)
+        lastScanFinish[root.url] = nil
+        lastScanDuration[root.url] = nil
+        rescanBackoff[root.url] = nil
+        pendingDampedRescans.removeValue(forKey: root.url)?.cancel()
+
         // (external-change-watch, Tier 3) Re-point the watcher at the reduced root set so the
         // removed root is no longer watched (an empty set tears the stream down entirely).
         treeWatcher.watch(roots: roots.map(\.url))
@@ -312,26 +481,229 @@ final class WorkspaceModel: ObservableObject {
         scheduleGitRefresh()
     }
 
-    /// Rescans every root in place (SPEC §5.1: Refresh rescans all folders). Republishes `roots`
-    /// **only when the rescanned structure actually differs** (external-change-watch, Tier 3): a
+    /// Rescans every root in place (SPEC §5.1: Refresh rescans all folders). Republishes a root
+    /// **only when its rescanned structure actually differs** (external-change-watch, Tier 3): a
     /// watcher-driven rescan whose surviving event turned out structure-neutral (e.g. an in-place
     /// content write to an unopened file) then does not thrash the sidebar or re-fire
     /// (session-restore)'s snapshot `.onChange`. The root URL set is unchanged, so the tree watcher
     /// needs no re-point here.
     ///
+    /// (async-root-scan) **Returns before the rescans complete.** Each root's walk runs on
+    /// `scanQueue` and splices itself into `roots` when it lands, so no caller may assume the tree
+    /// is up to date on return — and none does: `handleTreeChange` and SidebarView's Refresh are
+    /// fire-and-forget, and `createFile` stashes `pendingNewFileURL` for an open that reads the file
+    /// straight from disk without consulting the tree (SPEC §5.2's "appears after the automatic
+    /// refresh that creation triggers" still holds, just a beat later). The diff-guard contract
+    /// above now lives in `requestScan`'s apply block.
+    ///
     /// `force` bypasses the diff-guard and always republishes: the explicit user "Refresh" action
     /// (SidebarView) must feel responsive and re-publish unconditionally, whereas the watcher/tree
     /// paths call it with the default so a structure-neutral event doesn't thrash the sidebar.
+    /// `force` also decides damping, and can, because `force == false` is *exactly* the watcher
+    /// path: `handleTreeChange` is this function's only non-forced caller, and it is the drip that
+    /// has to be damped (see `minRescanGap`). An explicit user Refresh is never damped.
     func refreshAll(force: Bool = false) {
-        let rescanned = roots.map { FileNode.scan(directory: $0.url) }
-        if force || rescanned != roots {
-            roots = rescanned
+        for root in roots {
+            requestScan(of: root.url, force: force, damped: !force)
         }
         // (git-changed-badge) The changed-set is a separate `@Published` property, **independent of
         // the structural diff**: a structure-neutral event (an in-place content edit to a tracked
         // file) leaves `roots` unchanged yet still changes git status, so recompute the badge set
-        // unconditionally here even when the tree republish above was skipped.
+        // unconditionally here — and without waiting for the walks, which may be damped or minutes
+        // long, so a badge refresh is never held hostage to a tree rescan.
         scheduleGitRefresh()
+    }
+
+    /// (async-root-scan) The single entry point for scanning a root, and the **only**
+    /// `FileNode.scan` call site in the app target. Returns immediately: the walk runs on
+    /// `scanQueue` and `applyScan` splices its result into `roots` on the main actor when it lands.
+    ///
+    /// - `force`: bypass the diff-guard so the result always republishes (explicit user Refresh),
+    ///   and reset this root's damping backoff when it lands.
+    /// - `damped`: subject this request to the per-root minimum rescan gap. Watcher-driven rescans
+    ///   pass `true`; the initial scan from `addFolders`, an explicit Refresh, and the trailing-edge
+    ///   re-entry (which has already served the gap) pass `false`.
+    ///
+    /// Two coalescing gates, in order — both record the request in `rescanRequested` rather than
+    /// dropping it, so a superseded or damped event is always *deferred*, never lost:
+    /// 1. a walk already in flight for `url` ⇒ record and return, so this window runs at most one
+    ///    walk per root at any moment (this, not queue serialism, is what serializes a root; the
+    ///    gate is per-model, so two windows on the same root do walk it twice);
+    /// 2. a damped request still inside the gap ⇒ record, arm the one trailing-edge re-entry, return.
+    ///
+    /// Past both gates the deferred request is **consumed** rather than left standing: the walk that
+    /// is about to start reads the disk now, so it already delivers everything that request asked
+    /// for (its `force` bit is folded in, its armed timer cancelled).
+    ///
+    /// The bridge is the same `Task` + `withCheckedContinuation` + `queue.async` shape
+    /// `scheduleGitRefresh` uses, with the queue captured strongly (a deallocated window can never
+    /// strand an unresumed continuation) and `[weak self]` (a closed window's model is neither kept
+    /// alive nor written).
+    private func requestScan(of url: URL, force: Bool = false, damped: Bool = false) {
+        if scanningRootURLs.contains(url) {
+            rescanRequested.insert(url)
+            if force { forcedRescans.insert(url) }
+            return
+        }
+
+        // Gate 2. `damped` implies `!force` by construction — every call site passes `damped` as
+        // `!force` or as a literal `false` — so a damped request never carries a force bit to
+        // preserve here, and an explicit user Refresh is never delayed by this gate.
+        if damped, let finished = lastScanFinish[url] {
+            // The required gap is the exponential backoff — and, once the previous rescan came back
+            // structurally unchanged (`backoff > minRescanGap`, the evidence of a no-op drip), at
+            // least 3× the previous walk's own cost, so the drip's duty cycle stays bounded on a
+            // root of any size (see `minRescanGap`). The proportional term deliberately does NOT
+            // apply while `backoff == minRescanGap` (the last walk found a real change): a lone
+            // genuine change on a quiet root must reflect promptly, not wait out 3× a home-scale
+            // walk. Monotonic throughout: a wall-clock step cannot lengthen or shorten the gap.
+            let backoff = rescanBackoff[url] ?? Self.minRescanGap
+            let proportional = backoff > Self.minRescanGap
+                ? Self.rescanDurationFactor * (lastScanDuration[url] ?? 0)
+                : 0
+            let remaining = max(backoff, proportional) - Self.secondsElapsed(since: finished)
+            if remaining > 0 {
+                rescanRequested.insert(url)
+                scheduleDampedRescan(of: url, after: remaining)
+                return
+            }
+        }
+
+        // Both gates passed, so a walk starts *now* and will read the current state of the disk —
+        // which is exactly what any request deferred earlier for this root was asking for. Consume
+        // that deferred request here (folding its force bit into this walk) and disarm its timer:
+        // otherwise a Refresh arriving during a damped gap would cost a second, redundant full walk
+        // when the stale timer fires, and a timer armed against an old 30 s deadline would outlive
+        // the backoff reset this walk is about to perform.
+        rescanRequested.remove(url)
+        // Two statements, not `force || forcedRescans.remove(...)`: `||` short-circuits, and the
+        // remove must run unconditionally or a forced pending bit would outlive its request.
+        let hadForcedPending = forcedRescans.remove(url) != nil
+        let effectiveForce = force || hadForcedPending
+        pendingDampedRescans.removeValue(forKey: url)?.cancel()
+
+        scanningRootURLs.insert(url)
+        let generation = scanGeneration[url] ?? 0
+        let token = ScanCancellationToken()
+        scanTokens[url] = token
+        // Captured here and carried into the job rather than re-read on the way out: a root's
+        // children can only change through an `applyScan`, and gate (1) above guarantees at most one
+        // walk per root, so this *is* the value the apply would have read — and comparing against it
+        // moves the deep `Equatable` walk off-main with the scan. (Before this item that compare was
+        // itself an O(N) main-thread cost on every watcher event.)
+        let old = roots.first { $0.url == url }
+        let queue = Self.scanQueue
+        Task { [weak self] in
+            let result = await withCheckedContinuation { (continuation: CheckedContinuation<(node: FileNode, changed: Bool, duration: TimeInterval), Never>) in
+                queue.async {
+                    // Timed around the walk itself, not around the hop: the damping gap is a
+                    // multiple of what this root actually costs to walk (see `minRescanGap`), and
+                    // the diff below is deliberately excluded — it is cheap next to the syscalls
+                    // and including it would inflate the gap on the *changed* path, which resets.
+                    let started = DispatchTime.now()
+                    let scanned = FileNode.scan(directory: url, cancellation: token)
+                    let duration = WorkspaceModel.secondsElapsed(since: started)
+                    // `old` is `FileNode?`; a nil `old` (no such root at job start — not reachable
+                    // today, since every caller appends the root first) reads as "changed".
+                    continuation.resume(returning: (scanned, scanned != old, duration))
+                }
+            }
+            guard let self else { return }
+            self.applyScan(
+                result.node,
+                changed: result.changed,
+                of: url,
+                generation: generation,
+                token: token,
+                force: effectiveForce,
+                duration: result.duration
+            )
+        }
+    }
+
+    /// (async-root-scan) The main-actor landing point for a finished walk — `requestScan`'s apply
+    /// block. Runs for **every** job, including ones whose result is thrown away, because the
+    /// job-local teardown (clearing the `scanningRootURLs` gate and this job's token) has to happen
+    /// either way or the root would never be scanned again.
+    ///
+    /// The result is discarded when the root's generation moved (`removeRoot`, or a
+    /// remove-then-re-add that raced the walk — the tree may also be a cancelled walk's partial one)
+    /// or when the root is simply no longer in `roots`. The pending re-run is drained **regardless**
+    /// of that: a superseded job's coalesced request is precisely the re-added root's own scan, and
+    /// dropping it would leave a placeholder that never fills.
+    private func applyScan(
+        _ scanned: FileNode,
+        changed: Bool,
+        of url: URL,
+        generation: Int,
+        token: ScanCancellationToken,
+        force: Bool,
+        duration: TimeInterval
+    ) {
+        scanningRootURLs.remove(url)
+        // Identity-compared so a job can only ever clear its own token.
+        if scanTokens[url] === token {
+            scanTokens[url] = nil
+        }
+
+        if (scanGeneration[url] ?? 0) == generation,
+           let index = roots.firstIndex(where: { $0.url == url }) {
+            if force || changed {
+                roots[index] = scanned
+            }
+            // The first walk of a freshly added root has landed, so the sidebar stops showing
+            // "Scanning…" for it — whether or not the tree above republished (a genuinely empty root
+            // scans to a value equal to its own placeholder). Guarded on membership because this is
+            // an `@Published` set: an unguarded `remove` on a rescan of an already-scanned root
+            // would fire `objectWillChange` (and re-render the sidebar) on every damped no-op walk.
+            if initialScanRootURLs.contains(url) {
+                initialScanRootURLs.remove(url)
+            }
+            // Damping clock, walk cost, and backoff: a rescan that came back structurally unchanged
+            // doubles the gap the next watcher-driven one must wait out, up to `maxRescanGap`; a real
+            // structural change — or an explicit user Refresh — resets it to `minRescanGap`. The
+            // recorded duration additionally holds the next gap to >= 3× this walk's cost.
+            lastScanFinish[url] = DispatchTime.now()
+            lastScanDuration[url] = duration
+            rescanBackoff[url] = (force || changed)
+                ? Self.minRescanGap
+                : min((rescanBackoff[url] ?? Self.minRescanGap) * 2, Self.maxRescanGap)
+            // (git-changed-badge) No refresh here by design: every path that can *trigger* a walk
+            // (`addFolders`, `refreshAll`, `removeRoot`, `createFile`) schedules one at trigger time,
+            // so a per-landing one is redundant — and would re-run git after every damped no-op walk.
+        }
+
+        if rescanRequested.remove(url) != nil {
+            let forced = forcedRescans.remove(url) != nil
+            requestScan(of: url, force: forced, damped: !forced)
+        }
+    }
+
+    /// (async-root-scan) Arms the single trailing-edge re-entry for a damped root: the watcher event
+    /// that arrived inside the rescan gap fires `delay` seconds later instead of being dropped, so
+    /// the tree is eventually right. Exactly one work item per root is armed at a time — a burst
+    /// inside the gap coalesces into the pending one — and `removeRoot`/`deinit` cancel it.
+    /// `[weak self]` + `MainActor.assumeIsolated` mirror `scheduleAutosave`: the item is dispatched
+    /// to `DispatchQueue.main`, so its body runs on the main actor.
+    private func scheduleDampedRescan(of url: URL, after delay: TimeInterval) {
+        guard pendingDampedRescans[url] == nil else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            // Dispatched to `DispatchQueue.main` below, so this body runs on the main actor.
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.pendingDampedRescans[url] = nil
+                // This *is* the deferred request; if something already consumed it (an intervening
+                // walk's apply block did), there is nothing left to fire.
+                guard self.rescanRequested.remove(url) != nil else { return }
+                let forced = self.forcedRescans.remove(url) != nil
+                // `damped: false`: the gap has been served. Re-checking it here would let a fencepost
+                // between the timer's deadline and the clock read in gate 2 re-defer the same
+                // request in a tight loop.
+                self.requestScan(of: url, force: forced, damped: false)
+            }
+        }
+        pendingDampedRescans[url] = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     /// (git-changed-badge) The one public trigger for recomputing the changed-file badge set (SPEC
@@ -348,8 +720,13 @@ final class WorkspaceModel: ObservableObject {
     func scheduleGitRefresh() {
         let repoRoots = roots.map(\.url).filter(GitStatus.isRepositoryRoot)
         guard !repoRoots.isEmpty else {
-            // A window with no git roots clears cheaply — no git job spawned.
-            changedFileURLs = []
+            // A window with no git roots clears cheaply — no git job spawned. The clear is guarded
+            // on non-emptiness because `changedFileURLs` is `@Published`: an unconditional assignment
+            // would fire `objectWillChange` on every call (save, activation, refresh) in a window
+            // that has no git roots at all, which is the common case for a plain folder window.
+            if !changedFileURLs.isEmpty {
+                changedFileURLs = []
+            }
             recomputeAgain = false
             return
         }
@@ -388,8 +765,11 @@ final class WorkspaceModel: ObservableObject {
     /// (external-change-watch, Tier 3) The tree watcher's main-actor consumer + skip gate. FSEvents
     /// has no self-write suppression, and under always-on autosave the open file is rewritten every
     /// ~0.75 s while typing (with git-status refresh shelling out to `git`, which writes under
-    /// `.git`, on save/activation) — so an ungated stream would fire a full recursive main-thread
-    /// rescan + whole-sidebar re-diff on FEdit's own routine writes. Filter the batch first:
+    /// `.git`, on save/activation) — so an ungated stream would fire a full recursive rescan of
+    /// every root plus a whole-sidebar re-diff on FEdit's own routine writes. (Since
+    /// (async-root-scan) that walk is off-main and damped, so it no longer freezes the window — but
+    /// it is still a walk of the whole tree, and this gate is still the cheapest place to stop it.)
+    /// Filter the batch first:
     /// - drop the open file's own path (its content is handled by the Tier 1 vnode watcher and it
     ///   changes no tree *structure*);
     /// - drop any path inside the scanner skip-set (dotfiles/hidden — covering `.git`/`.build` — and
@@ -433,8 +813,8 @@ final class WorkspaceModel: ObservableObject {
             // (Fix 2) `Data.write(options: .atomic)` drops a sibling temp named
             // `<openFileName>.sb-XXXXXXXX-YYYYYY` next to the open file; it is neither the open-file
             // path nor a skip-dir, so without this every autosave/save would force a full recursive
-            // main-thread rescan. Scoped to the open file's own temp so genuine external atomic saves
-            // of other files still trigger a rescan.
+            // rescan of every root. Scoped to the open file's own temp so genuine external atomic
+            // saves of other files still trigger a rescan.
             if let openFilePath, isOwnAtomicWriteTemp(path, openFilePath: openFilePath) { return false }
             return !isSkippedTreePath(path, rootPaths: rootPaths)
         }
@@ -443,12 +823,20 @@ final class WorkspaceModel: ObservableObject {
         refreshAll()
     }
 
-    /// Whether a rescan would ignore `path` — mirroring `FileNode`'s scan skip rules so the
-    /// watcher's notion of "interesting" matches exactly what a rescan surfaces. A path outside every
-    /// watched root is skipped (nothing a rescan touches); otherwise only the components **below**
-    /// the containing root are tested (so a root that itself lives under a hidden ancestor is not
-    /// wrongly filtered out), skipping any hidden (`.`-prefixed) component — covering `.git`,
-    /// `.build`, and dotfiles — or any name in `FileNode.skippedDirectoryNames`.
+    /// Whether a rescan would ignore `path` — an **approximation** of `FileNode`'s scan skip rules.
+    /// A path outside every watched root is skipped (nothing a rescan touches); otherwise only the
+    /// components **below** the containing root are tested (so a root that itself lives under a
+    /// hidden ancestor is not wrongly filtered out), skipping any hidden (`.`-prefixed) component —
+    /// covering `.git`, `.build`, and dotfiles — or any name in `FileNode.skippedDirectoryNames`.
+    ///
+    /// **Known divergence, measured not suspected (async-root-scan, filed as
+    /// (watcher-scan-skip-parity)).** `FileNode.scanChildren` passes `.skipsHiddenFiles`, which also
+    /// excludes entries carrying the `UF_HIDDEN` flag with no dot in their name — `~/Library` is
+    /// exactly that. This predicate tests the dot prefix only, so under a `$HOME` root every
+    /// `~/Library/**` write survives this gate and drives a full rescan that can never surface
+    /// anything. Closing it exactly would need a per-path `stat`, which `handleTreeChange`'s
+    /// no-syscall-per-changed-path constraint forbids; until that item lands, what bounds the cost
+    /// is `requestScan`'s damping (see `minRescanGap`), not this gate.
     private func isSkippedTreePath(_ path: String, rootPaths: [String]) -> Bool {
         guard let root = rootPaths.first(where: { path == $0 || path.hasPrefix($0 + "/") }) else {
             return true
@@ -893,11 +1281,11 @@ final class WorkspaceModel: ObservableObject {
     /// skips hidden files (SPEC §5.2), so a dotfile would be created but never appear in the sidebar.
     /// A name collision returns `.duplicateName` **without overwriting** (`.withoutOverwriting` also
     /// closes the check→write TOCTOU window); any other write failure returns `.writeFailed`. On
-    /// success it rescans the roots (`force`, so the explicit action always republishes and the new
-    /// row appears — subject to the target folder being expanded), stashes the standardized URL in
-    /// `pendingNewFileURL` for `openPendingNewFileIfNeeded()`, and returns `.created`. It does
-    /// **not** touch `isPresentingNewFileSheet` (the sheet dismisses itself) or open the file (that
-    /// runs from the sheet's `onDismiss`).
+    /// success it rescans the root containing the new file (`force`, so the explicit action always
+    /// republishes and the new row appears — subject to the target folder being expanded), stashes
+    /// the standardized URL in `pendingNewFileURL` for `openPendingNewFileIfNeeded()`, and returns
+    /// `.created`. It does **not** touch `isPresentingNewFileSheet` (the sheet dismisses itself) or
+    /// open the file (that runs from the sheet's `onDismiss`).
     func createFile(named rawName: String) -> NewFileResult {
         let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty,
@@ -931,7 +1319,27 @@ final class WorkspaceModel: ObservableObject {
             return .writeFailed(error.localizedDescription)
         }
 
-        refreshAll(force: true)
+        // (async-root-scan) Rescan **only the roots the new file landed under**, forced so the row
+        // appears (SPEC §5.2). Plural, not `first(where:)`: roots may nest (`addFolders` dedupes on
+        // exact path equality only), and each containing root renders its own section, so every one
+        // of them gains the row. Rescanning the rest would re-walk — and reset the damping backoff
+        // of — roots that provably cannot contain the file. The prefix match is the same path-string
+        // idiom `removeRoot` uses. The fallback is reachable, not defensive: `newFileTargetDirectory`
+        // is the open file's parent, and an open file can sit outside every root (e.g. after its
+        // root was removed), in which case no root shows the new file and the full refresh is simply
+        // the honest superset.
+        let parent = fileURL.deletingLastPathComponent().path
+        let containingRoots = roots.filter { parent == $0.url.path || parent.hasPrefix($0.url.path + "/") }
+        if containingRoots.isEmpty {
+            refreshAll(force: true)
+        } else {
+            for root in containingRoots {
+                requestScan(of: root.url, force: true)
+            }
+            // (git-changed-badge) `refreshAll` would have scheduled this; the scoped path must too —
+            // a walk's landing no longer refreshes the badge set (see `applyScan`).
+            scheduleGitRefresh()
+        }
         pendingNewFileURL = fileURL
         return .created
     }
@@ -983,8 +1391,14 @@ final class WorkspaceModel: ObservableObject {
     /// this never has to contend with an in-progress dirty-file guard. Silent throughout: no
     /// dialogs, no alerts (SPEC §7/§9) — a missing folder is dropped, a missing/unreadable file is
     /// simply not opened, and empty/corrupt JSON leaves the model exactly as it was (an empty
-    /// pristine window). Runs synchronously on the main thread (SPEC §11: root rescans + one file
-    /// read at launch is acceptable).
+    /// pristine window).
+    ///
+    /// (async-root-scan) Returns without waiting for the roots to be scanned: `addFolders` appends
+    /// each one synchronously as a placeholder and its recursive walk lands later, so a home-scale
+    /// restored root no longer blocks launch (it used to freeze it for minutes). What still runs
+    /// synchronously here is the one file read, bounded by the 100 MB open cap — SPEC §11. Note the
+    /// ordering this preserves: `roots` is non-empty the moment this returns, which is what keeps
+    /// the `roots.isEmpty` pristine tests meaningful (see `addFolders`).
     func restore(fromJSON json: String) {
         guard roots.isEmpty, openFile == nil else { return }
         guard let data = json.data(using: .utf8),

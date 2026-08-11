@@ -288,8 +288,10 @@ struct ContentView: View {
               workspace.roots.isEmpty, workspace.openFile == nil, workspaceSnapshot.isEmpty else { return }
 
         // One runloop turn later, mirroring the folder-panel idiom in `onAppear`: the window is on
-        // screen first, so the recursive scan, watcher arming, git shell-out and any "Cannot Open
-        // File" alert run in an ordinary context rather than inside the odoc/appear stack.
+        // screen first, so the watcher arming, git shell-out and any "Cannot Open File" alert run in
+        // an ordinary context rather than inside the odoc/appear stack. (The recursive scan itself no
+        // longer runs here at all since (async-root-scan) — `addFolders` only appends a placeholder
+        // and requests the walk off-main.)
         DispatchQueue.main.async {
             guard workspace.roots.isEmpty, workspace.openFile == nil, workspaceSnapshot.isEmpty else { return }
             workspace.addFolders([token.root])

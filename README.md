@@ -49,7 +49,7 @@ fedit                     # just launches or activates FEdit
 fedit --help              # usage, on stdout
 ```
 
-Each path gets its **own new window** — an existing window, full or empty, is never disturbed (the request is delivered as the new window's own value, so it cannot land anywhere else). A file's **containing folder** becomes that window's sole sidebar root, so `fedit ~/notes.md` scans your entire home directory (the same cost as picking `~` in the Open Folder… panel; the scan is recursive and synchronous). At most 8 paths per call.
+Each path gets its **own new window** — an existing window, full or empty, is never disturbed (the request is delivered as the new window's own value, so it cannot land anywhere else). A file's **containing folder** becomes that window's sole sidebar root, so `fedit ~/notes.md` scans your entire home directory (the same cost as picking `~` in the Open Folder… panel). The scan runs off the main thread: the window appears immediately, showing `Scanning…` in the sidebar while the tree fills in behind it — though the finished tree is still held in memory in full, so a home-scale root is heavy. At most 8 paths per call.
 
 `-h`/`--help` is recognized as the **first argument only** — after that everything is a path, since a file really can be called `--help`.
 

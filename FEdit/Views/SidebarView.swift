@@ -43,7 +43,14 @@ struct SidebarView: View {
                 List {
                     ForEach(workspace.roots) { root in
                         Section {
-                            if query.isEmpty {
+                            if workspace.initialScanRootURLs.contains(root.url) {
+                                // (async-root-scan) The root is still the empty placeholder
+                                // `addFolders` appended; its walk is running off the main thread.
+                                // Keyed to *first* scans only, so a later refresh of a populated
+                                // root never blanks it and a genuinely empty root never flickers.
+                                Text("Scanning…")
+                                    .foregroundStyle(.secondary)
+                            } else if query.isEmpty {
                                 OutlineGroup(root.children ?? [], children: \.children) { node in
                                     FileRow(node: node, workspace: workspace)
                                 }
@@ -75,6 +82,10 @@ struct SidebarView: View {
     /// root-relative path matches `query`, in the scanner's depth-first (folders-first) order;
     /// a per-section "No matches" fallback when nothing matches. Computed inline per render — a
     /// synchronous linear scan is acceptable per SPEC §11, no caching layer.
+    ///
+    /// (async-root-scan) Only reached for a root whose first scan has landed — the "Scanning…"
+    /// branch in `body` intercepts the others in *both* modes, so an incomplete tree is never
+    /// misreported here as "this file doesn't exist".
     @ViewBuilder
     private func flatRows(for root: FileNode, query: FilterQuery) -> some View {
         let matches = root.filesWithRelativePaths().filter { query.matches($0.path) }

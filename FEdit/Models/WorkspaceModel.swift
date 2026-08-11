@@ -98,7 +98,34 @@ final class WorkspaceModel: ObservableObject {
     /// The sidebar's filter query text (SPEC §5.4–§5.5). Lives on the per-window model rather
     /// than view `@State` because SPEC §9 persists filter text per window, and (session-restore)
     /// snapshots from `WorkspaceModel` — parking it here now avoids a later move.
-    @Published var filterText: String = ""
+    ///
+    /// (filter-walk-main-thread) The `didSet` is the cache's **release** site, and the only one:
+    /// leaving filter mode drops the retained flat/filtered lists instead of holding tens of MB for
+    /// the rest of the window's life. The predicate is `FilterQuery(...).isEmpty` — deliberately
+    /// the SAME predicate `SidebarView.body` uses to pick tree mode — not `filterText.isEmpty`, so
+    /// an operator-only or whitespace query (which shows the tree, not "No matches") also releases.
+    /// Both writers route through this setter: the `TextField` binding and `restore(fromJSON:)`'s
+    /// direct assignment. The accessor below cannot be the release site — it is only ever reached
+    /// in filter mode, so a release there would never run. The parse per keystroke is the price of
+    /// agreeing with the mode switch; it is one small parse, not a filter pass over the tree.
+    @Published var filterText: String = "" {
+        didSet {
+            if FilterQuery(filterText).isEmpty {
+                filterRowCache.releaseAll()
+            }
+        }
+    }
+
+    /// (filter-walk-main-thread) Filter mode's derived rows, cached per root — see `FilterRowCache`
+    /// for the design and its memory trade. Deliberately **not** `@Published`: `filteredMatches`
+    /// populates it from inside `SidebarView`'s body pass, which is only sound because writing it
+    /// publishes nothing (no `objectWillChange`, so no invalidation loop) and because the write is
+    /// idempotent across SwiftUI's speculative body passes.
+    ///
+    /// Invalidated/released at exactly three sites, mirroring `initialScanRootURLs`' discipline:
+    /// the `land` seam's splice branch, `removeRoot`, and `filterText`'s `didSet` above (wholesale).
+    /// Populated at exactly one: `filteredMatches`, the body-pass read above.
+    private var filterRowCache = FilterRowCache()
 
     /// (new-file) Per-window flag driving ContentView's `.sheet(isPresented:)` for File → New…
     /// (SPEC §7, §10). The app-level menu command reaches the focused window's model and flips this
@@ -229,6 +256,17 @@ final class WorkspaceModel: ObservableObject {
             guard let index = roots.firstIndex(where: { $0.url == url }) else { return false }
             if force || changed {
                 roots[index] = scanned
+                // (filter-walk-main-thread) **This line must stay INSIDE this branch.** The splice
+                // above is the only mutation of a present root's tree, so it is the only event that
+                // can stale the filter row cache — and this branch is exactly "a splice happened".
+                // Moved one line down, outside the `if`, it would invalidate on every landing
+                // including the structurally-unchanged damped ones (the `~/Library` drip under a
+                // $HOME root, which lands repeatedly with `changed == false`), re-running the full
+                // DFS per landing and resurrecting the main-thread walk this item removed — just at
+                // the damping cadence instead of the render cadence. That is this item's known
+                // resurrection hazard; it is silent (rows stay correct, only the cost returns), so
+                // nothing but this comment guards it.
+                filterRowCache.invalidate(url)
             }
             // The first walk of a freshly added root has landed, so the sidebar stops showing
             // "Scanning…" for it — whether or not the tree above republished (a genuinely empty root
@@ -420,6 +458,11 @@ final class WorkspaceModel: ObservableObject {
         // absence from `roots`). The "Scanning…" set is model-side view state, so it is cleared here.
         scanScheduler.noteRootRemoved(root.url)
         initialScanRootURLs.remove(root.url)
+        // (filter-walk-main-thread) The third per-root drain, alongside the two above: a removed
+        // root's cached filter rows are dead weight (and would be served again on a re-add, before
+        // the fresh walk lands, if the entry survived). Same `invalidate` the splice branch calls —
+        // one operation, deliberately not two names for the same whole-entry drop.
+        filterRowCache.invalidate(root.url)
 
         // (external-change-watch, Tier 3) Re-point the watcher at the reduced root set so the
         // removed root is no longer watched (an empty set tears the stream down entirely).
@@ -463,6 +506,23 @@ final class WorkspaceModel: ObservableObject {
         // unconditionally here — and without waiting for the walks, which may be damped or minutes
         // long, so a badge refresh is never held hostage to a tree rescan.
         scheduleGitRefresh()
+    }
+
+    /// (filter-walk-main-thread) Filter mode's rows for one root (SPEC §5.4): every file under
+    /// `root` whose root-relative path matches `query`, in the scanner's depth-first folders-first
+    /// order — the same list `SidebarView.flatRows` used to rebuild inline on every render.
+    ///
+    /// `query` is **passed in already parsed**, not re-derived from `filterText`: `SidebarView.body`
+    /// parses once per render for its tree-vs-filter mode decision and hands that value down, so the
+    /// render still costs exactly one parse however many roots are open.
+    ///
+    /// The `filesWithRelativePaths()` walk lives in the provider closure and therefore runs only on
+    /// a cache miss — i.e. once per root per splice, not once per render. It is the **only** call
+    /// site of that walk in the app target; adding another would re-open the defect.
+    func filteredMatches(for root: FileNode, query: FilterQuery) -> [FilterRowCache.Match] {
+        filterRowCache.rows(for: root.url, query: query) {
+            root.filesWithRelativePaths().map { FilterRowCache.Match(path: $0.path, node: $0.node) }
+        }
     }
 
     /// (git-changed-badge) The one public trigger for recomputing the changed-file badge set (SPEC

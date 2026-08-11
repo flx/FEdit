@@ -213,6 +213,7 @@ FEdit/
   Models/RootScanScheduler.swift  per-root scan state machine: coalescing gates, damping,
                                 generations, cancellation tokens (owns the scan teardown)
   Models/FilterQuery.swift      boolean filter parser/evaluator (terms, AND/OR, ^/$ anchors)
+  Models/FilterRowCache.swift   per-root cache of filter mode's flat rows (invalidated per splice)
   Models/FileWatcher.swift      open-file vnode watcher + FileSignature (self-write key)
   Models/DirectoryTreeWatcher.swift  recursive FSEvents watcher for sidebar roots
   Models/GitStatus.swift        off-main `git status --porcelain=v1 -z` shell-out + parse for §5.6
@@ -232,9 +233,9 @@ FEdit/
 scripts/
   install.sh                    Release build + install of FEdit.app and the fedit shim
   fedit                         /bin/sh command-line shim around `open -a` (§3 external opens)
-  FileNodeTests, FilterQueryTests, GitStatusTests, LogicalLineTests,
-  MarkdownRendererTests, OpenRequestTests, RootScanTests, SnapshotTests
-                                standalone swiftc-run regression harnesses (no XCTest target)
+  FileNodeTests, FilterQueryTests, FilterRowCacheTests, GitStatusTests,
+  LogicalLineTests, MarkdownRendererTests, OpenRequestTests, RootScanTests,
+  SnapshotTests                 standalone swiftc-run regression harnesses (no XCTest target)
   FeditShimTests                shell harness for scripts/fedit (stub `open`, no GUI)
 ```
 

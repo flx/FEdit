@@ -80,15 +80,22 @@ struct SidebarView: View {
 
     /// Flat filtered contents of one section (SPEC §5.4): every file under `root` whose
     /// root-relative path matches `query`, in the scanner's depth-first (folders-first) order;
-    /// a per-section "No matches" fallback when nothing matches. Computed inline per render — a
-    /// synchronous linear scan is acceptable per SPEC §11, no caching layer.
+    /// a per-section "No matches" fallback when nothing matches.
+    ///
+    /// (filter-walk-main-thread) These rows are **cached derived state**, not recomputed here. This
+    /// used to run `root.filesWithRelativePaths()` — a full DFS allocating one tuple per file —
+    /// inline in `body`; since this view observes the whole model, every editor keystroke and every
+    /// caret move re-ran that walk on the main thread for each root. `filteredMatches` recomputes
+    /// only when the root's tree is spliced or the query changes, so a render with unchanged inputs
+    /// costs a dictionary lookup. `query` is the single per-render parse from `body`, passed down
+    /// rather than re-derived, and the mode decision, "No matches", and `FileRow` are unchanged.
     ///
     /// (async-root-scan) Only reached for a root whose first scan has landed — the "Scanning…"
     /// branch in `body` intercepts the others in *both* modes, so an incomplete tree is never
     /// misreported here as "this file doesn't exist".
     @ViewBuilder
     private func flatRows(for root: FileNode, query: FilterQuery) -> some View {
-        let matches = root.filesWithRelativePaths().filter { query.matches($0.path) }
+        let matches = workspace.filteredMatches(for: root, query: query)
         if matches.isEmpty {
             Text("No matches")
                 .foregroundStyle(.secondary)

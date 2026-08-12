@@ -284,7 +284,12 @@ struct ContentView: View {
         guard didRestore else { return }
         cliToken.wrappedValue = nil
 
-        guard LaunchCoordinator.shared.wasIssuedThisProcess(token),
+        // (clitoken-tolerant-decode) The `!rootPath.isEmpty` belt: a tolerant-decoded token whose
+        // rootPath defaulted to "" must never reach `addFolders` — `URL(fileURLWithPath: "")`
+        // resolves against the CWD, which for a LaunchServices-launched app is typically "/", and
+        // `addFolders` admits any existing directory (a full-volume scan). The issued-id guard
+        // already makes a defaulted token unreachable here; this is the structural backstop.
+        guard LaunchCoordinator.shared.wasIssuedThisProcess(token), !token.rootPath.isEmpty,
               workspace.roots.isEmpty, workspace.openFile == nil, workspaceSnapshot.isEmpty else { return }
 
         // One runloop turn later, mirroring the folder-panel idiom in `onAppear`: the window is on

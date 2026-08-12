@@ -97,6 +97,44 @@ struct CLIOpenToken: Codable, Hashable {
         self.filePath = request.file?.path
     }
 
+    /// (clitoken-tolerant-decode) The stable fallback identity for a token whose archived `id` is
+    /// missing or corrupt. A *fixed* sentinel, deliberately not a fresh `UUID()`: this type's
+    /// `Hashable` is the `"cli-open"` scene's window identity, and the system may decode the same
+    /// archive more than once during restore — decode must therefore be **idempotent** (equal bytes
+    /// ⟹ equal value). Distinct ids only matter for `openWindow(value:)` no-dedup, and a defaulted
+    /// token can never reach `openWindow` (only freshly built tokens do, and those mint real
+    /// UUIDs). The sentinel is exactly as inert as any restored id: `issuedTokenIDs` can never
+    /// contain it (its sole insertion site is fed by `CLIOpenToken(request:)`'s own `UUID()`).
+    private static let fallbackID = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+
+    /// (clitoken-tolerant-decode) Tolerant decoding — optional-with-defaults like
+    /// `WorkspaceSnapshot`, but deliberately one notch MORE tolerant: `WorkspaceSnapshot` fails on
+    /// a present-but-wrong-typed key (`try decodeIfPresent`); here each key is wrapped in `try?`,
+    /// so even a wrong-typed field degrades to its default instead of killing the restore. The
+    /// divergence is the read path's ownership: this value is archived by SwiftUI as the
+    /// `"cli-open"` `WindowGroup(for:)` window value and decoded by the *system* during scene
+    /// restore — there is no error surface and no retry, so any per-field failure must be
+    /// absorbed. (A structurally alien archive — not a keyed container at all — still fails
+    /// decode, and must: SwiftUI then restores the window valueless, the accepted degrade.)
+    ///
+    /// - a missing/corrupt `id` becomes `fallbackID` (see above — stable, inert);
+    /// - a missing/corrupt `rootPath` becomes `""`. What makes that safe is the restore-inertness
+    ///   guard, NOT the path's non-existence: `applyCLITokenIfNeeded` drops every token whose id
+    ///   this process did not issue, so a defaulted token is never applied. (An empty path would
+    ///   otherwise resolve against the CWD — `ContentView` carries a belt against that.)
+    /// - `filePath` was always optional.
+    ///
+    /// **Versioning note (the discipline this buys):** when adding a field, give it a default
+    /// here and keep the old fields' meaning stable; never rename or repurpose a key. A token
+    /// written by any past version must decode under any future one — the system owns the write
+    /// AND the read timing, so there is no migration hook, only tolerance.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? container.decodeIfPresent(UUID.self, forKey: .id)) ?? Self.fallbackID
+        rootPath = (try? container.decodeIfPresent(String.self, forKey: .rootPath)) ?? ""
+        filePath = try? container.decodeIfPresent(String.self, forKey: .filePath)
+    }
+
     var root: URL {
         URL(fileURLWithPath: rootPath, isDirectory: true)
     }

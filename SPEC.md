@@ -23,6 +23,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 - A file or folder handed to the app **from outside** (the `fedit` command, `open -a FEdit <path>`) always opens in a **new** window — no existing window, full or empty, is ever disturbed. The file's containing folder becomes that window's sole root and the file is opened in the editor; a folder argument just becomes the root. Several paths in one invocation give one window each (capped at 8 per delivery); a path that no longer exists is ignored. On a cold launch this window comes up **in addition to** the restored session's windows, and it is an ordinary window from then on — it is restored with the next session like any other.
 - Two window groups back this: `"editor"` (value-less) for Cmd+O/Cmd+N/restore, and `"cli-open"`, which presents the external open as the new window's **value** — the window a request lands in is the window the system created for it. An external open is applied **at most once, only by the process that issued it, and only to a window still empty at that moment**; a restored window — editor or cli-open alike — always wins with its own saved session state, and never re-runs the open it was originally created for (so a cli-open window quit before its first state save comes back empty). Each external open carries a unique identity, so repeating one gives a second window rather than refocusing the first.
 - Each window owns its own independent state: folder list, filter text, open file, cursor.
+- An ordinary launch always shows at least one window: the restored session's windows when there are any, otherwise one blank editor window — **including when the previous session ended with zero windows open** (a zero-window saved session must not produce a windowless launch). A launch whose only work is an external open shows that open's window instead. (zero-window-session-relaunch: a once-per-launch net presents the blank window if nothing else appeared; a launch into a hidden app is the recorded exception.)
 - Default window size 1100×700, minimum 700×400.
 - Window frames restored by the system's window restoration.
 - The app uses **light appearance only**, regardless of the system setting.
@@ -202,8 +203,9 @@ Tabs, split editors, find/replace, file **rename/delete** and sidebar-driven fil
 FEdit.xcodeproj
 FEdit/
   App/FEditApp.swift            app entry, commands (menus), settings keys
-  App/LaunchCoordinator.swift   Cmd+O's pending-folder-pick mailbox, and the external-open (§3)
-                                dispatcher that opens one "cli-open" window per request
+  App/LaunchCoordinator.swift   Cmd+O's pending-folder-pick mailbox, the external-open (§3)
+                                dispatcher that opens one "cli-open" window per request, and the
+                                zero-window launch net (§3: a windowless launch gets one blank window)
   App/OpenRequest.swift         external-open path → (sidebar root, file to open), resolved on
                                 disk; plus CLIOpenToken, the window's presented value
   App/WindowCloseGuard.swift    NSWindowDelegate proxy: flush-on-close/quit, Close-Without-Saving

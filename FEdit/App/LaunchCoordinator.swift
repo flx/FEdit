@@ -123,6 +123,93 @@ final class LaunchCoordinator {
         guard !isSettled else { return }
         isSettled = true
         dispatchPendingFileOpens()
+        scheduleZeroWindowLaunchNet()
+    }
+
+    // MARK: - (zero-window-session-relaunch) The launch net
+
+    /// How long after `applicationDidFinishLaunching` the net checks for a windowless launch.
+    /// In the one measured ordering (external-open-stray-window Rev 3, P2/P3 — a single odoc
+    /// launch, display locked) restored windows existed before didFinishLaunching, and a cold
+    /// launch-by-open settled at its one window quickly. 1.5 s is a deliberately generous guess
+    /// built on those observations, NOT a measured latency bound — re-measure before shrinking
+    /// it. The net's failure direction on a pathologically slow window is one extra blank window
+    /// — visible and recoverable — never a touched or missing one.
+    private static let zeroWindowNetDelay: TimeInterval = 1.5
+
+    /// (zero-window-session-relaunch) The app-level "open a blank editor window" action,
+    /// registered from `FEditApp.body` (`@Environment(\.openWindow)` resolves there and can
+    /// create the process's FIRST window with no scene ever mounted — probe-verified, LB4/LB5).
+    /// It opens the same `"editor"` group Cmd+O opens, with no mailbox increment — a plain blank
+    /// window, no folder panel. Pure store, idempotent (body re-evaluations re-register the
+    /// semantically identical closure); it never dispatches anything from inside body evaluation.
+    private var presentBlankEditorWindow: (() -> Void)?
+
+    func registerLaunchFallbackOpener(_ open: @escaping () -> Void) {
+        presentBlankEditorWindow = open
+    }
+
+    /// (zero-window-session-relaunch) SPEC §3 promises an ordinary launch shows one blank window
+    /// even when the saved session recorded zero windows — but a ZERO-window saved session is not
+    /// "no session": restore succeeds at restoring nothing, and SwiftUI then creates no default
+    /// window either (measured on pre-fix HEAD: close all windows, quit, relaunch → 0 windows,
+    /// no scene). This net is **checked once per process**, `zeroWindowNetDelay` after settle,
+    /// and presents one blank editor window iff the launch produced no window at all:
+    ///
+    /// - `liveWindowCount == 0` — nothing restored, nothing created. The predicate counts
+    ///   `isVisible || isMiniaturized` (a session restored entirely miniaturized is a live
+    ///   session, not a windowless launch — `isVisible` alone is false for miniaturized windows)
+    ///   and `canBecomeKey` (excludes invisible torn-down scene husks and panels). Known
+    ///   residual, recorded: `isVisible` semantics on a LOCKED screen were the stray-window
+    ///   probes' one unresolved doubt; if they read false there, a locked-screen restore launch
+    ///   gains one extra blank window — the accepted failure direction, and the human GUI pass
+    ///   covers it.
+    /// - `undispatched.isEmpty || openNewWindow == nil` — pending external opens will create
+    ///   their own windows, so the net must not race them — but ONLY when an opener exists to
+    ///   create them with. With no opener registered (a zero-window launch has no scene to
+    ///   register one), those requests are stuck: the retry chain exhausts and nothing ever
+    ///   appears. Firing the blank window is then exactly their rescue — its `ContentView`
+    ///   appears, registers the opener, and `registerWindowOpener` re-dispatches the queue.
+    ///   Deliberately NO "was a cli-open window issued" clause either (stray-window Rev 2,
+    ///   D-R3): an issued window that never materializes also lands on the fire side.
+    ///
+    /// A hidden app (login item with Hide, `open -j`) is skipped: all its windows read
+    /// `isVisible == false`, indistinguishable from windowless, and opening a window while
+    /// hidden would surprise on unhide. The (rare) hidden + zero-window launch therefore keeps
+    /// the pre-fix behavior — recorded corner, not silent.
+    ///
+    /// `NSOpenPanel.runModal` delaying the timer is harmless: by firing time a window exists and
+    /// the net no-ops. Dock-reopen with zero windows is a separate surface, deliberately not
+    /// re-armed here.
+    private var zeroWindowNetChecked = false
+
+    private func scheduleZeroWindowLaunchNet() {
+        let workItem = DispatchWorkItem {
+            // Scheduled on `DispatchQueue.main` below, so this body runs on the main actor;
+            // `assumeIsolated` states that to the compiler (the file's standing idiom).
+            MainActor.assumeIsolated {
+                LaunchCoordinator.shared.fireZeroWindowLaunchNetIfNeeded()
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.zeroWindowNetDelay, execute: workItem)
+    }
+
+    private func fireZeroWindowLaunchNetIfNeeded() {
+        guard !zeroWindowNetChecked else { return }
+        zeroWindowNetChecked = true
+
+        guard !NSApp.isHidden else { return }
+        let liveWindowCount = NSApp.windows.count { ($0.isVisible || $0.isMiniaturized) && $0.canBecomeKey }
+        guard liveWindowCount == 0, undispatched.isEmpty || openNewWindow == nil else { return }
+
+        guard let presentBlankEditorWindow else {
+            // LB4/LB5 say `App.body` runs before any of this, so a nil opener should be
+            // unreachable — but if it ever happens, the bug this net fixes would silently
+            // return. Make that diagnosable rather than a plausible-looking success.
+            NSLog("FEdit: zero-window launch net fired with no registered opener — windowless launch not rescued")
+            return
+        }
+        presentBlankEditorWindow()
     }
 
     /// The external-open sink (`AppDelegate.application(_:open:)`). Does nothing heavier than

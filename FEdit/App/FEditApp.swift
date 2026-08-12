@@ -28,12 +28,26 @@ struct FEditApp: App {
     // `WindowCloseGuard.swift`.
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
+    // (zero-window-session-relaunch) Resolves at the App level — probe-verified (stray-window
+    // Rev 3): LB4 = the registration statement in `body` runs before any scene exists (the
+    // action is only STORED there, never invoked — D-R2); LB5 = the stored action, when the
+    // launch net later invokes it, can create the process's FIRST window with no scene ever
+    // mounted. Handed to `LaunchCoordinator` below as the net's blank-window opener.
+    @Environment(\.openWindow) private var openWindow
+
     init() {
         // Light appearance only (SPEC §3), regardless of the system setting.
         NSApplication.shared.appearance = NSAppearance(named: .aqua)
     }
 
     var body: some Scene {
+        // (zero-window-session-relaunch) A pure store, re-run (idempotently) on every body
+        // evaluation so the captured `OpenWindowAction` stays fresh. Registration must never
+        // dispatch from inside body evaluation (stray-window Rev 2, D-R2) — and it doesn't: the
+        // net fires from its own timer, `LaunchCoordinator` only stores the closure here.
+        let _ = LaunchCoordinator.shared.registerLaunchFallbackOpener { [openWindow] in
+            openWindow(id: "editor")
+        }
         // Value-less `WindowGroup(id:)` + `openWindow(id:)` opens a *new* window per Cmd+N call
         // (no `openWindow(value:)` dedup that would reuse a window / restructure the shipped
         // `@SceneStorage` restore). See LaunchCoordinator / FileCommands for the new-window flow.

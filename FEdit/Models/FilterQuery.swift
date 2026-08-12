@@ -125,7 +125,15 @@ struct MatchTerm: Equatable {
 /// optional `AND`/`OR` operators, flattened at parse time into OR-of-AND-groups (disjunctive
 /// normal form) — no parentheses, no precedence stack. Malformed input degrades gracefully
 /// (§5.5 last bullet) rather than erroring.
-struct FilterQuery {
+///
+/// (filter-walk-main-thread) `Equatable` is **derived** conformance over the single stored
+/// property `groups` — no semantics change, no custom `==`. It exists so `FilterRowCache` can key
+/// its per-root filtered rows on the *parsed value* rather than on the raw text: parsing is pure
+/// (`init` reads nothing but its argument), so two equal `FilterQuery` values always select the
+/// same rows, and keying on the parse kills the two-argument `(query, queryText)` invariant a text
+/// key would have carried. Comparing `[[MatchTerm]]` per lookup is trivially cheap next to a
+/// filter pass over a whole tree.
+struct FilterQuery: Equatable {
     /// Splits `text` into tokens on any whitespace run, dropping empty pieces. `"AND"`/`"OR"`
     /// (exact case) become operators; everything else, including lowercase `"and"`/`"or"`, is an
     /// ordinary term (criterion 5).

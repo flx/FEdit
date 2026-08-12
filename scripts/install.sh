@@ -204,6 +204,17 @@ ditto "$BUILT_APP" "$INSTALLED_APP" || die "could not copy $APP_NAME to $DEST"
 
 printf '\nInstalled %s\n' "$INSTALLED_APP"
 
-install_cli_shim
+# (install-sh-temp-shim) The shim rewrites its APP= default to $INSTALLED_APP, so installing it
+# for a NON-default destination would repoint the user's real `fedit` on PATH at what is usually
+# a throwaway copy — the documented temp-dir gate workflow (`install.sh /tmp/...`) used to do
+# exactly that, silently. Skip the shim for non-/Applications destinations UNLESS the caller set
+# FEDIT_BIN_DIR explicitly: an explicit bin dir is an explicit ask (the probe workflow points it
+# at a scratch dir for the same reason), and the default-destination behavior is unchanged.
+if [ "$DEST" = "$DEFAULT_DEST" ] || [ -n "${FEDIT_BIN_DIR:-}" ]; then
+    install_cli_shim
+else
+    printf 'Skipping the fedit shim for the non-default destination %s\n' "$DEST"
+    printf '(set FEDIT_BIN_DIR to install one pointing at this copy anyway)\n'
+fi
 
 printf 'If FEdit is already running, quit it and relaunch to pick up this build.\n'

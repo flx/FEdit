@@ -27,7 +27,7 @@ v1 feature-complete: every planned item has shipped (see [DONE.md](DONE.md); [TO
 
 Open `FEdit.xcodeproj` in Xcode and Run. No third-party dependencies.
 
-A handful of pure-logic modules (filter query, markdown renderer, git status parsing, file tree scanning, session snapshots, line counting, command-line path mapping) also have standalone `swiftc`-run regression harnesses under `scripts/*/main.swift`, used in place of an XCTest target; the `fedit` shim has a shell one at `scripts/FeditShimTests/run.sh`.
+A handful of pure-logic modules (filter query, filter row caching, markdown renderer, git status parsing, file tree scanning, per-root scan scheduling, watcher skip gating, session snapshots, line counting, command-line path mapping) also have standalone `swiftc`-run regression harnesses under `scripts/*/main.swift`, used in place of an XCTest target; the `fedit` shim has a shell one at `scripts/FeditShimTests/run.sh`.
 
 ## Installing
 
@@ -37,7 +37,7 @@ A handful of pure-logic modules (filter query, markdown renderer, git status par
 scripts/install.sh
 ```
 
-The installer also drops a `fedit` command into the first writable directory among `$FEDIT_BIN_DIR`, `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin` (created if needed), with its app path pointed at wherever the bundle was installed. It never uses `sudo`, and a shim that cannot be placed is a warning, not a failed install.
+The installer also drops a `fedit` command into the first writable directory among `$FEDIT_BIN_DIR`, `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin` (created if needed), with its app path pointed at wherever the bundle was installed. It never uses `sudo`, and a shim that cannot be placed is a warning, not a failed install. Installing to a non-default destination (e.g. a temp directory for testing) skips the shim — it would repoint your real `fedit` at the throwaway copy — unless `FEDIT_BIN_DIR` is set explicitly.
 
 ## Command line
 
@@ -49,7 +49,7 @@ fedit                     # just launches or activates FEdit
 fedit --help              # usage, on stdout
 ```
 
-Each path gets its **own new window** — an existing window, full or empty, is never disturbed (the request is delivered as the new window's own value, so it cannot land anywhere else). A file's **containing folder** becomes that window's sole sidebar root, so `fedit ~/notes.md` scans your entire home directory (the same cost as picking `~` in the Open Folder… panel). The scan runs off the main thread: the window appears immediately, showing `Scanning…` in the sidebar while the tree fills in behind it — though the finished tree is still held in memory in full, so a home-scale root is heavy. At most 8 paths per call.
+Each path gets its **own new window** — an existing window, full or empty, is never disturbed (the request is delivered as the new window's own value, so it cannot land anywhere else). A file's **containing folder** becomes that window's sole sidebar root, so `fedit ~/notes.md` scans your entire home directory (the same cost as picking `~` in the Open Folder… panel). The scan runs off the main thread: the window appears immediately, showing `Scanning…` in the sidebar while the tree fills in behind it. The tree is capped at ~50,000 entries per root, breadth-first — a home-scale root fills level by level and loses only its deepest reached level's tail, and it says so with a notice in its sidebar section. At most 8 paths per call.
 
 `-h`/`--help` is recognized as the **first argument only** — after that everything is a path, since a file really can be called `--help`.
 

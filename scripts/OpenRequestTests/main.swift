@@ -268,6 +268,83 @@ check(ghost.file?.absoluteString.hasSuffix("/") == false, "…with no trailing s
 check(ghost.root == URL(fileURLWithPath: ghostRoot, isDirectory: true),
       "the rebuilt root equals the directory URL the app would build for the same path")
 
+// MARK: - CLIOpenToken tolerant decode (clitoken-tolerant-decode)
+
+section("Tolerant decode: the system owns the read path, so every key defaults")
+do {
+    let decoder = JSONDecoder()
+
+    // A PAST-version archive missing keys decodes with defaults rather than killing the scene
+    // restore silently. (Unknown EXTRA keys were already ignored by synthesized Codable — the
+    // future-shaped fixture below pins only that a present id is preserved, not regenerated.)
+    let futureShaped = Data(#"{"id":"11111111-2222-3333-4444-555555555555","rootPath":"/tmp/x","filePath":null,"someFutureKey":42}"#.utf8)
+    if let token = try? decoder.decode(CLIOpenToken.self, from: futureShaped) {
+        check(token.rootPath == "/tmp/x", "unknown extra keys are ignored, known keys decode")
+        check(token.id == UUID(uuidString: "11111111-2222-3333-4444-555555555555"), "a present id is preserved, not regenerated")
+    } else {
+        check(false, "future-shaped token failed to decode")
+    }
+
+    let missingId = Data(#"{"rootPath":"/tmp/x"}"#.utf8)
+    if let token = try? decoder.decode(CLIOpenToken.self, from: missingId) {
+        check(token.rootPath == "/tmp/x", "missing id: the remaining keys still decode")
+    } else {
+        check(false, "token with missing id failed to decode")
+    }
+
+    let empty = Data("{}".utf8)
+    if let token = try? decoder.decode(CLIOpenToken.self, from: empty) {
+        check(token.rootPath == "", "fully empty archive decodes to the inert empty-rootPath token")
+        check(token.filePath == nil, "fully empty archive decodes with no file")
+    } else {
+        check(false, "empty-object token failed to decode")
+    }
+
+    // Wrong-TYPED present keys — the tolerance `try?` buys over WorkspaceSnapshot's
+    // `try decodeIfPresent` contract. One fixture per field, because each `try?` is a separate
+    // line that a "harmonize with WorkspaceSnapshot" edit could independently break.
+    let corruptId = Data(#"{"id":12345,"rootPath":"/tmp/x"}"#.utf8)
+    if let token = try? decoder.decode(CLIOpenToken.self, from: corruptId) {
+        check(token.rootPath == "/tmp/x", "a wrong-typed id falls back to the sentinel without failing the rest")
+    } else {
+        check(false, "token with wrong-typed id failed to decode")
+    }
+    let corruptRoot = Data(#"{"id":"11111111-2222-3333-4444-555555555555","rootPath":42}"#.utf8)
+    if let token = try? decoder.decode(CLIOpenToken.self, from: corruptRoot) {
+        check(token.rootPath == "", "a wrong-typed rootPath falls back to the inert empty default")
+        check(token.id == UUID(uuidString: "11111111-2222-3333-4444-555555555555"), "…without disturbing the healthy id")
+    } else {
+        check(false, "token with wrong-typed rootPath failed to decode")
+    }
+    let corruptFile = Data(#"{"rootPath":"/tmp/x","filePath":42}"#.utf8)
+    if let token = try? decoder.decode(CLIOpenToken.self, from: corruptFile) {
+        check(token.filePath == nil, "a wrong-typed filePath falls back to nil")
+    } else {
+        check(false, "token with wrong-typed filePath failed to decode")
+    }
+
+    // Decode is IDEMPOTENT for defaulted ids: the fallback is a stable sentinel, not a fresh
+    // UUID, because this type's Hashable is the scene's window identity and the system may decode
+    // the same archive more than once during restore. (Distinct ids only matter for
+    // openWindow(value:), which only ever sees freshly built tokens with real UUIDs.)
+    let a = try? decoder.decode(CLIOpenToken.self, from: missingId)
+    let b = try? decoder.decode(CLIOpenToken.self, from: missingId)
+    check(a != nil && a == b, "equal corrupt bytes decode to EQUAL tokens (identity is stable across re-decodes)")
+
+    // The boundary of tolerance: a structurally alien archive (not a keyed container) must STILL
+    // fail — SwiftUI then restores the window valueless, the accepted degrade. Full tolerance
+    // here would materialize a plausible token out of arbitrary bytes.
+    check((try? decoder.decode(CLIOpenToken.self, from: Data("[1,2,3]".utf8))) == nil,
+          "a non-keyed archive still fails decode (tolerance has a floor)")
+
+    // The encode side is untouched (synthesized): a freshly built token still round-trips to an
+    // equal value. (The wire-format key spellings are pinned by the literal-JSON fixture above.)
+    let request = OpenRequest(fileURL: notes)!
+    let original = CLIOpenToken(request: request)
+    let roundTripped = try! decoder.decode(CLIOpenToken.self, from: try! JSONEncoder().encode(original))
+    check(roundTripped == original, "current-version round trip yields an equal token (tolerance changed nothing for healthy tokens)")
+}
+
 teardown()
 
 // MARK: - Summary

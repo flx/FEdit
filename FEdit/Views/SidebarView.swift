@@ -51,10 +51,12 @@ struct SidebarView: View {
                                 Text("Scanning…")
                                     .foregroundStyle(.secondary)
                             } else if query.isEmpty {
+                                truncationNotice(for: root, filtering: false)
                                 OutlineGroup(root.children ?? [], children: \.children) { node in
                                     FileRow(node: node, workspace: workspace)
                                 }
                             } else {
+                                truncationNotice(for: root, filtering: true)
                                 flatRows(for: root, query: query)
                             }
                         } header: {
@@ -72,6 +74,45 @@ struct SidebarView: View {
         }
     }
 
+    /// (tree-node-budget) The per-root declaration that this tree is **incomplete**: shown iff the
+    /// root's last applied walk hit the node budget (SPEC §5.2, §5.4, §11). Silent truncation was
+    /// rejected — this row is the whole visible half of the item.
+    ///
+    /// Shown in **both** modes, because both misreport otherwise: tree mode as "this folder is
+    /// empty", filter mode as "this file does not exist". Deliberately **not** shown for a root that
+    /// is still `Scanning…` — its walk has not landed, so there is nothing to declare yet, and
+    /// `body`'s first branch intercepts those before this is ever reached.
+    ///
+    /// The copy names the one recovery that works: adding the subfolder you want as its **own** root,
+    /// since the budget is per root. It deliberately does **not** suggest Refresh — truncation is
+    /// deterministic, so a rescan of the same tree provably cuts in exactly the same place, and
+    /// advising it would send the user round a loop that cannot help.
+    @ViewBuilder
+    private func truncationNotice(for root: FileNode, filtering: Bool) -> some View {
+        if workspace.truncatedRootURLs.contains(root.url) {
+            Group {
+                if filtering {
+                    Text("Results may be incomplete — the tree is truncated.")
+                } else if let count = workspace.truncatedNodeCount(for: root.url) {
+                    // Interpolated from the walk's own measurement, so the budget constant lives in
+                    // exactly one place (`FileNode.defaultNodeBudget`) and changing it needs no edit
+                    // here.
+                    Text("Showing the first \(count.formatted()) items — deeper folders are incomplete. Add a subfolder as its own root to see more.")
+                } else {
+                    // The count is missing only if a truncated landing published this flag without
+                    // storing its report — unreachable, since both happen in one `applyScan` turn.
+                    // The declaration still goes out: dropping the notice would hide the truncation,
+                    // and inventing a number would be worse than omitting it.
+                    Text("Deeper folders are incomplete — the tree is truncated. Add a subfolder as its own root to see more.")
+                }
+            }
+            .foregroundStyle(.secondary)
+            // The notice is a sentence, not a name: it wraps to as many lines as it needs rather
+            // than truncating — the same outcome as the file-name rows below it, by different means (SPEC §5.3).
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private var searchField: some View {
         TextField("Filter files (e.g. .swift$ OR ^src/)", text: $workspace.filterText)
             .textFieldStyle(.roundedBorder)
@@ -80,15 +121,22 @@ struct SidebarView: View {
 
     /// Flat filtered contents of one section (SPEC §5.4): every file under `root` whose
     /// root-relative path matches `query`, in the scanner's depth-first (folders-first) order;
-    /// a per-section "No matches" fallback when nothing matches. Computed inline per render — a
-    /// synchronous linear scan is acceptable per SPEC §11, no caching layer.
+    /// a per-section "No matches" fallback when nothing matches.
+    ///
+    /// (filter-walk-main-thread) These rows are **cached derived state**, not recomputed here. This
+    /// used to run `root.filesWithRelativePaths()` — a full DFS allocating one tuple per file —
+    /// inline in `body`; since this view observes the whole model, every editor keystroke and every
+    /// caret move re-ran that walk on the main thread for each root. `filteredMatches` recomputes
+    /// only when the root's tree is spliced or the query changes, so a render with unchanged inputs
+    /// costs a dictionary lookup. `query` is the single per-render parse from `body`, passed down
+    /// rather than re-derived, and the mode decision, "No matches", and `FileRow` are unchanged.
     ///
     /// (async-root-scan) Only reached for a root whose first scan has landed — the "Scanning…"
     /// branch in `body` intercepts the others in *both* modes, so an incomplete tree is never
     /// misreported here as "this file doesn't exist".
     @ViewBuilder
     private func flatRows(for root: FileNode, query: FilterQuery) -> some View {
-        let matches = root.filesWithRelativePaths().filter { query.matches($0.path) }
+        let matches = workspace.filteredMatches(for: root, query: query)
         if matches.isEmpty {
             Text("No matches")
                 .foregroundStyle(.secondary)

@@ -69,7 +69,7 @@ struct RootScan {
     var lastFinish: DispatchTime?
 
     /// (async-root-scan) How long that walk took, measured the same monotonic way around the
-    /// `FileNode.scan` call on `scanQueue`. Feeds the proportional damping term.
+    /// `FileNode.scanRecordingSkips` call on `scanQueue`. Feeds the proportional damping term.
     var lastDuration: TimeInterval?
 
     /// (async-root-scan) The gap a watcher-driven rescan of this root must currently wait out —
@@ -81,6 +81,37 @@ struct RootScan {
     /// *deferred*, never dropped, so the tree is eventually right. At most one is armed at a time; a
     /// burst inside the gap coalesces into the pending one.
     var pendingDampedRescan: DispatchWorkItem?
+
+    /// (watcher-scan-skip-parity) What this root's last **applied** walk decided to leave out of the
+    /// tree — the FSEvents gate's only source of truth about non-name-decidable skips (`UF_HIDDEN`
+    /// entries and the like; the record's `unreadableDirs` half is carried but deliberately not
+    /// consulted by the gate, see `SkipRecord`). Written by `applyScan` on the applied branch,
+    /// drained by `noteRootRemoved`, collected with the entry.
+    ///
+    /// `Optional` per this type's rule, and load-bearing rather than shorthand for "empty": `nil`
+    /// means **no walk has ever delivered verdicts for this root**, which is not the same claim as
+    /// "the walk found nothing to skip". The gate must fall back to its static rules alone in the
+    /// first case; in the second it may rely on the record's silence.
+    var skipRecord: SkipRecord?
+}
+
+/// (watcher-scan-skip-parity) What a finished walk hands back. Was three loose arguments
+/// `(FileNode, Bool, TimeInterval)` before the skip record needed a fourth; grouping them keeps the
+/// `WalkCompletion`/`applyScan` seams from growing a positional-argument hazard, and makes the fake
+/// launcher in `scripts/RootScanTests` name what it is delivering.
+struct WalkResult: Sendable {
+    /// The scanned tree. A cancelled walk's is **partial** — the generation check discards it.
+    let node: FileNode
+
+    /// The verdicts that produced `node`, and partial in exactly the same cases: discarded with it.
+    let skipRecord: SkipRecord
+
+    /// Whether `node` differs structurally from the diff baseline captured at walk start. Computed
+    /// off-main inside the launcher, with the walk.
+    let changed: Bool
+
+    /// The walk's own measured cost, in seconds. Feeds the proportional damping term.
+    let duration: TimeInterval
 }
 
 /// (root-scan-consolidation) The in-flight walks' cancellation tokens, and the **only** part of the
@@ -171,10 +202,10 @@ final class RootScanScheduler {
     /// What a finished walk hands back on the main actor. `@Sendable` is required, not decorative: the
     /// default launcher carries this closure into `scanQueue.async`'s `@Sendable` body, and a bare
     /// `@MainActor` function type is not implicitly `Sendable`.
-    typealias WalkCompletion = @Sendable @MainActor (_ scanned: FileNode, _ changed: Bool, _ duration: TimeInterval) -> Void
+    typealias WalkCompletion = @Sendable @MainActor (_ result: WalkResult) -> Void
 
-    /// The walk executor: run `FileNode.scan(directory:cancellation:)` off the main actor against
-    /// `old` as the diff baseline, then deliver `(tree, changed, duration)` back on the main actor.
+    /// The walk executor: run `FileNode.scanRecordingSkips(directory:cancellation:)` off the main
+    /// actor against `old` as the diff baseline, then deliver the `WalkResult` back on the main actor.
     typealias WalkLauncher = @MainActor (_ url: URL, _ old: FileNode?, _ token: ScanCancellationToken, _ completion: @escaping WalkCompletion) -> Void
 
     /// The trailing-edge timer: run `workItem` on the main actor after `delay` seconds.
@@ -223,10 +254,14 @@ final class RootScanScheduler {
     /// a root whose walk is cheap (under `minRescanGap`/3 ≈ 333 ms) is governed by the 1 s floor
     /// exactly as before.
     ///
-    /// This is what stops a sustained event drip that can never surface anything — `~/Library/**`
-    /// under a `$HOME` root, whose events pass the watcher's dot-prefix gate while the scanner skips
-    /// the `UF_HIDDEN` directory outright (filed as (watcher-scan-skip-parity)) — from re-walking a
-    /// home-scale tree back-to-back forever now that the walk no longer blocks the main thread.
+    /// This is what bounds a sustained event drip that can never surface anything, now that the walk
+    /// no longer blocks the main thread. Its motivating case — `~/Library/**` under a `$HOME` root,
+    /// whose events passed the watcher's dot-prefix gate while the scanner skipped the `UF_HIDDEN`
+    /// directory outright — is since (watcher-scan-skip-parity) stopped one layer earlier, by
+    /// `TreeSkipGate` consulting `RootScan.skipRecord`, so those events no longer *request* a rescan
+    /// at all. Damping remains the bound on every drip the gate legitimately lets through; it is
+    /// **not** a safety net for gate drops, which it structurally cannot be (it defers requests, it
+    /// cannot manufacture one the gate never made).
     static let minRescanGap: TimeInterval = 1
     static let maxRescanGap: TimeInterval = 30
     static let rescanDurationFactor: Double = 3
@@ -298,6 +333,10 @@ final class RootScanScheduler {
         scan.backoff = nil
         scan.pendingDampedRescan?.cancel()
         scan.pendingDampedRescan = nil
+        // (watcher-scan-skip-parity) Drained with the rest: a removed root's verdicts describe a tree
+        // that is no longer shown, and a re-add must not have its first gate decisions made against
+        // them. `nil` is the honest state — "no walk has delivered verdicts for this root".
+        scan.skipRecord = nil
         scans[url] = scan
         tokens.cancelAndRemove(url)
         collectEntryIfIdle(url)
@@ -306,7 +345,7 @@ final class RootScanScheduler {
     // MARK: - Scanning
 
     /// (async-root-scan) The single entry point for scanning a root; the app target's **only**
-    /// `FileNode.scan` call site is the walk launcher this drives. Returns immediately: the walk runs
+    /// `FileNode.scanRecordingSkips` call site is the walk launcher this drives. Returns immediately: the walk runs
     /// on `scanQueue`, and `applyScan` hands its result to the model's landing seam on the main actor
     /// when it comes back.
     ///
@@ -386,16 +425,14 @@ final class RootScanScheduler {
         // moves the deep `Equatable` walk off-main with the scan. (Before (async-root-scan) that
         // compare was itself an O(N) main-thread cost on every watcher event.)
         let old = currentNode(url)
-        launchWalk(url, old, token) { [weak self] scanned, changed, duration in
+        launchWalk(url, old, token) { [weak self] result in
             // `[weak self]`: a closed window's scheduler is neither kept alive nor written.
             self?.applyScan(
-                scanned,
-                changed: changed,
+                result,
                 of: url,
                 generation: generation,
                 token: token,
-                force: effectiveForce,
-                duration: duration
+                force: effectiveForce
             )
         }
     }
@@ -418,13 +455,11 @@ final class RootScanScheduler {
     /// `land` is called, and the entry is re-read *after* it: `land` is a call out of this object, so
     /// nothing here may hold a stale copy of the entry across it (see the comments inline).
     private func applyScan(
-        _ scanned: FileNode,
-        changed: Bool,
+        _ result: WalkResult,
         of url: URL,
         generation: Int,
         token: ScanCancellationToken,
-        force: Bool,
-        duration: TimeInterval
+        force: Bool
     ) {
         // Clear the in-flight gate and publish it **before** the `land` callout below — deliberate,
         // for re-entrancy: `land` leaves this object, and anything it does that comes back in here
@@ -436,7 +471,7 @@ final class RootScanScheduler {
         tokens.clear(url: url, ifIdentical: token)
 
         // `&&` short-circuits, so a job whose generation moved never reaches the model seam.
-        let applied = scan.generation == generation && land(url, scanned, changed, force)
+        let applied = scan.generation == generation && land(url, result.node, result.changed, force)
 
         // Re-read across the callout, for the same reason the write above happens early: the entry
         // in `scans` — not this local — is the truth once `land` has run.
@@ -447,9 +482,18 @@ final class RootScanScheduler {
             // structural change — or an explicit user Refresh — resets it to `minRescanGap`. The
             // recorded duration additionally holds the next gap to >= 3× this walk's cost. Recorded
             // only on this branch (I8): a discarded landing must not restart a removed root's clock.
+            //
+            // (watcher-scan-skip-parity) The skip record is stored on this same branch, and on **all**
+            // of it — including a structurally-unchanged landing, which publishes nothing but whose
+            // verdicts are nonetheless the freshest ones there are. That is safe precisely because
+            // `scans` is not `@Published` and this scheduler is not an `ObservableObject`, so the
+            // store cannot re-render the sidebar. A discarded landing (generation moved, or the root
+            // is gone from `roots`) stores nothing: `&&` short-circuited above, and its record may be
+            // a cancelled walk's partial one.
+            scan.skipRecord = result.skipRecord
             scan.lastFinish = now()
-            scan.lastDuration = duration
-            scan.backoff = (force || changed)
+            scan.lastDuration = result.duration
+            scan.backoff = (force || result.changed)
                 ? Self.minRescanGap
                 : min((scan.backoff ?? Self.minRescanGap) * 2, Self.maxRescanGap)
         }
@@ -547,7 +591,7 @@ final class RootScanScheduler {
     ///
     /// `static` deliberately — a default that captured `self` would put the scheduler in its own
     /// stored property and defeat the no-self-retain invariant. `nonisolated` because everything it
-    /// touches is either a local or nonisolated (`FileNode.scan`, `secondsElapsed`), and it must be
+    /// touches is either a local or nonisolated (`FileNode.scanRecordingSkips`, `secondsElapsed`), and it must be
     /// convertible to the main-actor-isolated `WalkLauncher` seam without dragging isolation into the
     /// queue closure.
     ///
@@ -571,13 +615,23 @@ final class RootScanScheduler {
             // deliberately excluded — it is cheap next to the syscalls and including it would
             // inflate the gap on the *changed* path, which resets.
             let started = DispatchTime.now()
-            let scanned = FileNode.scan(directory: url, cancellation: token)
+            // (watcher-scan-skip-parity) The app target's single walk call: the recording entry point,
+            // so every landing carries the verdicts the FSEvents gate consults. The record is
+            // produced by the walk itself and carried through unchanged — never re-derived on the
+            // main actor, which would cost the syscalls this whole design exists to avoid.
+            let outcome = FileNode.scanRecordingSkips(directory: url, cancellation: token)
             let duration = secondsElapsed(from: started, to: DispatchTime.now())
             // `old` is `FileNode?`; a nil `old` (no such root at job start — not reachable today,
             // since every caller appends the root first) reads as "changed".
-            let changed = scanned != old
+            let changed = outcome.node != old
+            let result = WalkResult(
+                node: outcome.node,
+                skipRecord: outcome.skipRecord,
+                changed: changed,
+                duration: duration
+            )
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { completion(scanned, changed, duration) }
+                MainActor.assumeIsolated { completion(result) }
             }
         }
     }

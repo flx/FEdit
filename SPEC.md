@@ -62,7 +62,7 @@ FEdit is a lightweight macOS text editor with a strong focus on low memory usage
 - **File-system watching (automatic refresh):**
   - **Open file:** watched with a precise vnode `DispatchSource`. An external change is reflected automatically, no manual Refresh. If the buffer is **clean**, it is reloaded from disk (caret preserved at its UTF-16 offset, clamped into the new length; scroll position — the first visible line — preserved). If the buffer is **dirty**, the in-editor version is kept (no clobber; SPEC §11 last-writer-wins) and a subtle **"changed on disk"** marker is shown in the window subtitle ("Edited — changed on disk"); the next save (or, under always-on autosave, the ~0.75 s flush) writes the buffer over the external version and clears the marker. FEdit's own writes (Cmd+S and every autosave, all through the single save path) are recognized by an `(inode, size, mtime)` signature and never mistaken for an external change. The reload reads the whole file synchronously (bounded by the 100 MB open cap). Delete/recreate does not blank the editor — the buffer is retained (a later save recreates the file). Promptness/timing is specified for local APFS/HFS+ volumes; on coarse-mtime volumes (SMB/NFS/FAT/exFAT) a same-size in-place external write within one mtime tick of FEdit's own write can be missed (accepted, last-writer-wins).
   - **Sidebar roots:** each root is watched recursively with FSEvents; an external add/remove (including in subdirectories) is reflected in the tree without manual Refresh, debounced so a burst of changes coalesces into a single rescan. After a rescan that found nothing changed, further watcher-driven rescans of that root are damped (§11) — so a change arriving during sustained no-op churn can be deferred by the current damping gap (up to 3× the root's own walk time) before it is reflected; it is deferred, never dropped, a change on a quiet root is not deferred beyond the 1 s floor, and manual Refresh is never damped. Removing a root stops watching it. Manual Refresh remains.
-- Hidden files (dotfiles) are skipped. Additionally skipped directory names: `node_modules`, `.build`, `DerivedData`.
+- Hidden entries are skipped: **dot-prefixed names** (any name starting with `.`), unconditionally, **and every entry Foundation reports as hidden** (`URLResourceKey.isHiddenKey`) — which on macOS covers the BSD `UF_HIDDEN` flag (e.g. `~/Library`, whose name contains no dot) and the other invisibility sources Foundation folds into that key (the Finder "invisible" bit, a legacy `/.hidden` listing). For a **symlink** the link's own flag decides, not its target's. Additionally skipped, for **directories and symlinks** only (a plain file of the same name is kept and shown): `node_modules`, `.build`, `DerivedData`. This is one owned predicate in the scanner, not a delegation to Foundation's `.skipsHiddenFiles`, and the automatic-refresh watcher gate above consults the scanner's own recorded verdicts rather than re-deriving the rule — so events *inside* a skipped subtree no longer drive rescans that can surface nothing, and a change to a plain file named `node_modules` still refreshes. Two events still do reach a rescan by design: any event while the root's first scan is still pending (no verdicts recorded yet), and an event naming a skipped entry **itself** — that is what makes un-hiding it (`chflags nohidden`) refresh the tree automatically. Directories the scan could not read (permissions/TCC) are shown empty; events under them keep driving (damped) rescans deliberately, because nothing announces a permission grant, so recovery is automatic once access is restored.
 - Sort order within a directory: folders first, then files, each alphabetically (`localizedStandardCompare`).
 - A file created via File → New… (§7) appears in the tree after the automatic refresh that creation triggers; its row is visible when its containing folder is expanded (a file created into a collapsed nested folder still opens, but its row is revealed only on expand).
 
@@ -209,9 +209,12 @@ FEdit/
   App/WindowCloseGuard.swift    NSWindowDelegate proxy: flush-on-close/quit, Close-Without-Saving
                                 escape; app delegate's external-open (odoc) sink
   Models/WorkspaceModel.swift   per-window state: roots, open file, dirty/save/autosave logic
-  Models/FileNode.swift         tree node + recursive scanner
+  Models/FileNode.swift         tree node + recursive scanner (owns the skip predicate; records
+                                what it skipped, per root, for the watcher gate)
   Models/RootScanScheduler.swift  per-root scan state machine: coalescing gates, damping,
                                 generations, cancellation tokens (owns the scan teardown)
+  Models/TreeSkipGate.swift     FSEvents skip gate: would a rescan ignore this changed path?
+                                (static rules + the scanner's recorded verdicts; no syscalls)
   Models/FilterQuery.swift      boolean filter parser/evaluator (terms, AND/OR, ^/$ anchors)
   Models/FilterRowCache.swift   per-root cache of filter mode's flat rows (invalidated per splice)
   Models/FileWatcher.swift      open-file vnode watcher + FileSignature (self-write key)
@@ -235,7 +238,8 @@ scripts/
   fedit                         /bin/sh command-line shim around `open -a` (§3 external opens)
   FileNodeTests, FilterQueryTests, FilterRowCacheTests, GitStatusTests,
   LogicalLineTests, MarkdownRendererTests, OpenRequestTests, RootScanTests,
-  SnapshotTests                 standalone swiftc-run regression harnesses (no XCTest target)
+  SnapshotTests, TreeSkipGateTests
+                                standalone swiftc-run regression harnesses (no XCTest target)
   FeditShimTests                shell harness for scripts/fedit (stub `open`, no GUI)
 ```
 

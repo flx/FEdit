@@ -60,9 +60,11 @@ struct FileNode: Identifiable, Equatable, Sendable {
     /// through `RootScanScheduler.requestScan(of:force:damped:)` (root-scan-consolidation). Never
     /// call it on the main actor; SPEC §11 no longer accepts a main-thread walk.
     ///
-    /// This no-argument entry point is deliberately behavior-identical to the pre-async scanner and
-    /// is what `scripts/FileNodeTests` pins; the cancellable overload below is purely additive (a
-    /// `nil` token makes it this function).
+    /// (watcher-scan-skip-parity) A **thin wrapper** that discards the skip record: there is exactly
+    /// one walk implementation, `scanRecordingSkips(directory:cancellation:)`, so `scripts/FileNodeTests`
+    /// pins production code rather than a twin. The app target no longer calls either wrapper — the
+    /// scan queue needs the record — so they exist for the harness's pinned entry points (and their
+    /// equivalence to the recording walk is itself asserted there).
     static func scan(directory: URL) -> FileNode {
         scan(directory: directory, cancellation: nil)
     }
@@ -72,29 +74,89 @@ struct FileNode: Identifiable, Equatable, Sendable {
     /// home-scale root does not leave a scan-queue thread walking it for minutes. A cancelled walk
     /// returns a **partial** tree — by contract the caller must discard it (`RootScanScheduler` does,
     /// via the root's scan generation), never publish it.
+    ///
+    /// (watcher-scan-skip-parity) The second thin wrapper over `scanRecordingSkips`; see above.
     static func scan(directory: URL, cancellation: ScanCancellationToken?) -> FileNode {
-        let standardized = directory.standardizedFileURL
-        let children = scanChildren(of: standardized, cancellation: cancellation)
-        return FileNode(url: standardized, name: standardized.lastPathComponent, isDirectory: true, children: children)
+        scanRecordingSkips(directory: directory, cancellation: cancellation).node
     }
 
-    private static func scanChildren(of directory: URL, cancellation: ScanCancellationToken?) -> [FileNode] {
+    /// (watcher-scan-skip-parity) The **single** walk implementation: the tree, plus a record of what
+    /// the walk decided to skip, so the FSEvents gate can ask the scanner's own verdicts instead of
+    /// re-deriving them.
+    ///
+    /// Why the record exists at all: `WorkspaceModel.isSkippedTreePath` runs per changed path inside
+    /// an FSEvents burst under a **no-syscall-per-path** rule, so it cannot `stat` anything. Before
+    /// this item it re-implemented the scanner's rule as a dot-prefix test plus
+    /// `skippedDirectoryNames`, and diverged in both directions — a `UF_HIDDEN` non-dot directory
+    /// (`~/Library`) passed the gate and drove a rescan that could never surface anything; and a plain
+    /// *file* named `node_modules` was dropped by the gate although the scanner keeps it. Recording
+    /// the verdicts where the syscalls already happen and consulting them where none are allowed makes
+    /// parity structural instead of a re-derivation that has to be kept in sync by hand. (Unreadable
+    /// directories are recorded too, but the gate deliberately does not consult that half — see
+    /// `SkipRecord.unreadableDirs`.)
+    ///
+    /// A **partial** record accompanies a cancelled walk's partial tree, and the same contract
+    /// applies: the caller must discard both (`RootScanScheduler`'s generation check does).
+    static func scanRecordingSkips(directory: URL, cancellation: ScanCancellationToken?) -> ScanOutcome {
+        let standardized = directory.standardizedFileURL
+        var skippedIndex: [String: Set<String>] = [:]
+        var unreadableDirs: Set<String> = []
+        let children = scanChildren(
+            of: standardized,
+            relativePath: "",
+            cancellation: cancellation,
+            skippedIndex: &skippedIndex,
+            unreadableDirs: &unreadableDirs
+        )
+        return ScanOutcome(
+            node: FileNode(url: standardized, name: standardized.lastPathComponent, isDirectory: true, children: children),
+            skippedIndex: skippedIndex,
+            unreadableDirs: unreadableDirs
+        )
+    }
+
+    /// `relativePath` is `directory`'s path **relative to the scanned root** — `""` for the root
+    /// itself — and is built from `lastPathComponent`s alone, never by string arithmetic on absolute
+    /// paths. That is what makes the recorded keys independent of whether the caller handed in a
+    /// standardized or a canonical (realpath'd) root URL, which in turn is what lets the gate compare
+    /// them against components it derives from an FSEvents path without a rebase step.
+    private static func scanChildren(
+        of directory: URL,
+        relativePath: String,
+        cancellation: ScanCancellationToken?,
+        skippedIndex: inout [String: Set<String>],
+        unreadableDirs: inout Set<String>
+    ) -> [FileNode] {
         let fileManager = FileManager.default
         let entries: [URL]
         do {
+            // (watcher-scan-skip-parity) `.skipsHiddenFiles` is deliberately **gone**: hidden-ness is
+            // now this scanner's own decision (see the predicate below), so the gate can be told what
+            // it decided. Foundation would otherwise filter entries out before the loop ever saw them,
+            // leaving nothing to record.
             entries = try fileManager.contentsOfDirectory(
                 at: directory,
-                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-                options: [.skipsHiddenFiles]
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .isHiddenKey],
+                options: []
             )
         } catch {
             // Unreadable directory (permissions, disappeared mid-scan, etc.) — show as empty
             // rather than crashing or propagating the error (SPEC §11).
+            //
+            // (watcher-scan-skip-parity) Recorded, not merely swallowed: this is the one place that
+            // knows a subtree is missing from the tree for a reason other than a skip verdict. The
+            // record is for observability and future scan-outcome reporting, NOT for the FSEvents
+            // gate — `TreeSkipGate` deliberately never consults `unreadableDirs`; see
+            // `SkipRecord.unreadableDirs` for why gating on it would be permanent.
+            unreadableDirs.insert(relativePath)
             return []
         }
 
         var nodes: [FileNode] = []
         nodes.reserveCapacity(entries.count)
+        // Names this directory skipped, **excluding** dot-prefixed ones: those are decidable from the
+        // name alone at event time, so recording them would swell the index for zero information.
+        var skippedNames: Set<String> = []
 
         for entryURL in entries {
             // (async-root-scan, Tier 2) One lock-guarded flag read per entry — cheap beside the
@@ -106,20 +168,54 @@ struct FileNode: Identifiable, Equatable, Sendable {
             let standardizedEntry = entryURL.standardizedFileURL
             let name = standardizedEntry.lastPathComponent
 
-            let resourceValues = try? standardizedEntry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            // `.isHiddenKey` joins the keys this call already fetches — one `resourceValues` call
+            // regardless of key count, so owning the hidden test costs no extra syscall per entry.
+            // (It does surface hidden entries to this loop that `.skipsHiddenFiles` used to drop
+            // before it, so each pays one `resourceValues` before being skipped; hidden *subtrees*
+            // are still never descended.)
+            let resourceValues = try? standardizedEntry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .isHiddenKey])
             let isSymbolicLink = resourceValues?.isSymbolicLink ?? false
             // Symbolic links are treated as leaf files (no recursion) to avoid link cycles.
             let isDirectory = !isSymbolicLink && (resourceValues?.isDirectory ?? false)
 
-            if (isDirectory || isSymbolicLink) && skippedDirectoryNames.contains(name) {
+            // (watcher-scan-skip-parity) The owned hidden predicate, replacing `.skipsHiddenFiles`
+            // (dot ∪ `UF_HIDDEN`). The dot term is deliberate **belt**: it makes "dot ⟹ skipped" true
+            // by construction, on any volume, which is what lets the gate keep a static dot rule that
+            // matches this scanner unconditionally rather than by a volume-behavior assumption. A
+            // non-dot entry whose `resourceValues` failed reads as not hidden and is therefore kept —
+            // a deliberate tree-fidelity change vs Foundation in that rare failure case, favoring
+            // showing an entry over silently hiding it.
+            let hidden = (resourceValues?.isHidden ?? false) || name.hasPrefix(".")
+
+            if hidden || ((isDirectory || isSymbolicLink) && skippedDirectoryNames.contains(name)) {
+                if !name.hasPrefix(".") { skippedNames.insert(name) }
                 continue
             }
 
             if isDirectory {
-                nodes.append(FileNode(url: standardizedEntry, name: name, isDirectory: true, children: scanChildren(of: standardizedEntry, cancellation: cancellation)))
+                let childRelativePath = relativePath.isEmpty ? name : relativePath + "/" + name
+                nodes.append(FileNode(
+                    url: standardizedEntry,
+                    name: name,
+                    isDirectory: true,
+                    children: scanChildren(
+                        of: standardizedEntry,
+                        relativePath: childRelativePath,
+                        cancellation: cancellation,
+                        skippedIndex: &skippedIndex,
+                        unreadableDirs: &unreadableDirs
+                    )
+                ))
             } else {
                 nodes.append(FileNode(url: standardizedEntry, name: name, isDirectory: false, children: nil))
             }
+        }
+
+        // Only non-empty verdicts are stored: an absent key reads as "nothing non-dot was skipped
+        // here", which is exactly what an empty set would mean, and the recursion above never writes
+        // this directory's own key (child keys are strictly longer), so there is nothing to clobber.
+        if !skippedNames.isEmpty {
+            skippedIndex[relativePath] = skippedNames
         }
 
         return sorted(nodes)
@@ -173,6 +269,54 @@ struct FileNode: Identifiable, Equatable, Sendable {
         } else {
             results.append((prefix + name, self))
         }
+    }
+}
+
+/// (watcher-scan-skip-parity) What one walk decided to leave out of the tree — the durable half of a
+/// `ScanOutcome`, stored per root by `RootScanScheduler` and consulted by `TreeSkipGate` inside
+/// FSEvents bursts.
+///
+/// Lives in `FileNode.swift` rather than beside either consumer because **both** standalone harnesses
+/// need it off a different compile line: `scripts/RootScanTests` builds `FileNode.swift` +
+/// `RootScanScheduler.swift`, `scripts/TreeSkipGateTests` builds `FileNode.swift` +
+/// `TreeSkipGate.swift`. It is produced here, so it is declared here.
+///
+/// Size is negligible in practice (non-dot hidden entries and unreadable directories are rare), and
+/// it is bounded by the same walk the tree is.
+struct SkipRecord: Sendable, Equatable {
+    /// Directory relative path (`""` = the scanned root) → the names that directory's listing
+    /// skipped, **excluding** dot-prefixed names. Keys and names are relative and built from path
+    /// components, never from absolute-path arithmetic, so they are comparable against components the
+    /// gate derives from an FSEvents path without any standardized-vs-canonical rebase.
+    var skippedIndex: [String: Set<String>] = [:]
+
+    /// Relative paths (`""` = the scanned root) of directories whose listing threw — the tree shows
+    /// them empty, so nothing beneath them can be surfaced by a rescan until they become readable
+    /// again.
+    ///
+    /// Recorded for **observability** and for the per-root scan-outcome reporting a later item wants
+    /// (tree-node-budget); it is deliberately **not** consulted by `TreeSkipGate`. Gating on it would
+    /// be permanent: a probe (2026-08-11) established that a TCC grant fires no filesystem event at
+    /// all, and that writing inside a directory never delivers that directory's own path — so no
+    /// event can announce that an unreadable directory became readable, and an entry here would turn
+    /// its whole subtree (worst case the key `""`, a denied root) into an auto-refresh black hole
+    /// that never reopens. Events under an unreadable subtree therefore keep driving damped rescans,
+    /// which is what makes recovery automatic. See `TreeSkipGate.isSkipped(belowRootComponents:record:)`.
+    var unreadableDirs: Set<String> = []
+}
+
+/// (watcher-scan-skip-parity) One walk's full result: the tree plus the verdicts that produced it.
+/// `Sendable` for the same reason `FileNode` is — the walk runs on `RootScanScheduler.scanQueue` and
+/// this value is handed back to the main actor whole.
+struct ScanOutcome: Sendable {
+    var node: FileNode
+    var skippedIndex: [String: Set<String>]
+    var unreadableDirs: Set<String>
+
+    /// The durable half, for the scheduler to store per root. A plain regrouping of the two fields
+    /// above — no recomputation, no second walk.
+    var skipRecord: SkipRecord {
+        SkipRecord(skippedIndex: skippedIndex, unreadableDirs: unreadableDirs)
     }
 }
 

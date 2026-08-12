@@ -591,8 +591,9 @@ final class WorkspaceModel: ObservableObject {
     /// Filter the batch first:
     /// - drop the open file's own path (its content is handled by the Tier 1 vnode watcher and it
     ///   changes no tree *structure*);
-    /// - drop any path inside the scanner skip-set (dotfiles/hidden — covering `.git`/`.build` — and
-    ///   `FileNode.skippedDirectoryNames`), so a rescan would not surface it anyway.
+    /// - drop any path the scanner would not surface anyway — `TreeSkipGate`, driven per path by
+    ///   `isSkippedTreePath` below: dot components, skip-named intermediates, and (since
+    ///   (watcher-scan-skip-parity)) the containing root's own recorded scan verdicts.
     /// Only if a path survives is a rescan worth doing; `refreshAll` then republishes only on a real
     /// structural diff.
     private func handleTreeChange(_ paths: [String]) {
@@ -604,9 +605,28 @@ final class WorkspaceModel: ObservableObject {
         // the roots and the open-file path (a handful) need `realpath(3)`; the FSEvents batch is
         // already canonical, so we do NOT syscall over every changed path — that would pay realpath
         // cost on thousands of paths (npm install, git checkout) the skip gate then discards.
+        //
+        // (watcher-scan-skip-parity) Built as **pairs**, once per batch: the skip gate needs both
+        // halves of each root — the canonical path to test containment and derive below-root
+        // components against, and that root's recorded scan verdicts. A bare `[String]` of canonical
+        // paths, as this was before, destroys that association irrecoverably.
+        //
+        // The record is **resolved here**, once per root per batch, not per path: `TreeSkipGate`'s
+        // statics-first allocation invariant covers only what happens *inside* the gate, and a
+        // `scanScheduler.scans[…]?.skipRecord` written as its argument would be evaluated before the
+        // statics ran — a `URL`-keyed dictionary lookup (hashing a URL) plus a `SkipRecord` copy for
+        // every `.git` write in the burst, i.e. exactly the per-path cost the gate's rule ordering
+        // exists to avoid. Resolving it up front is also free of staleness: this runs on the main
+        // actor in one synchronous turn and `scans` is main-actor state, so no landing can interleave
+        // between the snapshot and its uses.
         let openURL = openFile?.url
         let openFilePath = openURL.map { canonicalPath($0.resolvingSymlinksInPath().path) }
-        let rootPaths = roots.map { canonicalPath($0.url.resolvingSymlinksInPath().path) }
+        let rootPairs = roots.map {
+            (
+                canonicalPath: canonicalPath($0.url.resolvingSymlinksInPath().path),
+                skipRecord: scanScheduler.scans[$0.url]?.skipRecord
+            )
+        }
         let changedPaths = paths
 
         // (Fix 1) Recreate-after-delete recovery. An external `rm` of the open file drives the vnode
@@ -621,7 +641,7 @@ final class WorkspaceModel: ObservableObject {
         // (SPEC §11), left as-is here rather than crashing. The `isActive == false` guard prevents
         // double-arming an already-active watcher.
         if let openURL, let openFilePath, !fileWatcher.isActive,
-           rootPaths.contains(where: { FileNode.path(openFilePath, isContainedIn: $0) }),
+           rootPairs.contains(where: { FileNode.path(openFilePath, isContainedIn: $0.canonicalPath) }),
            changedPaths.contains(openFilePath) {
             fileWatcher.watch(openURL.resolvingSymlinksInPath())
             fileDidChangeOnDisk()
@@ -635,48 +655,69 @@ final class WorkspaceModel: ObservableObject {
             // rescan of every root. Scoped to the open file's own temp so genuine external atomic
             // saves of other files still trigger a rescan.
             if let openFilePath, isOwnAtomicWriteTemp(path, openFilePath: openFilePath) { return false }
-            return !isSkippedTreePath(path, rootPaths: rootPaths)
+            return !isSkippedTreePath(path, rootPairs: rootPairs)
         }
         guard hasSurvivor else { return }
 
         refreshAll()
     }
 
-    /// Whether a rescan would ignore `path` — an **approximation** of `FileNode`'s scan skip rules.
-    /// A path outside every watched root is skipped (nothing a rescan touches); otherwise only the
-    /// components **below** the longest containing root are tested (so a root that itself lives
-    /// under a hidden ancestor — or under another, broader root — is not wrongly filtered out),
-    /// skipping any hidden (`.`-prefixed) component — covering `.git`, `.build`, and dotfiles —
-    /// or any name in `FileNode.skippedDirectoryNames`.
+    /// Whether a rescan would ignore `path`. A path outside every watched root is skipped (nothing a
+    /// rescan touches); otherwise the components **below** the longest containing root are handed to
+    /// `TreeSkipGate` together with that root's recorded scan verdicts.
     ///
-    /// **Known divergence, measured not suspected (async-root-scan, filed as
-    /// (watcher-scan-skip-parity)).** `FileNode.scanChildren` passes `.skipsHiddenFiles`, which also
-    /// excludes entries carrying the `UF_HIDDEN` flag with no dot in their name — `~/Library` is
-    /// exactly that. This predicate tests the dot prefix only, so under a `$HOME` root every
-    /// `~/Library/**` write survives this gate and drives a full rescan that can never surface
-    /// anything. Closing it exactly would need a per-path `stat`, which `handleTreeChange`'s
-    /// no-syscall-per-changed-path constraint forbids; until that item lands, what bounds the cost
-    /// is `RootScanScheduler`'s damping (see its `minRescanGap`), not this gate.
-    private func isSkippedTreePath(_ path: String, rootPaths: [String]) -> Bool {
+    /// **Parity with the scanner (watcher-scan-skip-parity).** This used to re-implement
+    /// `FileNode`'s skip rules as a dot-prefix test plus `FileNode.skippedDirectoryNames`, and the
+    /// two drifted in three measured ways: a `UF_HIDDEN` non-dot directory (`~/Library` under a
+    /// `$HOME` root) passed this gate although the scanner dropped it, driving damped full rescans
+    /// that could never surface anything; a plain **file** named `node_modules` was dropped here
+    /// although the scanner keeps it, so a genuine change to it never auto-refreshed; and a
+    /// TCC-denied directory showed empty with nothing recorded, giving the `~/Library` storm shape a
+    /// second source. Parity is now **structural**: the scanner owns one skip predicate, records what
+    /// it decided (`SkipRecord`, on `RootScan.skipRecord`), and this gate asks rather than re-derives.
+    /// The no-syscall-per-changed-path constraint is untouched — the record is built where the
+    /// syscalls already happen.
+    ///
+    /// What remains conservative, deliberately, is the **final** component: the gate never drops an
+    /// event that names an entry directly, because that event is what un-sticks a stale record (see
+    /// `TreeSkipGate.isSkipped(belowRootComponents:record:)` for the full argument and the residual).
+    ///
+    /// Not assertion-pinned: this function (AppKit in the file), only review-traced. The gate itself
+    /// and its component derivation are pinned by `scripts/TreeSkipGateTests`.
+    private func isSkippedTreePath(_ path: String, rootPairs: [(canonicalPath: String, skipRecord: SkipRecord?)]) -> Bool {
         // The LONGEST containing root wins (root-slash-prefix-match review): roots can nest — and a
         // "/" root contains everything — so a shorter ancestor root must not shadow a more specific
         // one, or the components *between* the two (say, a dot-directory the specific root
-        // deliberately lives under) would be tested here and wrongly skip the event. Longest-match
-        // is equivalent to "skipped only if skipped under every containing root": the longest
-        // root's relative components are a suffix of every other containing root's, so whenever any
-        // containing root reads the path as clean, the longest one does too.
-        let containingRoots = rootPaths.filter { FileNode.path(path, isContainedIn: $0) }
-        guard let root = containingRoots.max(by: { $0.count < $1.count }) else {
+        // deliberately lives under) would be tested here and wrongly skip the event.
+        //
+        // For the two **static** rules that argument was an exact equivalence: longest-match is the
+        // same as "skipped only if skipped under every containing root", because the longest root's
+        // relative components are a suffix of every other containing root's, so a static skip seen
+        // from the longest root is seen from every other one too, and vice versa.
+        //
+        // With per-root **records** it is no longer an equivalence, and the direction is worth
+        // stating: longest-match can skip where the every-root reading would rescan (the longest
+        // root's record names the entry, a shorter root's record is absent or older), never the
+        // reverse. That is the harmless direction, because a record's verdicts are properties of the
+        // *entry* — its hidden flag, its name, its readability — not of the root it was reached
+        // from, so with fresh records every containing root agrees and the two readings coincide.
+        // They diverge only when a shorter root's record is stale or has not landed, and then the
+        // extra events longest-match drops are ones that root's own rescan would not have surfaced
+        // either; what remains is exactly the staleness residual `TreeSkipGate.isSkipped` already
+        // records (un-stuck by an event naming the entry itself, by Refresh, or by relaunch).
+        let containingRoots = rootPairs.filter { FileNode.path(path, isContainedIn: $0.canonicalPath) }
+        guard let root = containingRoots.max(by: { $0.canonicalPath.count < $1.canonicalPath.count }) else {
             return true
         }
-        // `dropFirst(root.count)` leaves a leading "/" that `split` discards — except under a "/"
-        // root, where it leaves no leading slash; both shapes split into the same components.
-        let relativeComponents = path.dropFirst(root.count).split(separator: "/")
-        for component in relativeComponents {
-            if component.hasPrefix(".") { return true }
-            if FileNode.skippedDirectoryNames.contains(String(component)) { return true }
-        }
-        return false
+        // The record travels in the pair, resolved once per batch by `handleTreeChange` — both
+        // because `scans` is keyed by the root's standardized URL rather than the canonical path the
+        // containment test needs, and because looking it up here would run per changed path, ahead
+        // of the gate's own statics-first rules. `nil` (no walk has landed yet) leaves those two
+        // static rules standing, exactly as this function behaved before the record existed.
+        return TreeSkipGate.isSkipped(
+            belowRootComponents: TreeSkipGate.belowRootComponents(of: path, root: root.canonicalPath),
+            record: root.skipRecord
+        )
     }
 
     /// (external-change-watch, Fix 2) Whether `path` is FEdit's own `Data.write(options: .atomic)`

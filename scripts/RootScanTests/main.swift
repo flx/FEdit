@@ -21,8 +21,8 @@
 //
 //  Standalone assertion harness for `RootScanScheduler` — the per-root scan state machine
 //  (root-scan-consolidation): coalescing gates, force-bit folding, damping arithmetic, generation
-//  discard, entry GC, and subsystem teardown. Not part of the app target — compiled and run
-//  manually:
+//  discard, entry GC, subsystem teardown, and (watcher-scan-skip-parity) the per-root skip record's
+//  plumbing. Not part of the app target — compiled and run manually:
 //
 //      swiftc FEdit/Models/FileNode.swift FEdit/Models/RootScanScheduler.swift \
 //          scripts/RootScanTests/main.swift -o /tmp/rstests && /tmp/rstests
@@ -158,6 +158,22 @@ func marker(of node: FileNode?) -> String? {
     node?.children?.first?.name
 }
 
+/// (watcher-scan-skip-parity) One walk's hand-back, the way the production launcher builds it. The
+/// default `record` is the empty one — "the walk skipped nothing" — which is what every scenario that
+/// predates the skip record wants; the record-specific scenarios pass `skipRecord(_:)` values whose
+/// contents identify *which* walk they came from.
+@MainActor
+func walk(_ node: FileNode, _ changed: Bool, _ duration: TimeInterval, record: SkipRecord = SkipRecord()) -> WalkResult {
+    WalkResult(node: node, skipRecord: record, changed: changed, duration: duration)
+}
+
+/// A skip record distinguishable by `marker`, so a scenario can tell *which* walk's verdicts were
+/// stored — the record analogue of `tree(_:_:)`.
+@MainActor
+func skipRecord(_ marker: String) -> SkipRecord {
+    SkipRecord(skippedIndex: ["": [marker]], unreadableDirs: ["denied-\(marker)"])
+}
+
 /// Wires a scheduler to `fakes` exactly the way `WorkspaceModel` wires the real one — the same two
 /// model seams, with the walk executor, timer and clock replaced by capture-only fakes. `fakes` is
 /// captured strongly (it does not own the scheduler, so no cycle is possible).
@@ -221,7 +237,7 @@ MainActor.assumeIsolated {
         check(scheduler.scans[rootURL]?.isScanning == true, "the in-flight gate is set while the walk runs")
         check(fakes.timerCount == 0, "an initial (undamped) scan arms no trailing-edge timer")
 
-        fakes.lastWalk.completion(tree(rootURL, "v1"), true, 0.5)
+        fakes.lastWalk.completion(walk(tree(rootURL, "v1"), true, 0.5))
         check(marker(of: fakes.roots.first) == "v1", "the landed tree is spliced into roots")
         check(fakes.initialScanRootURLs.isEmpty, "the first landing clears the root's \"Scanning…\" affordance")
         check(fakes.initialScanRemovals == 1, "…and it does so exactly once")
@@ -252,7 +268,7 @@ MainActor.assumeIsolated {
         // Structurally-unchanged landing: backoff doubles off the floor to 2 s, and the re-fire
         // (damped, since the coalesced request was unforced) is deferred by gate 2 rather than
         // running a second back-to-back walk.
-        fakes.lastWalk.completion(placeholder(rootURL), false, 0.1)
+        fakes.lastWalk.completion(walk(placeholder(rootURL), false, 0.1))
         check(fakes.walkCount == 1, "the coalesced re-fire is damped, not an immediate second walk")
         check(isClose(scheduler.scans[rootURL]?.backoff, 2), "an unchanged landing doubles the backoff to 2 s")
         check(fakes.timerCount == 1, "the deferred re-run arms exactly one trailing-edge timer")
@@ -278,7 +294,7 @@ MainActor.assumeIsolated {
         let scheduler = makeScheduler(fakes)
         fakes.addRoot(rootURL, to: scheduler)
         scheduler.requestScan(of: rootURL)
-        fakes.lastWalk.completion(tree(rootURL, "v1"), true, 0.2)
+        fakes.lastWalk.completion(walk(tree(rootURL, "v1"), true, 0.2))
 
         scheduler.requestScan(of: rootURL, force: true)          // explicit Refresh, undamped
         check(fakes.walkCount == 2, "an explicit Refresh is never damped (I4)")
@@ -287,12 +303,12 @@ MainActor.assumeIsolated {
         check(scheduler.scans[rootURL]?.forcedRescan == true, "the gated request's force bit is preserved")
         check(scheduler.scans[rootURL]?.rescanRequested == true, "…alongside the request bit (I14)")
 
-        fakes.lastWalk.completion(tree(rootURL, "v2"), false, 0.2)
+        fakes.lastWalk.completion(walk(tree(rootURL, "v2"), false, 0.2))
         check(fakes.walkCount == 3, "a forced re-fire skips the damping gate entirely (I11)")
         check(scheduler.scans[rootURL]?.forcedRescan == false, "the force bit is consumed by the re-fire")
         check(scheduler.scans[rootURL]?.rescanRequested == false, "…together with the request bit")
 
-        fakes.lastWalk.completion(tree(rootURL, "v3"), false, 0.2)
+        fakes.lastWalk.completion(walk(tree(rootURL, "v3"), false, 0.2))
         check(fakes.landings.last?.force == true, "the folded force bit reaches the model-side landing")
         check(marker(of: fakes.roots.first) == "v3", "a forced landing republishes even with changed == false")
         check(isClose(scheduler.scans[rootURL]?.backoff, RootScanScheduler.minRescanGap),
@@ -312,7 +328,7 @@ MainActor.assumeIsolated {
         @MainActor
         func cycle(force: Bool = false, changed: Bool, duration: TimeInterval = 0.1) {
             scheduler.requestScan(of: rootURL, force: force)
-            fakes.lastWalk.completion(changed ? tree(rootURL, UUID().uuidString) : placeholder(rootURL), changed, duration)
+            fakes.lastWalk.completion(walk(changed ? tree(rootURL, UUID().uuidString) : placeholder(rootURL), changed, duration))
         }
 
         for expected in [2.0, 4.0, 8.0, 16.0, 30.0, 30.0] {
@@ -339,7 +355,7 @@ MainActor.assumeIsolated {
         // proportional term is deliberately NOT applied — a lone genuine change on a quiet root
         // must reflect after 1 s, not after 3 × 10 s.
         scheduler.requestScan(of: rootURL)
-        fakes.lastWalk.completion(tree(rootURL, "v1"), true, 10)
+        fakes.lastWalk.completion(walk(tree(rootURL, "v1"), true, 10))
         scheduler.requestScan(of: rootURL, damped: true)
         check(fakes.walkCount == 1, "a damped request inside the gap does not walk")
         check(isClose(fakes.lastTimer.delay, 1), "at the backoff floor the gap is 1 s, not 3 × the 10 s walk")
@@ -349,7 +365,7 @@ MainActor.assumeIsolated {
         fakes.advance(1)
         fakes.lastTimer.item.perform()
         check(fakes.walkCount == 2, "the served gap releases the deferred walk")
-        fakes.lastWalk.completion(placeholder(rootURL), false, 10)
+        fakes.lastWalk.completion(walk(placeholder(rootURL), false, 10))
         scheduler.requestScan(of: rootURL, damped: true)
         check(isClose(fakes.lastTimer.delay, 30), "off the floor the gap becomes 3 × the last walk's duration")
 
@@ -377,7 +393,7 @@ MainActor.assumeIsolated {
         let scheduler = makeScheduler(fakes)
         fakes.addRoot(rootURL, to: scheduler)
         scheduler.requestScan(of: rootURL)
-        fakes.lastWalk.completion(placeholder(rootURL), false, 0.25)   // backoff → 2 s
+        fakes.lastWalk.completion(walk(placeholder(rootURL), false, 0.25))   // backoff → 2 s
 
         fakes.advance(0.5)
         scheduler.requestScan(of: rootURL, damped: true)
@@ -404,7 +420,7 @@ MainActor.assumeIsolated {
               "lastFinish is still nil while that first walk runs")
 
         // Removal wipes the clock, so the same rule applies again after a re-add.
-        fakes.lastWalk.completion(placeholder(rootURL), false, 0.1)
+        fakes.lastWalk.completion(walk(placeholder(rootURL), false, 0.1))
         check(scheduler.scans[rootURL]?.lastFinish != nil, "the landing records a clock")
         fakes.removeRoot(rootURL, from: scheduler)
         fakes.addRoot(rootURL, to: scheduler)
@@ -422,7 +438,7 @@ MainActor.assumeIsolated {
         let scheduler = makeScheduler(fakes)
         fakes.addRoot(rootURL, to: scheduler)
         scheduler.requestScan(of: rootURL)
-        fakes.lastWalk.completion(placeholder(rootURL), false, 0.1)
+        fakes.lastWalk.completion(walk(placeholder(rootURL), false, 0.1))
         scheduler.requestScan(of: rootURL, damped: true)         // arms a timer + records the request
         check(fakes.timerCount == 1, "precondition: a trailing-edge timer is armed")
 
@@ -454,7 +470,7 @@ MainActor.assumeIsolated {
         check(scheduler.scans[rootURL].map { $0.backoff == nil } == true, "…and the backoff")
 
         // The stale landing: discarded, but it still does its job-local teardown.
-        fakes.lastWalk.completion(tree(rootURL, "stale"), true, 0.3)
+        fakes.lastWalk.completion(walk(tree(rootURL, "stale"), true, 0.3))
         check(fakes.landings.isEmpty, "a landing whose generation moved never reaches the model seam")
         check(fakes.roots.isEmpty, "…so the removed root's section cannot reappear")
         check(scheduler.scans[rootURL] == nil, "the entry is collected once the walk has landed")
@@ -471,7 +487,7 @@ MainActor.assumeIsolated {
         let scheduler = makeScheduler(fakes)
         fakes.addRoot(rootURL, to: scheduler)
         scheduler.requestScan(of: rootURL)
-        fakes.lastWalk.completion(placeholder(rootURL), false, 135)  // unchanged: backoff → 2 s, clock set
+        fakes.lastWalk.completion(walk(placeholder(rootURL), false, 135))  // unchanged: backoff → 2 s, clock set
         check(isClose(scheduler.scans[rootURL]?.backoff, 2), "precondition: the backoff has left its floor")
         check(scheduler.scans[rootURL]?.lastFinish != nil, "precondition: the damping clock is set")
         check(isClose(scheduler.scans[rootURL]?.lastDuration, 135), "precondition: an expensive walk is recorded")
@@ -493,7 +509,7 @@ MainActor.assumeIsolated {
         // The stale walk lands: discarded (generation moved), so it records no damping state of its
         // own, and the I12 drain re-fires the recorded request with `damped: true`.
         let landingsBefore = fakes.landings.count      // the first walk's landing is legitimately in the log
-        fakes.lastWalk.completion(tree(rootURL, "stale"), true, 135)
+        fakes.lastWalk.completion(walk(tree(rootURL, "stale"), true, 135))
         check(fakes.landings.count == landingsBefore, "the stale tree is discarded — generation moved")
         check(fakes.walkCount == 3, "the damped re-fire LAUNCHES IMMEDIATELY — the wiped clock means gate 2 cannot engage")
         check(fakes.timerCount == 0, "…and arms no trailing-edge timer at all")
@@ -508,13 +524,13 @@ MainActor.assumeIsolated {
         let scheduler = makeScheduler(fakes)
         fakes.addRoot(rootURL, to: scheduler)
         scheduler.requestScan(of: rootURL)
-        fakes.lastWalk.completion(placeholder(rootURL), false, 135)  // unchanged: backoff → 2 s, clock set
+        fakes.lastWalk.completion(walk(placeholder(rootURL), false, 135))  // unchanged: backoff → 2 s, clock set
 
         scheduler.requestScan(of: rootURL)                          // walk 2, left in flight
         scheduler.requestScan(of: rootURL, damped: true)            // gated behind it
         check(fakes.walkCount == 2, "precondition: the rescan is gated by the in-flight walk")
 
-        fakes.lastWalk.completion(placeholder(rootURL), false, 135)  // lands normally: backoff → 4 s, clock re-set
+        fakes.lastWalk.completion(walk(placeholder(rootURL), false, 135))  // lands normally: backoff → 4 s, clock re-set
         check(fakes.walkCount == 2, "with the clock intact the drain's re-fire does not walk")
         check(fakes.timerCount == 1, "…it arms a trailing-edge timer instead")
         check(isClose(fakes.lastTimer.delay, 405), "…for 3 × the 135 s walk, the proportional term")
@@ -538,16 +554,106 @@ MainActor.assumeIsolated {
         check(scheduler.scans[rootURL]?.rescanRequested == true, "…and recorded as the pending request")
         check(scheduler.scans[rootURL]?.generation == 3, "add + remove + add leaves generation 3")
 
-        fakes.lastWalk.completion(tree(rootURL, "stale"), true, 0.4)
+        fakes.lastWalk.completion(walk(tree(rootURL, "stale"), true, 0.4))
         check(fakes.landings.isEmpty, "the stale (partial) tree is discarded — generation moved")
         check(fakes.walkCount == 2, "the drain re-fires the re-added root's own scan unconditionally (I12)")
         check(fakes.timerCount == 0,
               "…undamped: the root has no recorded lastFinish — its only walk never landed — so gate 2 never engages (I13)")
         check(fakes.initialScanRootURLs.contains(rootURL), "the placeholder still shows \"Scanning…\" meanwhile")
 
-        fakes.lastWalk.completion(tree(rootURL, "fresh"), true, 0.4)
+        fakes.lastWalk.completion(walk(tree(rootURL, "fresh"), true, 0.4))
         check(marker(of: fakes.roots.first) == "fresh", "the fresh walk's tree lands under the fresh placeholder")
         check(!fakes.initialScanRootURLs.contains(rootURL), "…and \"Scanning…\" finally clears (the I12 defect)")
+    }
+
+    // MARK: - Skip record (watcher-scan-skip-parity)
+
+    section("Skip record: absent until a landing applies, then it is the landed walk's own")
+    do {
+        let fakes = Fakes()
+        let scheduler = makeScheduler(fakes)
+        fakes.addRoot(rootURL, to: scheduler)
+        // `.map` rather than `?.skipRecord == nil`: the latter also passes when the whole entry is
+        // gone, which would make "no verdicts yet" vacuously true.
+        check(scheduler.scans[rootURL].map { $0.skipRecord == nil } == true,
+              "a freshly added root has no skip record — absence means \"no walk has delivered verdicts\"")
+
+        scheduler.requestScan(of: rootURL)
+        check(scheduler.scans[rootURL].map { $0.skipRecord == nil } == true,
+              "…and still none while its first walk is in flight")
+
+        fakes.lastWalk.completion(walk(tree(rootURL, "v1"), true, 0.5, record: skipRecord("v1")))
+        check(scheduler.scans[rootURL]?.skipRecord == skipRecord("v1"),
+              "an applied landing stores that walk's record verbatim, got \(String(describing: scheduler.scans[rootURL]?.skipRecord))")
+    }
+
+    section("Skip record: a structurally-unchanged landing still refreshes it (no publish, fresher verdicts)")
+    do {
+        let fakes = Fakes()
+        let scheduler = makeScheduler(fakes)
+        fakes.addRoot(rootURL, to: scheduler)
+        scheduler.requestScan(of: rootURL)
+        fakes.lastWalk.completion(walk(tree(rootURL, "v1"), true, 0.5, record: skipRecord("v1")))
+
+        // Unchanged AND unforced: `land` reports the root is present (applied) but splices nothing.
+        // The verdicts are nonetheless newer than v1's, so they must replace them.
+        scheduler.requestScan(of: rootURL)
+        fakes.lastWalk.completion(walk(tree(rootURL, "v2"), false, 0.5, record: skipRecord("v2")))
+        check(marker(of: fakes.roots.first) == "v1", "precondition: the unchanged landing published nothing")
+        check(scheduler.scans[rootURL]?.skipRecord == skipRecord("v2"),
+              "…yet the skip record advanced to that landing's own, got \(String(describing: scheduler.scans[rootURL]?.skipRecord))")
+    }
+
+    section("Skip record: drained by removal, and a superseded walk's partial record is discarded")
+    do {
+        let fakes = Fakes()
+        let scheduler = makeScheduler(fakes)
+        fakes.addRoot(rootURL, to: scheduler)
+        scheduler.requestScan(of: rootURL)                      // walk 1, generation 1
+        fakes.lastWalk.completion(walk(tree(rootURL, "settled"), true, 0.4, record: skipRecord("settled")))
+        check(scheduler.scans[rootURL]?.skipRecord == skipRecord("settled"), "precondition: a record is stored")
+
+        scheduler.requestScan(of: rootURL)                      // walk 2, left in flight at generation 1
+        check(fakes.walkCount == 2, "precondition: a second walk is in flight")
+
+        fakes.removeRoot(rootURL, from: scheduler)              // generation 2, walk 2 cancelled
+        check(scheduler.scans[rootURL] != nil, "the entry survives the removal — a walk is still in flight")
+        check(scheduler.scans[rootURL].map { $0.skipRecord == nil } == true,
+              "…but the removal drained the skip record with the rest of the per-root state")
+
+        fakes.addRoot(rootURL, to: scheduler)                   // generation 3, fresh placeholder
+        scheduler.requestScan(of: rootURL)                      // gated behind walk 2 still unwinding
+
+        // Walk 2 unwinds: cancelled, so its tree AND its record are partial, and its generation moved.
+        // Neither may land — if `applyScan` stored the record outside the applied branch, the gate
+        // would then be consulting a half-built index for a freshly re-added root.
+        fakes.lastWalk.completion(walk(tree(rootURL, "partial"), true, 0.4, record: skipRecord("partial")))
+        check(fakes.landings.count == 1, "precondition: the superseded landing never reached the model seam")
+        check(scheduler.scans[rootURL].map { $0.skipRecord == nil } == true,
+              "the superseded walk's partial record is discarded, not stored, got \(String(describing: scheduler.scans[rootURL]?.skipRecord))")
+
+        // The control: the re-added root's own walk lands normally and its record does take.
+        fakes.lastWalk.completion(walk(tree(rootURL, "fresh"), true, 0.4, record: skipRecord("fresh")))
+        check(scheduler.scans[rootURL]?.skipRecord == skipRecord("fresh"),
+              "…while the fresh walk's record lands normally")
+    }
+
+    section("Skip record: an idle removed root's record goes with its collected entry")
+    do {
+        let fakes = Fakes()
+        let scheduler = makeScheduler(fakes)
+        fakes.addRoot(rootURL, to: scheduler)
+        scheduler.requestScan(of: rootURL)
+        fakes.lastWalk.completion(walk(tree(rootURL, "v1"), true, 0.4, record: skipRecord("v1")))
+        check(scheduler.scans[rootURL]?.skipRecord != nil, "precondition: a record is stored")
+
+        fakes.removeRoot(rootURL, from: scheduler)
+        check(scheduler.scans[rootURL] == nil, "the idle removed root's entry — record included — is collected outright")
+
+        // A re-add starts from no verdicts at all, so the gate cannot decide against a dead tree.
+        fakes.addRoot(rootURL, to: scheduler)
+        check(scheduler.scans[rootURL].map { $0.skipRecord == nil } == true,
+              "a re-added root starts with no skip record")
     }
 
     // MARK: - Entry GC
@@ -560,7 +666,7 @@ MainActor.assumeIsolated {
         fakes.addRoot(otherURL, to: scheduler)
         scheduler.requestScan(of: rootURL)
         scheduler.requestScan(of: otherURL)
-        fakes.lastWalk.completion(tree(otherURL, "beta"), true, 0.1)
+        fakes.lastWalk.completion(walk(tree(otherURL, "beta"), true, 0.1))
 
         check(scheduler.scans.count == 2, "both roots have entries while they are present")
         fakes.removeRoot(otherURL, from: scheduler)
@@ -568,7 +674,7 @@ MainActor.assumeIsolated {
         check(scheduler.scans[rootURL] != nil, "the other root's entry is untouched")
         check(scheduler.scans[rootURL]?.isScanning == true, "…and still holds its in-flight gate")
 
-        fakes.walks[0].completion(tree(rootURL, "alpha"), true, 0.1)
+        fakes.walks[0].completion(walk(tree(rootURL, "alpha"), true, 0.1))
         check(scheduler.scans[rootURL] != nil, "a *present* root's entry is never collected")
         check(scheduler.scans[rootURL]?.lastFinish != nil, "…so its damping clock survives its landing")
 
@@ -586,7 +692,7 @@ MainActor.assumeIsolated {
         let scheduler = makeScheduler(fakes)
         fakes.addRoot(rootURL, to: scheduler)
         scheduler.requestScan(of: rootURL)
-        fakes.lastWalk.completion(placeholder(rootURL), false, 0.1)   // clock set, backoff 2 s
+        fakes.lastWalk.completion(walk(placeholder(rootURL), false, 0.1))   // clock set, backoff 2 s
 
         scheduler.requestScan(of: rootURL, damped: true)
         let timer = fakes.lastTimer.item
@@ -601,7 +707,7 @@ MainActor.assumeIsolated {
         check(scheduler.scans[rootURL].map { $0.pendingDampedRescan == nil } == true, "…and leaves no phantom armed slot")
 
         // The armed slot being genuinely clear is what lets the next damped request arm at all.
-        fakes.lastWalk.completion(placeholder(rootURL), false, 0.1)
+        fakes.lastWalk.completion(walk(placeholder(rootURL), false, 0.1))
         scheduler.requestScan(of: rootURL, damped: true)
         check(fakes.timerCount == 2, "a later damped request can still arm its trailing-edge timer")
     }
@@ -612,7 +718,7 @@ MainActor.assumeIsolated {
         let scheduler = makeScheduler(fakes)
         fakes.addRoot(rootURL, to: scheduler)
         scheduler.requestScan(of: rootURL)
-        fakes.lastWalk.completion(placeholder(rootURL), false, 0.1)
+        fakes.lastWalk.completion(walk(placeholder(rootURL), false, 0.1))
 
         scheduler.requestScan(of: rootURL, damped: true)
         let stale = fakes.lastTimer.item
@@ -623,7 +729,7 @@ MainActor.assumeIsolated {
 
         // A cancelled item can never clear a *successor's* slot: that is what makes the armed-slot
         // bookkeeping single-owner even though it is not identity-compared.
-        fakes.lastWalk.completion(placeholder(rootURL), false, 0.1)
+        fakes.lastWalk.completion(walk(placeholder(rootURL), false, 0.1))
         scheduler.requestScan(of: rootURL, damped: true)
         let live = fakes.lastTimer.item
         stale.perform()
@@ -661,7 +767,7 @@ MainActor.assumeIsolated {
 
         // The landing closure the (now dead) scheduler handed to the walk holds it weakly, so a walk
         // that unwinds after teardown is a no-op rather than a resurrection or a crash.
-        fakes.walks[0].completion(tree(rootURL, "after-teardown"), true, 0.1)
+        fakes.walks[0].completion(walk(tree(rootURL, "after-teardown"), true, 0.1))
         check(fakes.landings.isEmpty, "a walk landing after teardown reaches no model seam")
         check(marker(of: fakes.roots.first) == nil, "…and splices nothing into roots")
     }

@@ -88,6 +88,34 @@ final class WorkspaceModel: ObservableObject {
     /// `removeRoot`.
     @Published private(set) var initialScanRootURLs: Set<URL> = []
 
+    /// (tree-node-budget) Roots whose last applied walk hit the per-root node budget
+    /// (`FileNode.defaultNodeBudget`), i.e. whose tree is **incomplete in its deep interior** — the
+    /// walk is breadth-first, so every shallow level is whole and what is missing is depth. The
+    /// sidebar declares this per root in both modes (SPEC §5.2, §5.4, §11); silent truncation was
+    /// rejected outright.
+    ///
+    /// Model-side `@Published` state, deliberately, and **not** a read of the scheduler's
+    /// `RootScan.lastReport`: `scans` is invisible to the UI by design (nothing in it publishes), so
+    /// a flag stored only there could never invalidate the notice. Written at exactly two sites,
+    /// mirroring `initialScanRootURLs`' discipline: the scheduler's landing seam below (membership-
+    /// guarded, and **outside** the splice branch — see there for why that is the whole point) and
+    /// `removeRoot`. The notice's node count is read lazily from `lastReport` through
+    /// `truncatedNodeCount(for:)`, which is sound because the landing writes it in the same
+    /// `applyScan` turn as this flag, before any render.
+    @Published private(set) var truncatedRootURLs: Set<URL> = []
+
+    /// (tree-node-budget) How many nodes `url`'s last applied walk actually built — the number the
+    /// sidebar's truncation notice interpolates, so nothing hardcodes the budget constant outside
+    /// `FileNode.defaultNodeBudget`. Carried from the walk that measured it (never a recount of the
+    /// delivered tree, which would be an O(N) main-thread pass per render).
+    ///
+    /// `nil` means no walk of this root has landed — unreachable while `truncatedRootURLs` contains
+    /// `url`, since the landing that inserts it stores the report in the same synchronous turn, but
+    /// modeled honestly rather than papered over with a fabricated count.
+    func truncatedNodeCount(for url: URL) -> Int? {
+        scanScheduler.scans[url]?.lastReport?.nodeCount
+    }
+
     /// Record-only until requestOpen. Writing this property has **zero side effects at the model
     /// layer** — no `didSet` — by design: the selection→load hook used to live in ContentView's
     /// `.onChange(of:)` (editor-core); it is now `requestOpen`, called directly from the sidebar
@@ -250,9 +278,12 @@ final class WorkspaceModel: ObservableObject {
         currentNode: { [unowned self] url in
             roots.first { $0.url == url }
         },
-        land: { [unowned self] url, scanned, changed, force in
+        land: { [unowned self] url, scanned, changed, force, report in
             // The generation check is the scheduler's; this seam answers the other half of the old
             // apply block's condition — is the root still in `roots`? — and performs the splice.
+            // Everything below it is therefore scoped to a root that still has a section: nothing
+            // here may publish state for a root the sidebar cannot show, because only `removeRoot`
+            // drains such state and it has already run.
             guard let index = roots.firstIndex(where: { $0.url == url }) else { return false }
             if force || changed {
                 roots[index] = scanned
@@ -275,6 +306,21 @@ final class WorkspaceModel: ObservableObject {
             // would fire `objectWillChange` (and re-render the sidebar) on every damped no-op walk.
             if initialScanRootURLs.contains(url) {
                 initialScanRootURLs.remove(url)
+            }
+            // (tree-node-budget) The truncation flag, updated **outside** the splice branch above —
+            // that placement is the whole point, not an oversight. The flag can flip while
+            // `changed == false`: a tree sitting exactly at the budget boundary gains a file and
+            // loses a node's worth of depth, so the walk refuses something it previously fitted while
+            // the *spliced* tree compares equal — and a splice-branch-only update would leave the
+            // notice stale (or never show it at all). Membership-guarded for the same reason the
+            // `initialScanRootURLs` line above is: this is an `@Published` set, so an unguarded write
+            // would fire `objectWillChange` and re-render the sidebar on every damped no-op walk.
+            if report.truncated != truncatedRootURLs.contains(url) {
+                if report.truncated {
+                    truncatedRootURLs.insert(url)
+                } else {
+                    truncatedRootURLs.remove(url)
+                }
             }
             // (git-changed-badge) No refresh here by design: every path that can *trigger* a walk
             // (`addFolders`, `refreshAll`, `removeRoot`, `createFile`) schedules one at trigger time,
@@ -463,6 +509,10 @@ final class WorkspaceModel: ObservableObject {
         // the fresh walk lands, if the entry survived). Same `invalidate` the splice branch calls —
         // one operation, deliberately not two names for the same whole-entry drop.
         filterRowCache.invalidate(root.url)
+        // (tree-node-budget) The fourth: a removed root owes no truncation notice, and a re-add must
+        // not inherit the previous incarnation's flag while its own first walk runs. The scheduler's
+        // `noteRootRemoved` above dropped the report whose node count that notice interpolates.
+        truncatedRootURLs.remove(root.url)
 
         // (external-change-watch, Tier 3) Re-point the watcher at the reduced root set so the
         // removed root is no longer watched (an empty set tears the stream down entirely).

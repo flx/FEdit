@@ -21,8 +21,9 @@
 //
 //  Standalone assertion harness for `RootScanScheduler` — the per-root scan state machine
 //  (root-scan-consolidation): coalescing gates, force-bit folding, damping arithmetic, generation
-//  discard, entry GC, subsystem teardown, and (watcher-scan-skip-parity) the per-root skip record's
-//  plumbing. Not part of the app target — compiled and run manually:
+//  discard, entry GC, subsystem teardown, (watcher-scan-skip-parity) the per-root skip record's
+//  plumbing, and (tree-node-budget) the per-root budget report's — including what the model-side
+//  landing seam is handed and when. Not part of the app target — compiled and run manually:
 //
 //      swiftc FEdit/Models/FileNode.swift FEdit/Models/RootScanScheduler.swift \
 //          scripts/RootScanTests/main.swift -o /tmp/rstests && /tmp/rstests
@@ -85,6 +86,9 @@ struct LandingRecord {
     let node: FileNode
     let changed: Bool
     let force: Bool
+    /// (tree-node-budget) The budget report the seam was handed — recorded so a scenario can assert
+    /// it arrived **verbatim**, on every landing and not only on the ones that splice.
+    let report: TreeBudgetReport
     let applied: Bool
 }
 
@@ -99,6 +103,16 @@ final class Fakes {
     /// Counts `initialScanRootURLs` removals that actually fired, so the membership guard (I10 — no
     /// spurious publish on a damped no-op landing) is observable.
     var initialScanRemovals = 0
+
+    /// (tree-node-budget) The fake's copy of `WorkspaceModel.truncatedRootURLs` — the `@Published`
+    /// set that drives the sidebar's per-root truncation notice — maintained by the `land` closure
+    /// below with the **same membership guard** the model uses.
+    var truncatedRootURLs: Set<URL> = []
+    /// Mutations of that set that actually fired. A landing that leaves the flag where it already
+    /// was must not touch it: on the model this set is `@Published`, so an unguarded write would
+    /// re-render the whole sidebar on every damped no-op walk. Counting is what makes the guard
+    /// observable rather than merely present.
+    var truncatedPublishes = 0
 
     var walks: [PendingWalk] = []
     var timers: [ArmedTimer] = []
@@ -127,6 +141,9 @@ final class Fakes {
         roots.removeAll { $0.url == url }
         scheduler.noteRootRemoved(url)
         initialScanRootURLs.remove(url)
+        // (tree-node-budget) Drained with its siblings, exactly as `WorkspaceModel.removeRoot` does:
+        // a removed root owes no notice, and a re-add must not inherit the old incarnation's flag.
+        truncatedRootURLs.remove(url)
     }
 
     var walkCount: Int { walks.count }
@@ -158,13 +175,35 @@ func marker(of node: FileNode?) -> String? {
     node?.children?.first?.name
 }
 
+/// (tree-node-budget) A walk that fitted inside its budget: the default for every scenario that
+/// predates the budget. Declared before its use as a default argument — top-level bindings in
+/// `main.swift` initialize in source order.
+let untruncated = TreeBudgetReport(nodeCount: 0, truncated: false)
+
+/// (tree-node-budget) A report distinguishable by its node count, so a scenario can tell *which*
+/// walk's report was stored or delivered — the budget analogue of `tree(_:_:)`/`skipRecord(_:)`.
+func budgetReport(_ nodeCount: Int, truncated: Bool = true) -> TreeBudgetReport {
+    TreeBudgetReport(nodeCount: nodeCount, truncated: truncated)
+}
+
 /// (watcher-scan-skip-parity) One walk's hand-back, the way the production launcher builds it. The
 /// default `record` is the empty one — "the walk skipped nothing" — which is what every scenario that
 /// predates the skip record wants; the record-specific scenarios pass `skipRecord(_:)` values whose
 /// contents identify *which* walk they came from.
+///
+/// (tree-node-budget) `report` defaults to `untruncated`, the shape of every walk that fitted inside
+/// its budget; the budget scenarios pass their own. Its `nodeCount` is deliberately not derived from
+/// `node` — the scheduler carries the walk's own measurement and never recounts a tree, and a fake
+/// that recounted would hide it if the scheduler started to.
 @MainActor
-func walk(_ node: FileNode, _ changed: Bool, _ duration: TimeInterval, record: SkipRecord = SkipRecord()) -> WalkResult {
-    WalkResult(node: node, skipRecord: record, changed: changed, duration: duration)
+func walk(
+    _ node: FileNode,
+    _ changed: Bool,
+    _ duration: TimeInterval,
+    record: SkipRecord = SkipRecord(),
+    report: TreeBudgetReport = untruncated
+) -> WalkResult {
+    WalkResult(node: node, skipRecord: record, changed: changed, duration: duration, budgetReport: report)
 }
 
 /// A skip record distinguishable by `marker`, so a scenario can tell *which* walk's verdicts were
@@ -181,9 +220,9 @@ func skipRecord(_ marker: String) -> SkipRecord {
 func makeScheduler(_ fakes: Fakes) -> RootScanScheduler {
     RootScanScheduler(
         currentNode: { url in fakes.roots.first { $0.url == url } },
-        land: { url, scanned, changed, force in
+        land: { url, scanned, changed, force, report in
             guard let index = fakes.roots.firstIndex(where: { $0.url == url }) else {
-                fakes.landings.append(LandingRecord(url: url, node: scanned, changed: changed, force: force, applied: false))
+                fakes.landings.append(LandingRecord(url: url, node: scanned, changed: changed, force: force, report: report, applied: false))
                 return false
             }
             if force || changed {
@@ -193,7 +232,21 @@ func makeScheduler(_ fakes: Fakes) -> RootScanScheduler {
                 fakes.initialScanRootURLs.remove(url)
                 fakes.initialScanRemovals += 1
             }
-            fakes.landings.append(LandingRecord(url: url, node: scanned, changed: changed, force: force, applied: true))
+            // (tree-node-budget) The truncation flag, updated **outside** the splice branch above and
+            // membership-guarded — the same shape as `WorkspaceModel`'s seam, which is the code this
+            // mirror exists to pin the contract of. Outside, because the flag can flip on a landing
+            // that splices nothing (a tree sitting exactly at the budget boundary); guarded, because
+            // the real set is `@Published` and an unguarded write would re-render the sidebar on
+            // every damped no-op walk.
+            if report.truncated != fakes.truncatedRootURLs.contains(url) {
+                if report.truncated {
+                    fakes.truncatedRootURLs.insert(url)
+                } else {
+                    fakes.truncatedRootURLs.remove(url)
+                }
+                fakes.truncatedPublishes += 1
+            }
+            fakes.landings.append(LandingRecord(url: url, node: scanned, changed: changed, force: force, report: report, applied: true))
             return true
         },
         launchWalk: { url, old, token, completion in
@@ -656,6 +709,142 @@ MainActor.assumeIsolated {
               "a re-added root starts with no skip record")
     }
 
+    // MARK: - Budget report (tree-node-budget)
+    //
+    // Two things are under test here, and they are deliberately separate: the scheduler's own
+    // `RootScan.lastReport` (observability plus the notice's node count, stored on exactly the
+    // applied branch), and the **model-side** flag the notice actually renders from — which this
+    // harness can only reach through the `land` seam. `Fakes` maintains its own
+    // `truncatedRootURLs` with the same membership guard `WorkspaceModel` uses, so what these
+    // scenarios pin is the seam's *contract*: what `land` is handed, when, and what a correct
+    // consumer must do with it. The model's own copy of that consumer is review-traced (no UI
+    // harness exists), which is why the guard lives in one place there with a comment naming this.
+
+    section("Budget report: absent until a landing applies, then it is the landed walk's own")
+    do {
+        let fakes = Fakes()
+        let scheduler = makeScheduler(fakes)
+        fakes.addRoot(rootURL, to: scheduler)
+        // `.map` rather than `?.lastReport == nil`, for the same reason the skip-record scenarios use
+        // it: the latter also passes when the whole entry is gone.
+        check(scheduler.scans[rootURL].map { $0.lastReport == nil } == true,
+              "a freshly added root has no budget report — absence means \"no walk has landed\"")
+
+        scheduler.requestScan(of: rootURL)
+        check(scheduler.scans[rootURL].map { $0.lastReport == nil } == true,
+              "…and still none while its first walk is in flight")
+        check(fakes.truncatedRootURLs.isEmpty, "…and no truncation notice is owed while it runs")
+
+        fakes.lastWalk.completion(walk(tree(rootURL, "v1"), true, 0.5, report: budgetReport(50_000)))
+        check(scheduler.scans[rootURL]?.lastReport == budgetReport(50_000),
+              "an applied landing stores that walk's report verbatim, got \(String(describing: scheduler.scans[rootURL]?.lastReport))")
+        check(fakes.landings.last?.report == budgetReport(50_000),
+              "…and the model seam was handed the very same value, not a re-derivation")
+        check(fakes.truncatedRootURLs == [rootURL], "…and the truncated root reaches the notice's published set")
+        check(fakes.truncatedPublishes == 1, "…in exactly one mutation of it")
+    }
+
+    section("Budget report: an unchanged landing refreshes it — and can flip the flag with no splice")
+    do {
+        let fakes = Fakes()
+        let scheduler = makeScheduler(fakes)
+        fakes.addRoot(rootURL, to: scheduler)
+        scheduler.requestScan(of: rootURL)
+        fakes.lastWalk.completion(walk(tree(rootURL, "v1"), true, 0.5, report: budgetReport(100)))
+        check(fakes.truncatedRootURLs == [rootURL], "precondition: the first walk landed truncated")
+
+        // Unchanged AND unforced: `land` reports the root present (applied) but splices nothing —
+        // while the tree that had been sitting exactly at the budget boundary now fits. This is the
+        // shape a splice-branch-only update gets wrong: the notice would stay up forever on a root
+        // that is no longer truncated.
+        scheduler.requestScan(of: rootURL)
+        fakes.lastWalk.completion(walk(tree(rootURL, "v2"), false, 0.5, report: budgetReport(100, truncated: false)))
+        check(marker(of: fakes.roots.first) == "v1", "precondition: the unchanged landing published no tree")
+        check(fakes.landings.last?.report == budgetReport(100, truncated: false),
+              "the report reaches the seam on an unchanged landing too, not only on splices")
+        check(scheduler.scans[rootURL]?.lastReport == budgetReport(100, truncated: false),
+              "…and the stored report advances to that landing's own, got \(String(describing: scheduler.scans[rootURL]?.lastReport))")
+        check(fakes.truncatedRootURLs.isEmpty, "…and the FAKE seam's consumer set drops the root, splice or no splice (the model's own copy is review-traced)")
+        check(fakes.truncatedPublishes == 2, "…in exactly one further mutation")
+
+        // And the other half of the guard: a landing that leaves the flag where it already was must
+        // touch nothing, or every damped no-op walk would re-render the sidebar.
+        scheduler.requestScan(of: rootURL)
+        fakes.lastWalk.completion(walk(tree(rootURL, "v3"), false, 0.5, report: budgetReport(100, truncated: false)))
+        check(fakes.truncatedPublishes == 2, "a landing that changes nothing about truncation publishes nothing")
+        check(fakes.truncatedRootURLs.isEmpty, "…and leaves the set correct")
+    }
+
+    section("Budget report: drained by removal, and a superseded walk's partial report is discarded")
+    do {
+        let fakes = Fakes()
+        let scheduler = makeScheduler(fakes)
+        fakes.addRoot(rootURL, to: scheduler)
+        scheduler.requestScan(of: rootURL)                      // walk 1, generation 1
+        fakes.lastWalk.completion(walk(tree(rootURL, "settled"), true, 0.4, report: budgetReport(7)))
+        check(scheduler.scans[rootURL]?.lastReport == budgetReport(7), "precondition: a report is stored")
+        check(fakes.truncatedRootURLs == [rootURL], "precondition: …and published")
+
+        scheduler.requestScan(of: rootURL)                      // walk 2, left in flight at generation 1
+        fakes.removeRoot(rootURL, from: scheduler)              // generation 2, walk 2 cancelled
+        check(scheduler.scans[rootURL] != nil, "the entry survives the removal — a walk is still in flight")
+        check(scheduler.scans[rootURL].map { $0.lastReport == nil } == true,
+              "…but the removal drained the budget report with the rest of the per-root state")
+        check(fakes.truncatedRootURLs.isEmpty, "…and the model-side notice set is drained in the same breath")
+
+        fakes.addRoot(rootURL, to: scheduler)                   // generation 3, fresh placeholder
+        scheduler.requestScan(of: rootURL)                      // gated behind walk 2 still unwinding
+
+        fakes.lastWalk.completion(walk(tree(rootURL, "partial"), true, 0.4, report: budgetReport(3)))
+        check(fakes.landings.count == 1, "precondition: the superseded landing never reached the model seam")
+        check(scheduler.scans[rootURL].map { $0.lastReport == nil } == true,
+              "a cancelled walk's partial report is discarded, not stored, got \(String(describing: scheduler.scans[rootURL]?.lastReport))")
+        check(fakes.truncatedRootURLs.isEmpty,
+              "…so a re-added root shows no notice earned by a dead incarnation's walk")
+
+        fakes.lastWalk.completion(walk(tree(rootURL, "fresh"), true, 0.4, report: budgetReport(9, truncated: false)))
+        check(scheduler.scans[rootURL]?.lastReport == budgetReport(9, truncated: false),
+              "…while the fresh walk's report lands normally")
+        check(fakes.truncatedRootURLs.isEmpty, "…and an untruncated fresh walk owes no notice")
+    }
+
+    section("Budget report: an idle removed root's report goes with its collected entry")
+    do {
+        let fakes = Fakes()
+        let scheduler = makeScheduler(fakes)
+        fakes.addRoot(rootURL, to: scheduler)
+        scheduler.requestScan(of: rootURL)
+        fakes.lastWalk.completion(walk(tree(rootURL, "v1"), true, 0.4, report: budgetReport(12)))
+        check(scheduler.scans[rootURL]?.lastReport != nil, "precondition: a report is stored")
+
+        fakes.removeRoot(rootURL, from: scheduler)
+        check(scheduler.scans[rootURL] == nil, "the idle removed root's entry — report included — is collected outright")
+        check(fakes.truncatedRootURLs.isEmpty, "…and its notice goes with it")
+
+        fakes.addRoot(rootURL, to: scheduler)
+        check(scheduler.scans[rootURL].map { $0.lastReport == nil } == true,
+              "a re-added root starts from no report at all")
+    }
+
+    section("Budget report: a landing for a root that left `roots` publishes no notice (I8)")
+    do {
+        let fakes = Fakes()
+        let scheduler = makeScheduler(fakes)
+        fakes.addRoot(rootURL, to: scheduler)
+        scheduler.requestScan(of: rootURL)
+
+        // The root leaves `roots` **without** the scheduler being told, so its generation is unmoved
+        // and the landing really does reach the model seam — the one path on which `land` returns
+        // false. A notice inserted here would be one no section could show and no removal could
+        // drain, which is why the seam's presence guard runs before the truncation update.
+        fakes.roots.removeAll { $0.url == rootURL }
+        fakes.lastWalk.completion(walk(tree(rootURL, "orphan"), true, 0.3, report: budgetReport(11)))
+        check(fakes.landings.last?.applied == false, "precondition: the seam reported the root is gone from roots")
+        check(fakes.landings.last?.report == budgetReport(11), "…having been handed the report all the same")
+        check(fakes.truncatedRootURLs.isEmpty, "no notice is published for a root with no section")
+        check(scheduler.scans[rootURL] == nil, "…and the unapplied landing records nothing at all (I8), entry collected")
+    }
+
     // MARK: - Entry GC
 
     section("Entry GC: idle removed roots are collected, live and present ones are not")
@@ -780,7 +969,7 @@ MainActor.assumeIsolated {
         // driven: the only claim under test is that none of them captured `self`.
         var scheduler: RootScanScheduler? = RootScanScheduler(
             currentNode: { _ in nil },
-            land: { _, _, _, _ in false }
+            land: { _, _, _, _, _ in false }
         )
         weak let weakScheduler = scheduler
         check(weakScheduler != nil, "precondition: the weak reference sees the live scheduler")

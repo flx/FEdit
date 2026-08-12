@@ -51,10 +51,12 @@ struct SidebarView: View {
                                 Text("Scanning…")
                                     .foregroundStyle(.secondary)
                             } else if query.isEmpty {
+                                truncationNotice(for: root, filtering: false)
                                 OutlineGroup(root.children ?? [], children: \.children) { node in
                                     FileRow(node: node, workspace: workspace)
                                 }
                             } else {
+                                truncationNotice(for: root, filtering: true)
                                 flatRows(for: root, query: query)
                             }
                         } header: {
@@ -69,6 +71,45 @@ struct SidebarView: View {
                 .listStyle(.inset)
                 .environment(\.defaultMinListRowHeight, 20)
             }
+        }
+    }
+
+    /// (tree-node-budget) The per-root declaration that this tree is **incomplete**: shown iff the
+    /// root's last applied walk hit the node budget (SPEC §5.2, §5.4, §11). Silent truncation was
+    /// rejected — this row is the whole visible half of the item.
+    ///
+    /// Shown in **both** modes, because both misreport otherwise: tree mode as "this folder is
+    /// empty", filter mode as "this file does not exist". Deliberately **not** shown for a root that
+    /// is still `Scanning…` — its walk has not landed, so there is nothing to declare yet, and
+    /// `body`'s first branch intercepts those before this is ever reached.
+    ///
+    /// The copy names the one recovery that works: adding the subfolder you want as its **own** root,
+    /// since the budget is per root. It deliberately does **not** suggest Refresh — truncation is
+    /// deterministic, so a rescan of the same tree provably cuts in exactly the same place, and
+    /// advising it would send the user round a loop that cannot help.
+    @ViewBuilder
+    private func truncationNotice(for root: FileNode, filtering: Bool) -> some View {
+        if workspace.truncatedRootURLs.contains(root.url) {
+            Group {
+                if filtering {
+                    Text("Results may be incomplete — the tree is truncated.")
+                } else if let count = workspace.truncatedNodeCount(for: root.url) {
+                    // Interpolated from the walk's own measurement, so the budget constant lives in
+                    // exactly one place (`FileNode.defaultNodeBudget`) and changing it needs no edit
+                    // here.
+                    Text("Showing the first \(count.formatted()) items — deeper folders are incomplete. Add a subfolder as its own root to see more.")
+                } else {
+                    // The count is missing only if a truncated landing published this flag without
+                    // storing its report — unreachable, since both happen in one `applyScan` turn.
+                    // The declaration still goes out: dropping the notice would hide the truncation,
+                    // and inventing a number would be worse than omitting it.
+                    Text("Deeper folders are incomplete — the tree is truncated. Add a subfolder as its own root to see more.")
+                }
+            }
+            .foregroundStyle(.secondary)
+            // The notice is a sentence, not a name: it wraps to as many lines as it needs rather
+            // than truncating — the same outcome as the file-name rows below it, by different means (SPEC §5.3).
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 

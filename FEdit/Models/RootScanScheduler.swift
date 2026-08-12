@@ -93,6 +93,21 @@ struct RootScan {
     /// "the walk found nothing to skip". The gate must fall back to its static rules alone in the
     /// first case; in the second it may rely on the record's silence.
     var skipRecord: SkipRecord?
+
+    /// (tree-node-budget) What this root's last **applied** walk's node budget did — how many nodes
+    /// it built, and whether it refused any. Written by `applyScan` on the applied branch beside
+    /// `skipRecord`, drained by `noteRootRemoved`, collected with the entry.
+    ///
+    /// Deliberately **not** the sidebar's render signal: `scans` is invisible to the UI by design
+    /// (nothing here is `@Published`, and this scheduler is not an `ObservableObject`), so a
+    /// truncation flag stored only here could never invalidate the notice. That signal is
+    /// `WorkspaceModel.truncatedRootURLs`, updated through the `land` seam. This entry is the
+    /// observability half **and** the notice's node count, which the view reads lazily — by which
+    /// time the landing that set the flag has already written it (both happen inside one `applyScan`
+    /// turn, before any render).
+    ///
+    /// `Optional` per this type's rule: `nil` means no walk of this root has ever landed.
+    var lastReport: TreeBudgetReport?
 }
 
 /// (watcher-scan-skip-parity) What a finished walk hands back. Was three loose arguments
@@ -112,6 +127,11 @@ struct WalkResult: Sendable {
 
     /// The walk's own measured cost, in seconds. Feeds the proportional damping term.
     let duration: TimeInterval
+
+    /// (tree-node-budget) What the walk's node budget did, carried from the walk that measured it —
+    /// the same value that reaches `RootScan.lastReport` and the model's landing seam. A cancelled
+    /// walk's is partial like everything else here, and discarded with it.
+    let budgetReport: TreeBudgetReport
 }
 
 /// (root-scan-consolidation) The in-flight walks' cancellation tokens, and the **only** part of the
@@ -197,15 +217,23 @@ final class RootScanScheduler {
     /// The model-side landing: splice `scanned` into `roots` when `force || changed`, and clear the
     /// root's "Scanning…" affordance. Returns `false` when the root is no longer in `roots` — the
     /// scheduler then records no damping state for it (I8). Captures the model **unowned**.
-    typealias Landing = @MainActor (_ url: URL, _ scanned: FileNode, _ changed: Bool, _ force: Bool) -> Bool
+    ///
+    /// (tree-node-budget) `report` is passed on **every** landing, including the structurally
+    /// unchanged ones that splice nothing: the truncation flag is model-side `@Published` state, and
+    /// it can flip while `changed == false` (a tree sitting exactly at the budget boundary gains one
+    /// file and loses one node's worth of depth). A seam that only saw the report on the splice
+    /// branch would leave that notice stale or missing — which is why the report rides the signature
+    /// rather than being fetched from `RootScan.lastReport` by the view.
+    typealias Landing = @MainActor (_ url: URL, _ scanned: FileNode, _ changed: Bool, _ force: Bool, _ report: TreeBudgetReport) -> Bool
 
     /// What a finished walk hands back on the main actor. `@Sendable` is required, not decorative: the
     /// default launcher carries this closure into `scanQueue.async`'s `@Sendable` body, and a bare
     /// `@MainActor` function type is not implicitly `Sendable`.
     typealias WalkCompletion = @Sendable @MainActor (_ result: WalkResult) -> Void
 
-    /// The walk executor: run `FileNode.scanRecordingSkips(directory:cancellation:)` off the main
-    /// actor against `old` as the diff baseline, then deliver the `WalkResult` back on the main actor.
+    /// The walk executor: run `FileNode.scanRecordingSkips(directory:cancellation:nodeBudget:)` off
+    /// the main actor against `old` as the diff baseline, then deliver the `WalkResult` back on the
+    /// main actor.
     typealias WalkLauncher = @MainActor (_ url: URL, _ old: FileNode?, _ token: ScanCancellationToken, _ completion: @escaping WalkCompletion) -> Void
 
     /// The trailing-edge timer: run `workItem` on the main actor after `delay` seconds.
@@ -221,7 +249,7 @@ final class RootScanScheduler {
     /// before this item, and the fake launcher supplies it directly.
     typealias Clock = @MainActor () -> DispatchTime
 
-    /// (async-root-scan) The **only** place the blocking recursive directory walk runs — the whole
+    /// (async-root-scan) The **only** place the blocking directory walk runs — the whole
     /// point of that item: no user action can freeze the window on a home-scale root any more.
     ///
     /// `static` (shared app-wide, not per-window) and **concurrent**, not serial: per-root
@@ -337,6 +365,11 @@ final class RootScanScheduler {
         // that is no longer shown, and a re-add must not have its first gate decisions made against
         // them. `nil` is the honest state — "no walk has delivered verdicts for this root".
         scan.skipRecord = nil
+        // (tree-node-budget) Same reasoning, same breath: a removed root's budget report describes a
+        // tree that is gone, and the sidebar's notice for a re-added root must not interpolate the
+        // previous incarnation's node count. `WorkspaceModel.removeRoot` drains the published
+        // truncated-set alongside this.
+        scan.lastReport = nil
         scans[url] = scan
         tokens.cancelAndRemove(url)
         collectEntryIfIdle(url)
@@ -471,7 +504,7 @@ final class RootScanScheduler {
         tokens.clear(url: url, ifIdentical: token)
 
         // `&&` short-circuits, so a job whose generation moved never reaches the model seam.
-        let applied = scan.generation == generation && land(url, result.node, result.changed, force)
+        let applied = scan.generation == generation && land(url, result.node, result.changed, force, result.budgetReport)
 
         // Re-read across the callout, for the same reason the write above happens early: the entry
         // in `scans` — not this local — is the truth once `land` has run.
@@ -490,7 +523,13 @@ final class RootScanScheduler {
             // store cannot re-render the sidebar. A discarded landing (generation moved, or the root
             // is gone from `roots`) stores nothing: `&&` short-circuited above, and its record may be
             // a cancelled walk's partial one.
+            //
+            // (tree-node-budget) The budget report is stored on exactly the same branch and for the
+            // same reasons — freshest-verdicts-win, no re-render, nothing stored for a discarded
+            // landing. It is observability plus the notice's node count; the notice's *visibility*
+            // was already published by the `land` callout above.
             scan.skipRecord = result.skipRecord
+            scan.lastReport = result.budgetReport
             scan.lastFinish = now()
             scan.lastDuration = result.duration
             scan.backoff = (force || result.changed)
@@ -587,7 +626,8 @@ final class RootScanScheduler {
     // MARK: - Default walk executor
 
     /// (async-root-scan) The production `launchWalk`: hop to `scanQueue`, walk, hop back to the main
-    /// actor with the tree, the structural diff, and the walk's own cost.
+    /// actor with the tree, the structural diff, the walk's own cost, and (tree-node-budget) what its
+    /// node budget did.
     ///
     /// `static` deliberately — a default that captured `self` would put the scheduler in its own
     /// stored property and defeat the no-self-retain invariant. `nonisolated` because everything it
@@ -619,7 +659,15 @@ final class RootScanScheduler {
             // so every landing carries the verdicts the FSEvents gate consults. The record is
             // produced by the walk itself and carried through unchanged — never re-derived on the
             // main actor, which would cost the syscalls this whole design exists to avoid.
-            let outcome = FileNode.scanRecordingSkips(directory: url, cancellation: token)
+            //
+            // (tree-node-budget) This is also the **only** budgeted walk in the app: the wrappers and
+            // the harness's pinned entry points pass no budget and stay unbounded. Per root per
+            // window — two windows on one root each build their own bounded tree.
+            let outcome = FileNode.scanRecordingSkips(
+                directory: url,
+                cancellation: token,
+                nodeBudget: FileNode.defaultNodeBudget
+            )
             let duration = secondsElapsed(from: started, to: DispatchTime.now())
             // `old` is `FileNode?`; a nil `old` (no such root at job start — not reachable today,
             // since every caller appends the root first) reads as "changed".
@@ -628,7 +676,10 @@ final class RootScanScheduler {
                 node: outcome.node,
                 skipRecord: outcome.skipRecord,
                 changed: changed,
-                duration: duration
+                duration: duration,
+                // Carried, never recomputed: counting the delivered tree on the main actor would be
+                // a second O(N) pass answering a question the walk already answered exactly.
+                budgetReport: outcome.budgetReport
             )
             DispatchQueue.main.async {
                 MainActor.assumeIsolated { completion(result) }

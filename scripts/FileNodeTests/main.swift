@@ -19,9 +19,12 @@
 //  You should have received a copy of the GNU General Public License
 //  along with FEdit. If not, see <https://www.gnu.org/licenses/>.
 //
-//  Standalone assertion harness for `FileNode.scan(directory:)` (folder-sidebar Tier 1) and, since
-//  (watcher-scan-skip-parity), for `FileNode.scanRecordingSkips(directory:cancellation:)` — the owned
-//  hidden predicate and the skip record the FSEvents gate consults.
+//  Standalone assertion harness for `FileNode.scan(directory:)` (folder-sidebar Tier 1); since
+//  (watcher-scan-skip-parity), for `FileNode.scanRecordingSkips(directory:cancellation:nodeBudget:)`
+//  — the owned hidden predicate and the skip record the FSEvents gate consults; and since
+//  (tree-node-budget), for the breadth-first walk's node budget: the exact preorder path pins that
+//  hold the unbounded tree identical across that restructure, and the level-order truncation
+//  semantics.
 //  Not part of the app target — compiled and run manually:
 //
 //      swiftc FEdit/Models/FileNode.swift scripts/FileNodeTests/main.swift -o /tmp/fntests && /tmp/fntests
@@ -211,6 +214,54 @@ if let skipNameVariantsNode = rootChildren.first(where: { $0.name == "skip-name-
     print("  FAIL: skip-name-variants not found in root.children")
 }
 
+// MARK: - (tree-node-budget) Exact preorder path pins
+//
+// The restructure to a breadth-first walk (tree-node-budget) has to leave the unbounded tree
+// **identical** — same per-directory classification, same folders-first/`localizedStandardCompare`
+// sort, same nesting — and the assertions above pin the ordering of exactly ONE directory (the
+// fixture root's own five children). These pins take the whole tree: every node's path relative to
+// the scanned root, in the tree's own preorder, as one exact list. Any reordering, any lost or
+// gained node, at any depth, in any of the three fixtures, fails here.
+//
+// The expected lists are derived by hand from the fixture definitions above, not captured from a
+// run, so they pin what the SPEC promises rather than what the code happens to do.
+
+/// Every node under `node`, by path relative to it, in the tree's own preorder — i.e. the order a
+/// fully expanded `OutlineGroup` renders, which is folders-first/`localizedStandardCompare` at every
+/// level (SPEC §5.2). The ordered sibling of `keptPaths` below.
+func orderedPaths(of node: FileNode, relativePath: String = "", into paths: inout [String]) {
+    for child in node.children ?? [] {
+        let relative = relativePath.isEmpty ? child.name : relativePath + "/" + child.name
+        paths.append(relative)
+        orderedPaths(of: child, relativePath: relative, into: &paths)
+    }
+}
+
+/// The whole tree as one preorder list, for the pins below.
+func orderedPaths(of node: FileNode) -> [String] {
+    var paths: [String] = []
+    orderedPaths(of: node, into: &paths)
+    return paths
+}
+
+section("Exact preorder path list of the whole first fixture (ordering pinned at every depth)")
+let fixtureOrdered = orderedPaths(of: root)
+let fixtureExpected = [
+    "skip-name-variants",
+    "skip-name-variants/file-case",
+    "skip-name-variants/file-case/node_modules",
+    "skip-name-variants/symlink-case",
+    "skip-name-variants/symlink-case/real_target",
+    "skip-name-variants/symlink-case/real_target/inside.txt",
+    "subdir",
+    "subdir/nested_file.txt",
+    "unreadable",
+    "file2",
+    "file10",
+]
+check(fixtureOrdered == fixtureExpected,
+      "the first fixture's preorder path list is exactly the expected one, got \(fixtureOrdered)")
+
 teardown()
 
 // MARK: - (watcher-scan-skip-parity) Owned skip predicate + the recorded skip index
@@ -307,7 +358,7 @@ func recordingTeardown() {
     try? fileManager.removeItem(at: recordingRoot)
 }
 
-let outcome = FileNode.scanRecordingSkips(directory: recordingRoot, cancellation: nil)
+let outcome = FileNode.scanRecordingSkips(directory: recordingRoot, cancellation: nil, nodeBudget: nil)
 let recordingChildren = outcome.node.children ?? []
 let recordingNames = Set(recordingChildren.map(\.name))
 
@@ -433,7 +484,209 @@ check(FileNode.scan(directory: recordingRoot) == outcome.node, "scan(directory:)
 check(FileNode.scan(directory: recordingRoot, cancellation: nil) == outcome.node,
       "scan(directory:cancellation:) returns the same node")
 
+section("Exact preorder path list of the whole second fixture (symlinks, UF_HIDDEN, unreadable)")
+let recordingOrdered = orderedPaths(of: outcome.node)
+let recordingExpected = [
+    "deep",
+    "deep/keep.txt",
+    "denied",
+    "dangling_link",
+    "link_target.txt",
+    "link_to_hidden",
+    "node_modules",
+]
+check(recordingOrdered == recordingExpected,
+      "the second fixture's preorder path list is exactly the expected one, got \(recordingOrdered)")
+
 recordingTeardown()
+
+// MARK: - (tree-node-budget) The node budget: level-order truncation
+//
+// A THIRD fixture root, for the same reason the second one exists: the fixtures above pin exact
+// child counts and orderings, so the budget cases get their own tree rather than perturbing theirs.
+//
+// Its shape is chosen so that a LEVEL-ORDER cut and a DEPTH-FIRST one disagree loudly. The root has
+// two directories and two files; `alpha`'s subtree alone is bigger than the root's own listing, so a
+// depth-first cut at a budget of 4 would spend the whole budget inside `alpha/deep` and leave the
+// root's own files — the rows a collapsed sidebar shows — with no node at all. Breadth-first keeps
+// every shallow level complete instead, which is the entire point of the item.
+//
+//     budget-order/            BFS creation order (the root node itself is never counted):
+//       alpha/                   1
+//         DerivedData/           — skipped, recorded under the key "alpha"
+//         deep/                  5
+//           d1.txt              12
+//           d2.txt              13
+//         a1.txt                 6
+//         a2.txt                 7
+//         a10.txt                8   (a2 before a10: localizedStandardCompare)
+//       beta/                    2
+//         node_modules/          — skipped, recorded under the key "beta"
+//         empty/                 9   (an empty directory, visited but contributing nothing)
+//         b1.txt                10
+//         b2.txt                11
+//       root1.txt                3
+//       root2.txt                4
+
+let budgetRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("FileNodeTests-budget-\(UUID().uuidString)", isDirectory: true)
+
+makeDirectory(budgetRoot)
+
+let alphaDir = budgetRoot.appendingPathComponent("alpha", isDirectory: true)
+makeDirectory(alphaDir)
+makeDirectory(alphaDir.appendingPathComponent("DerivedData", isDirectory: true))
+let deepDir = alphaDir.appendingPathComponent("deep", isDirectory: true)
+makeDirectory(deepDir)
+makeFile(deepDir.appendingPathComponent("d1.txt"))
+makeFile(deepDir.appendingPathComponent("d2.txt"))
+makeFile(alphaDir.appendingPathComponent("a1.txt"))
+makeFile(alphaDir.appendingPathComponent("a2.txt"))
+makeFile(alphaDir.appendingPathComponent("a10.txt"))
+
+let betaDir = budgetRoot.appendingPathComponent("beta", isDirectory: true)
+makeDirectory(betaDir)
+makeDirectory(betaDir.appendingPathComponent("node_modules", isDirectory: true))
+makeDirectory(betaDir.appendingPathComponent("empty", isDirectory: true))
+makeFile(betaDir.appendingPathComponent("b1.txt"))
+makeFile(betaDir.appendingPathComponent("b2.txt"))
+
+makeFile(budgetRoot.appendingPathComponent("root1.txt"))
+makeFile(budgetRoot.appendingPathComponent("root2.txt"))
+
+/// A root with nothing in it — the case that separates "the budget refused something" from "the
+/// budget was spent": a budget of 0 over this root refuses nothing, so it is NOT truncated.
+let emptyRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("FileNodeTests-empty-\(UUID().uuidString)", isDirectory: true)
+makeDirectory(emptyRoot)
+
+func budgetTeardown() {
+    try? fileManager.removeItem(at: budgetRoot)
+    try? fileManager.removeItem(at: emptyRoot)
+}
+
+/// One budgeted walk of the third fixture.
+func budgetedScan(_ nodeBudget: Int?, cancellation: ScanCancellationToken? = nil) -> ScanOutcome {
+    FileNode.scanRecordingSkips(directory: budgetRoot, cancellation: cancellation, nodeBudget: nodeBudget)
+}
+
+let unbounded = budgetedScan(nil)
+/// The whole fixture, in the order a fully expanded sidebar renders it. Every budget case below is
+/// asserted against an explicit sublist of this, so a cut that kept the right *number* of nodes but
+/// the wrong ones cannot pass.
+let unboundedExpected = [
+    "alpha",
+    "alpha/deep",
+    "alpha/deep/d1.txt",
+    "alpha/deep/d2.txt",
+    "alpha/a1.txt",
+    "alpha/a2.txt",
+    "alpha/a10.txt",
+    "beta",
+    "beta/empty",
+    "beta/b1.txt",
+    "beta/b2.txt",
+    "root1.txt",
+    "root2.txt",
+]
+
+section("Unbounded parity: the third fixture's exact preorder path list, and its budget report")
+check(orderedPaths(of: unbounded.node) == unboundedExpected,
+      "the unbounded walk's preorder path list is exactly the expected one, got \(orderedPaths(of: unbounded.node))")
+check(unbounded.budgetReport == TreeBudgetReport(nodeCount: 13, truncated: false),
+      "an unbounded walk still counts its nodes (13, the root node excluded) and is not truncated, got \(unbounded.budgetReport)")
+check(FileNode.scan(directory: budgetRoot) == unbounded.node,
+      "the unbounded wrapper entry point returns the same tree (it passes no budget)")
+
+section("Budget ≥ total: identical tree, nothing refused")
+let atTotal = budgetedScan(13)
+check(atTotal.node == unbounded.node, "a budget of exactly the tree's size yields the identical tree")
+check(atTotal.budgetReport == TreeBudgetReport(nodeCount: 13, truncated: false),
+      "…and is NOT truncated — spending the budget is not refusing anything, got \(atTotal.budgetReport)")
+check(atTotal.skippedIndex == unbounded.skippedIndex,
+      "…and records the same skip verdicts (every directory was still visited)")
+let overTotal = budgetedScan(100)
+check(overTotal.node == unbounded.node, "a budget well above the tree's size yields the identical tree")
+check(overTotal.budgetReport == TreeBudgetReport(nodeCount: 13, truncated: false),
+      "…and is not truncated either, got \(overTotal.budgetReport)")
+
+section("Budget = total − 1: exactly one node refused, and it is the LAST in BFS order")
+let oneShort = budgetedScan(12)
+check(orderedPaths(of: oneShort.node) == unboundedExpected.filter { $0 != "alpha/deep/d2.txt" },
+      "the only missing node is the deepest, last-created one, got \(orderedPaths(of: oneShort.node))")
+check(oneShort.budgetReport == TreeBudgetReport(nodeCount: 12, truncated: true),
+      "…and the walk reports 12 nodes, truncated, got \(oneShort.budgetReport)")
+
+section("Budget = the root's own listing: EVERY root-level entry survives (the level-order promise)")
+let atLevelOne = budgetedScan(4)
+check(orderedPaths(of: atLevelOne.node) == ["alpha", "beta", "root1.txt", "root2.txt"],
+      "all four root-level entries are kept and nothing deeper is, got \(orderedPaths(of: atLevelOne.node))")
+check(atLevelOne.budgetReport == TreeBudgetReport(nodeCount: 4, truncated: true),
+      "…and the walk reports 4 nodes, truncated, got \(atLevelOne.budgetReport)")
+check(atLevelOne.node.children?.first(where: { $0.name == "alpha" })?.children?.isEmpty == true,
+      "a directory beyond the cut is an EMPTY expandable folder, not a leaf")
+check(atLevelOne.node.children?.first(where: { $0.name == "alpha" })?.children != nil,
+      "…i.e. its children are [] and never nil — nil is what makes OutlineGroup treat a node as a leaf")
+
+section("Budget in the middle of a directory: the cut takes the sorted-later siblings")
+let midDirectory = budgetedScan(6)
+check(orderedPaths(of: midDirectory.node) == ["alpha", "alpha/deep", "alpha/a1.txt", "beta", "root1.txt", "root2.txt"],
+      "a1.txt survives and a2.txt/a10.txt are refused — the cut is in sorted order, got \(orderedPaths(of: midDirectory.node))")
+check(midDirectory.budgetReport == TreeBudgetReport(nodeCount: 6, truncated: true),
+      "…and the walk reports 6 nodes, truncated, got \(midDirectory.budgetReport)")
+
+section("Budget 0: truncated on a non-empty root, NOT truncated on an empty one")
+let zeroBudget = budgetedScan(0)
+check(zeroBudget.node.children?.isEmpty == true, "a budget of 0 builds no children at all")
+check(zeroBudget.budgetReport == TreeBudgetReport(nodeCount: 0, truncated: true),
+      "…and is truncated: the root's own entries were classified and refused, got \(zeroBudget.budgetReport)")
+let emptyZero = FileNode.scanRecordingSkips(directory: emptyRoot, cancellation: nil, nodeBudget: 0)
+check(emptyZero.node.children?.isEmpty == true, "a budget of 0 over an EMPTY root also builds no children")
+check(emptyZero.budgetReport == TreeBudgetReport(nodeCount: 0, truncated: false),
+      "…but is NOT truncated — nothing was refused, so no notice is owed, got \(emptyZero.budgetReport)")
+let emptyUnbounded = FileNode.scanRecordingSkips(directory: emptyRoot, cancellation: nil, nodeBudget: nil)
+check(emptyUnbounded.budgetReport == TreeBudgetReport(nodeCount: 0, truncated: false),
+      "an unbounded walk of an empty root reports the same, got \(emptyUnbounded.budgetReport)")
+// A negative budget is a caller bug; the one thing it must NOT do is read as "unbounded", which
+// would silently un-bound a production walk. `nil` is the only way to ask for that.
+let negativeBudget = budgetedScan(-1)
+check(negativeBudget.node == zeroBudget.node && negativeBudget.budgetReport == zeroBudget.budgetReport,
+      "a negative budget behaves exactly like 0, never like unbounded, got \(negativeBudget.budgetReport)")
+
+section("Skip records are written for VISITED directories only")
+check(unbounded.skippedIndex["alpha"] == ["DerivedData"],
+      "unbounded: alpha's skipped DerivedData is recorded, got \(unbounded.skippedIndex["alpha"] ?? [])")
+check(unbounded.skippedIndex["beta"] == ["node_modules"],
+      "unbounded: beta's skipped node_modules is recorded, got \(unbounded.skippedIndex["beta"] ?? [])")
+check(midDirectory.skippedIndex["alpha"] == ["DerivedData"],
+      "budget 6: alpha was visited (the cut fell inside it), so its verdicts are complete, got \(midDirectory.skippedIndex["alpha"] ?? [])")
+check(midDirectory.skippedIndex["beta"] == nil,
+      "budget 6: beta was never visited, so it contributes NO verdicts — absence is honest, got \(String(describing: midDirectory.skippedIndex["beta"]))")
+check(atLevelOne.skippedIndex["alpha"] == ["DerivedData"],
+      "budget 4: alpha is visited to decide truncation, so its verdicts are recorded even though nothing was admitted from it")
+check(atLevelOne.skippedIndex["beta"] == nil,
+      "budget 4: the walk stops at the first refusal, so beta is still never visited")
+
+section("Determinism: the same budget twice gives the same tree and the same report")
+let firstRun = budgetedScan(6)
+let secondRun = budgetedScan(6)
+check(firstRun.node == secondRun.node, "two budgeted walks of the same tree agree exactly")
+check(firstRun.budgetReport == secondRun.budgetReport, "…and so do their reports")
+check(firstRun.node == midDirectory.node, "…and agree with the earlier walk at the same budget")
+
+section("Cancellation still wins over the budget")
+let cancelledToken = ScanCancellationToken()
+cancelledToken.cancel()
+let cancelledUnbounded = budgetedScan(nil, cancellation: cancelledToken)
+check(cancelledUnbounded.node.children?.isEmpty == true,
+      "a pre-cancelled unbounded walk unwinds at the root's first entry")
+check(cancelledUnbounded.budgetReport == TreeBudgetReport(nodeCount: 0, truncated: false),
+      "…reporting 0 nodes and NOT truncated: `truncated` is about the budget, and the caller discards a cancelled walk whole, got \(cancelledUnbounded.budgetReport)")
+let cancelledBudgeted = budgetedScan(100, cancellation: cancelledToken)
+check(cancelledBudgeted.node == cancelledUnbounded.node && cancelledBudgeted.budgetReport == cancelledUnbounded.budgetReport,
+      "a generous budget changes nothing about a cancelled walk — cancellation is checked first, per entry")
+
+budgetTeardown()
 
 // MARK: - path(_:isContainedIn:) (root-slash-prefix-match)
 

@@ -37,7 +37,7 @@ A handful of pure-logic modules (filter query, filter row caching, markdown rend
 scripts/install.sh
 ```
 
-The installer also drops a `fedit` command into the first writable directory among `$FEDIT_BIN_DIR`, `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin` (created if needed), with its app path pointed at wherever the bundle was installed. It never uses `sudo`, and a shim that cannot be placed is a warning, not a failed install.
+The installer also drops a `fedit` command into the first writable directory among `$FEDIT_BIN_DIR`, `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin` (created if needed), with its app path pointed at wherever the bundle was installed. It never uses `sudo`, and a shim that cannot be placed is a warning, not a failed install. Installing to a non-default destination (e.g. a temp directory for testing) skips the shim — it would repoint your real `fedit` at the throwaway copy — unless `FEDIT_BIN_DIR` is set explicitly.
 
 ## Command line
 

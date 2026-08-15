@@ -27,7 +27,7 @@ v1 feature-complete: every planned item has shipped (see [DONE.md](DONE.md); [TO
 
 Open `FEdit.xcodeproj` in Xcode and Run. No third-party dependencies.
 
-A handful of pure-logic modules (filter query, filter row caching, markdown renderer, git status parsing, file tree scanning, per-root scan scheduling, watcher skip gating, session snapshots, line counting, command-line path mapping) also have standalone `swiftc`-run regression harnesses under `scripts/*/main.swift`, used in place of an XCTest target; the `fedit` shim has a shell one at `scripts/FeditShimTests/run.sh`.
+A handful of pure-logic modules (filter query, filter row caching, markdown renderer, git status parsing, file tree scanning, per-root scan scheduling, watcher skip gating, session snapshots, line counting, command-line path mapping, `--wait` marker claiming) also have standalone `swiftc`-run regression harnesses under `scripts/*/main.swift`, used in place of an XCTest target; the `fedit` shim has a shell one at `scripts/FeditShimTests/run.sh`.
 
 ## Installing
 
@@ -46,19 +46,23 @@ fedit notes.md            # opens notes.md, with its folder as the sidebar root
 fedit .                   # opens the current directory as a root, no file open
 fedit src/a.py docs/b.md  # one window each
 fedit                     # just launches or activates FEdit
+fedit --wait notes.md     # opens notes.md and blocks until that window closes
 fedit --help              # usage, on stdout
 ```
 
 Each path gets its **own new window** — an existing window, full or empty, is never disturbed (the request is delivered as the new window's own value, so it cannot land anywhere else). A file's **containing folder** becomes that window's sole sidebar root, so `fedit ~/notes.md` scans your entire home directory (the same cost as picking `~` in the Open Folder… panel). The scan runs off the main thread: the window appears immediately, showing `Scanning…` in the sidebar while the tree fills in behind it. The tree is capped at ~50,000 entries per root, breadth-first — a home-scale root fills level by level and loses only its deepest reached level's tail, and it says so with a notice in its sidebar section. At most 8 paths per call.
 
-`-h`/`--help` is recognized as the **first argument only** — after that everything is a path, since a file really can be called `--help`.
+`-h`/`--help` and `-w`/`--wait` are recognized as the **first argument only** — after that everything is a path, since a file really can be called `--help`.
 
 | Situation | Exit code |
 |---|---|
 | Success | `open`'s status (normally 0) |
 | A path does not exist (nothing is opened, not even the valid paths) | 66 |
-| More than 8 paths | 64 |
+| More than 8 paths, or a `--wait` that is not exactly one existing regular file | 64 |
 | `FEdit.app` could not be found | 69 |
+| `--wait` with neither `HOME` nor `FEDIT_WAIT_DIR` set (no place for its marker) | 78 |
+| `--wait` gave up: the open produced no window within 30 s, or FEdit died holding the file | 1 |
+| `--wait` interrupted by Ctrl-C, `kill`, or a closed terminal | 128 + signal |
 
 Set `FEDIT_APP` to the bundle's path if it is not where the installer put it. If there is no bundle there, the shim falls back to asking LaunchServices for an app *named* FEdit — so a stale `FEDIT_APP` may quietly open a differently-located copy and still exit 0. The 69 row above applies only when neither resolves.
 
@@ -67,6 +71,22 @@ A few details worth knowing:
 - **Symlinks are resolved.** The shim canonicalizes every argument with `realpath` (the usual command-line convention), so `fedit link/notes.md` shows the *real* folder in the sidebar, whereas opening the same folder through Cmd+O would show the link's name.
 - **A dotfile has no sidebar row.** `fedit ~/.zshrc` opens the file in the editor as expected, but the sidebar skips hidden files, so nothing in the tree is highlighted.
 - **A cold `fedit x.md` also restores your previous session.** The new window comes up next to the windows FEdit had when you last quit, not instead of them; it is then an ordinary window and comes back with the next session too.
+
+### Using FEdit as your git editor
+
+`fedit --wait <file>` opens one file in its own window and does not return until that window closes, which is the contract `git`, `crontab -e` and friends expect of an editor:
+
+```sh
+git config --global core.editor "fedit --wait"
+```
+
+`git commit` then opens `COMMIT_EDITMSG` in a FEdit window; write the message, close the window (Cmd+W), and the commit completes.
+
+**How to abort a commit.** FEdit autosaves — there is no "close without saving" — so the way to abort is to **delete the whole message text and then close the window**. Git sees an empty message and aborts. (Simply typing nothing works the same way, since git's template lines are all comments.) Quitting FEdit while the message window is open counts as finishing: git gets whatever was autosaved.
+
+The file opens with its **containing folder** as the sidebar root, so a commit-message window is rooted at the repository's `.git` directory. That is the same rule every other external open follows.
+
+Details: it takes exactly one path, and that path must already exist (`fedit --wait new-file.md` is an error, not a create). It leaves a marker file in `~/Library/Application Support/FEdit/wait` for the duration of the wait — that is how the window tells the command line it has closed — and removes it on every exit path, including Ctrl-C. If the open never produces a window, it gives up after 30 seconds with exit 1 rather than blocking forever. `sudo crontab -e` is **not** supported: the marker would land in root's spool where FEdit never looks, so it gives up after that same 30 seconds.
 
 ## License
 

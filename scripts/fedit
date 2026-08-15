@@ -23,15 +23,34 @@
 #  Opens files or folders in FEdit from the command line:
 #
 #      fedit [path ...]
+#      fedit --wait <file>
 #
 #  A thin wrapper around `open -a`: it encodes no FEdit-specific protocol at
 #  all. Its whole contract is "hand `open` the app bundle and zero or more
 #  existing, absolute paths"; everything about which window a path lands in is
 #  the app's business (it always makes a new one).
 #
+#  (git-editor-wait) `--wait` is the single exception to "no protocol", because
+#  `open` offers no way to be told about one window's fate: `open -W` waits for
+#  the whole app to quit, and odoc carries nothing but paths. So the signal goes
+#  through the filesystem. Before opening, this script drops a marker file — its
+#  own PID, a newline, then the canonical path — into the spool directory
+#  ~/Library/Application Support/FEdit/wait. The window that ends up showing
+#  that file claims the marker by renaming it to <name>.claimed (the
+#  acknowledgement) and deletes it when the window closes, which is what this
+#  script blocks on, so `git config core.editor "fedit --wait"`, GIT_EDITOR and
+#  `crontab -e` work. Every failure is bounded: an open that produces no window
+#  never acknowledges, and the wait gives up after FEDIT_WAIT_ACK_TIMEOUT
+#  seconds instead of hanging forever.
+#
 #  Exit codes: 0 (or `open`'s own status) on success, 64 (EX_USAGE) for too
-#  many paths, 66 (EX_NOINPUT) for a path that does not exist, 69
-#  (EX_UNAVAILABLE) when FEdit.app cannot be found.
+#  many paths or a `--wait` that names anything but exactly one existing regular
+#  file, 66 (EX_NOINPUT) for a path that does not exist, 69 (EX_UNAVAILABLE)
+#  when FEdit.app cannot be found, 78 (EX_CONFIG) when `--wait` is misconfigured
+#  (it can locate no spool directory — neither FEDIT_WAIT_DIR nor HOME is set —
+#  or FEDIT_WAIT_ACK_TIMEOUT is not a whole number of seconds), 1 when a wait is
+#  abandoned (the open was never acknowledged, or FEdit died still holding the
+#  claim), and 128+n when a signal (INT, TERM, HUP) ends a wait.
 #
 
 set -eu
@@ -45,28 +64,146 @@ APP=${FEDIT_APP:-/Applications/FEdit.app}
 # silently; here it is a usage error, which is the more useful answer.
 MAX_PATHS=8
 
+# (git-editor-wait) How long `--wait` gives FEdit to acknowledge the open by
+# claiming the marker, in seconds. Generous, because it is only ever hit when
+# something went wrong (a cold launch that never produced a window); the normal
+# case leaves phase 1 within a second. FEDIT_WAIT_ACK_TIMEOUT is the test hook.
+ACK_TIMEOUT=${FEDIT_WAIT_ACK_TIMEOUT:-30}
+
+# (git-editor-wait) One constant, spelled twice because `sleep` wants seconds
+# and the timeout arithmetic wants integers: keep them reciprocal. ~5 `sleep`
+# processes a second while a commit message is being written, and a close is
+# noticed within a fifth of a second.
+POLL_SECONDS=0.2
+POLLS_PER_SECOND=5
+
+# (git-editor-wait) How often, in polls, phase 2 asks whether FEdit is still
+# alive — every 10th tick, so 2 s. NOT every tick: `pgrep` costs ~2.6 ms of CPU
+# per call (measured: 200 calls, 0.52 s user+sys), which at the 5 Hz poll rate
+# would be ~1.3% of a core for as long as a commit message is being written; at
+# 0.5 Hz it is ~0.13%. The poll for the claim's DISAPPEARANCE stays at
+# POLL_SECONDS, because that is the close latency git sees.
+LIVENESS_EVERY_TICKS=10
+
 usage() {
     printf 'usage: fedit [path ...]\n'
+    printf '       fedit --wait <file>\n'
     printf '\n'
     printf 'Opens each file or folder in its own FEdit window (at most %s per call).\n' "$MAX_PATHS"
     printf 'A file opens with its containing folder as the window sidebar root; a\n'
     printf 'folder opens as the root with no file open. With no arguments, FEdit is\n'
     printf 'just launched or activated.\n'
     printf '\n'
+    # Written as "The --wait flag", not "--wait ...": a `printf` whose format
+    # string starts with a dash is parsed as an option and fails.
+    printf 'The --wait (-w) flag takes exactly one existing file and blocks until\n'
+    printf 'its window is closed, so a tool that hands over to an editor can use\n'
+    printf 'FEdit:\n'
+    printf '\n'
+    printf '    git config --global core.editor "fedit --wait"\n'
+    printf '\n'
     printf 'Set FEDIT_APP to point at FEdit.app if it is not at %s.\n' "$APP"
 }
 
-# `-h`/`--help` as the first argument only: after it, everything is a path (a
-# file really can be called "--help").
+# (git-editor-wait) Removes this invocation's marker in every form it can have
+# at the moment of the call: written-but-not-yet-renamed, unclaimed, or claimed.
+# Only ever called with $MARKER set (wait mode, past its assignment).
+remove_wait_marker() {
+    rm -f "$MARKER" "$MARKER.tmp" "$MARKER.claimed"
+}
+
+# (git-editor-wait) The wait itself, in two phases. Never returns: every path
+# out of it is an `exit`.
+await_marker_release() {
+    # Phase 1 is BOUNDED, and that is the whole point of the acknowledgement:
+    # the marker stops existing under its plain name only when a window with a
+    # live model has actually been handed the file. Every way an open can be
+    # dropped on the app side (the path vanished, no window opener was ever
+    # registered, the token was not applied) leaves the marker sitting here
+    # untouched, so those all surface as this timeout rather than as a hang.
+    ticks=0
+    ack_ticks=$((ACK_TIMEOUT * POLLS_PER_SECOND))
+    while [ -e "$MARKER" ]; do
+        if [ "$ticks" -ge "$ack_ticks" ]; then
+            remove_wait_marker
+            printf 'fedit: FEdit did not open %s within %s seconds; not waiting\n' \
+                "$WAIT_FILE" "$ACK_TIMEOUT" >&2
+            exit 1
+        fi
+        sleep "$POLL_SECONDS"
+        ticks=$((ticks + 1))
+    done
+
+    # Phase 2 is UNBOUNDED, deliberately: an editing session takes as long as it
+    # takes. Reaching here with no `.claimed` file at all means the window was
+    # opened and closed between two polls (or the app quit and swept the spool)
+    # — the same answer as a released claim, so the loop simply does not run.
+    #
+    # The liveness check is the only thing keeping this loop from spinning
+    # forever on an orphaned claim, so it carries NO cold-start state: getting
+    # here means FEdit renamed the marker, and that claim IS the sighting. The
+    # first poll that finds no FEdit is therefore already the answer. (A "wait
+    # until FEdit has been seen once" latch would instead wait for a sighting
+    # that a crash inside the 0.2 s after the claim can never deliver, and so
+    # would wait forever.)
+    #
+    # `$((… % LIVENESS_EVERY_TICKS))` is 0 on the FIRST tick, which is what keeps
+    # that immediate answer while still asking only every 2 s afterwards.
+    liveness_ticks=0
+    while [ -e "$MARKER.claimed" ]; do
+        if [ "$((liveness_ticks % LIVENESS_EVERY_TICKS))" -eq 0 ]; then
+            # Only `pgrep`'s OWN "no match" answer (status 1) means FEdit is
+            # gone. Every other nonzero status — 127 for no pgrep on PATH, 2/3
+            # for a pgrep that errored — is "cannot tell", and "cannot tell"
+            # must keep waiting: treating it as death would kill every HEALTHY
+            # wait the moment pgrep is unreachable, deleting the app's live
+            # claim on the way out. Waiting is safe here — the `.claimed` file
+            # disappearing still ends the loop whatever pgrep can or cannot say.
+            pgrep_status=0
+            pgrep -qx FEdit >/dev/null 2>&1 || pgrep_status=$?
+            if [ "$pgrep_status" -eq 1 ]; then
+                # FEdit is gone and the claim outlived it — it died without
+                # releasing (a crash; an ordinary quit releases everything it
+                # holds). Nothing will ever remove this file, so waiting for it
+                # is waiting forever.
+                rm -f "$MARKER.claimed"
+                printf 'fedit: FEdit quit without closing %s\n' "$WAIT_FILE" >&2
+                exit 1
+            fi
+        fi
+        sleep "$POLL_SECONDS"
+        liveness_ticks=$((liveness_ticks + 1))
+    done
+
+    exit 0
+}
+
+# `-h`/`--help` and `--wait`/`-w` as the first argument only: after it,
+# everything is a path (a file really can be called "--help").
+WAIT=0
 case "${1:-}" in
     -h|--help)
         usage
         exit 0
         ;;
+    -w|--wait)
+        WAIT=1
+        shift
+        ;;
 esac
 
 if [ "$#" -gt "$MAX_PATHS" ]; then
     printf 'fedit: too many paths (%s given, at most %s)\n' "$#" "$MAX_PATHS" >&2
+    usage >&2
+    exit 64
+fi
+
+# (git-editor-wait) Wait mode is the "be another tool's editor" contract, and
+# every tool that uses it (git, `crontab -e`) hands over exactly one
+# pre-existing file. Waiting on eight windows, or on a folder window that shows
+# no file at all, has no meaning — so it is a usage error, not a guess.
+if [ "$WAIT" -eq 1 ] && [ "$#" -ne 1 ]; then
+    printf 'fedit: --wait takes exactly one file (%s given)\n' "$#" >&2
     usage >&2
     exit 64
 fi
@@ -99,18 +236,117 @@ while [ "$processed" -lt "$argument_count" ]; do
     processed=$((processed + 1))
 done
 
+# (git-editor-wait) Everything the wait needs, set up before `open` runs: the
+# marker has to be on disk by the time the app looks for it.
+if [ "$WAIT" -eq 1 ]; then
+    WAIT_FILE=$1
+
+    # A directory (or a fifo, or a device) opens a window that shows no file, so
+    # nothing would ever claim the marker and the wait could only time out.
+    if [ ! -f "$WAIT_FILE" ]; then
+        printf 'fedit: --wait needs a regular file: %s\n' "$WAIT_FILE" >&2
+        usage >&2
+        exit 64
+    fi
+
+    # Checked HERE, before the first side effect (the spool `mkdir`, the marker,
+    # the `open`): an unusable timeout that surfaced later would abort the script
+    # with the marker already on disk and a window already open, orphaning the
+    # one and telling nobody about the other. Accepted shape: digits, no leading
+    # zero, at most 6 of them — done with `case` rather than arithmetic so a
+    # nonsense value never reaches `$((`. The leading-zero rejection is
+    # load-bearing, not pedantry: `$(( 08 ))` is an OCTAL parse error and
+    # `$(( 030 ))` is silently 24, so "all digits" alone is not "a number". The
+    # length cap keeps the tick arithmetic far away from int64 wraparound (a
+    # 19-digit value multiplied by POLLS_PER_SECOND wraps into a negative or
+    # near-infinite budget); 6 digits is already ~11 days of ack timeout.
+    case "$ACK_TIMEOUT" in
+        '' | *[!0-9]* | 0*) ACK_TIMEOUT_OK=0 ;;
+        *)                  ACK_TIMEOUT_OK=1 ;;
+    esac
+    if [ "$ACK_TIMEOUT_OK" -eq 1 ] && [ "${#ACK_TIMEOUT}" -gt 6 ]; then
+        ACK_TIMEOUT_OK=0
+    fi
+    if [ "$ACK_TIMEOUT_OK" -eq 0 ]; then
+        printf 'fedit: FEDIT_WAIT_ACK_TIMEOUT must be a whole number of seconds, at least 1: %s\n' \
+            "$ACK_TIMEOUT" >&2
+        exit 78
+    fi
+
+    # The spool is resolved HERE and nowhere else, deliberately: a launchd/cron
+    # context can have no HOME at all, and a top-level `$HOME` expansion under
+    # `set -u` would abort even a plain `fedit notes.md` there. FEDIT_WAIT_DIR is
+    # the harness's override; with neither, refuse rather than write into
+    # /Library/Application Support, which is not where the app will look.
+    if [ -z "${FEDIT_WAIT_DIR:-}" ] && [ -z "${HOME:-}" ]; then
+        printf 'fedit: --wait needs HOME (or FEDIT_WAIT_DIR) to place its marker\n' >&2
+        exit 78
+    fi
+    # This path is the protocol, spelled twice: once here and once as
+    # `WaitMarkers.spoolDirectory` in the app. Both harnesses assert this exact
+    # literal, which is the only thing keeping the two spellings together.
+    WAIT_DIR="${FEDIT_WAIT_DIR:-${HOME:-}/Library/Application Support/FEdit/wait}"
+
+    mkdir -p "$WAIT_DIR"
+    MARKER="$WAIT_DIR/$(uuidgen)"
+
+    # Trapped before the marker is written, so even the write-and-rename window
+    # is covered. Each trap `exit`s explicitly with 128+signo: a trap that only
+    # removed the marker would return into the poll loop below, find its file
+    # gone and exit 0 — telling git that a Ctrl-C'd edit succeeded. HUP is in the
+    # list because that is how a closed terminal abandons a wait.
+    trap 'remove_wait_marker; exit 130' INT
+    trap 'remove_wait_marker; exit 143' TERM
+    trap 'remove_wait_marker; exit 129' HUP
+
+    # PID first, then the canonical path verbatim, with no trailing newline: a
+    # path may itself contain newlines, so the app takes everything after the
+    # FIRST newline as the path. The PID is what lets the app garbage-collect a
+    # marker whose shim was killed outright — without it, one orphan naming a
+    # fixed path like .git/COMMIT_EDITMSG would mis-answer every later wait on
+    # that same path. Written aside and renamed into place, so a scan can never
+    # read a half-written marker.
+    printf '%s\n%s' "$$" "$WAIT_FILE" > "$MARKER.tmp"
+    mv "$MARKER.tmp" "$MARKER"
+fi
+
 # With no arguments this is just "launch or activate FEdit", which is what
 # `code`/`subl` do too — FEdit has a real empty-window state, so it is not a
 # dead end. The exit status is `open`'s, so a broken install still reports.
 if [ -d "$APP" ]; then
-    exec open -a "$APP" "$@"
+    if [ "$WAIT" -eq 0 ]; then
+        exec open -a "$APP" "$@"
+    fi
+
+    # (git-editor-wait) A wait cannot `exec`: it has work to do after `open`
+    # returns, and it has to see `open`'s status rather than inherit it —
+    # captured with `|| status=$?` because under `set -e` a bare nonzero `open`
+    # would kill the script with the marker still on disk.
+    status=0
+    open -a "$APP" "$@" || status=$?
+    if [ "$status" -ne 0 ]; then
+        remove_wait_marker
+        exit "$status"
+    fi
+    await_marker_release
 fi
 
 # No bundle at $APP: fall back to asking LaunchServices for an app named FEdit
 # (a copy installed somewhere else, still registered).
 if open -a FEdit "$@"; then
+    if [ "$WAIT" -eq 1 ]; then
+        await_marker_release
+    fi
     exit 0
 fi
 
+# (git-editor-wait) Nothing was opened, so nothing will ever claim the marker:
+# it has to go with this exit, or it would sit in the spool until some later
+# open scanned past it. The status stays 69 (the shipped "no bundle" contract),
+# not `open`'s own — a failing LaunchServices open in this branch means exactly
+# "no FEdit anywhere", which is what 69 says.
+if [ "$WAIT" -eq 1 ]; then
+    remove_wait_marker
+fi
 printf 'fedit: FEdit.app not found (looked in %s and LaunchServices); set FEDIT_APP\n' "$APP" >&2
 exit 69

@@ -126,10 +126,23 @@ final class WindowCloseGuardProxy: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        wrapped?.windowWillClose?(notification)
-        guard let window = notification.object as? NSWindow else { return }
-        window.delegate = wrapped
-        WindowCloseGuard.uninstallProxy(for: window)
+        // Main-thread by AppKit contract, stated to the compiler the same way `windowShouldClose`
+        // above does it.
+        MainActor.assumeIsolated {
+            // (git-editor-wait) Released BEFORE the forward, deliberately: SwiftUI's teardown runs
+            // inside `wrapped?.windowWillClose?` and can release the scene's `@StateObject`, and
+            // `model` is weak — after the forward there may be no model left to ask. This is also
+            // the only release point on the ordinary path, and it is on `willClose` rather than
+            // `shouldClose` on purpose: a close that gets cancelled (the save-failure escape, the
+            // one surviving cancel) never reaches here, so a cancelled close correctly leaves git
+            // still waiting on a window that is still open.
+            model?.releaseWaitMarker()
+
+            wrapped?.windowWillClose?(notification)
+            guard let window = notification.object as? NSWindow else { return }
+            window.delegate = wrapped
+            WindowCloseGuard.uninstallProxy(for: window)
+        }
     }
 
     override func responds(to aSelector: Selector!) -> Bool {
@@ -173,6 +186,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated {
             LaunchCoordinator.shared.noteLaunchFinished()
+        }
+    }
+
+    /// (git-editor-wait) Quitting is "done editing" as far as a waiting `fedit --wait` is concerned
+    /// — the same thing quitting any editor means to git, and with always-on autosave the file on
+    /// disk already holds what was typed. So the claims this process holds are released here — and
+    /// dead ones nobody else would ever collect are swept — in two passes:
+    ///
+    ///  1. per window, through the close guard's model, the same route a window close takes. This
+    ///     covers every live claim this process holds;
+    ///  2. a sweep of the `.claimed` entries whose creating shim is **gone** — crash residue from an
+    ///     earlier run, which nothing else will ever collect (the window that held it no longer
+    ///     exists, so pass 1 cannot reach it, and the shim that would have exited is dead).
+    ///
+    /// Pass 2 checks the creator rather than deleting every `.claimed` outright, because the spool
+    /// is *not* this process's alone: LaunchServices single-instancing is per bundle, so a
+    /// DerivedData build and an installed FEdit are two instances sharing one spool. An
+    /// unconditional sweep would release the other instance's live claims and exit its shims 0
+    /// mid-edit — git would take a commit message that is still being written.
+    ///
+    /// Best-effort throughout: a claim that survives this — a live shim's, held by a window pass 1
+    /// could not reach — leaves that shim in its phase-2 liveness check, which ends the wait once
+    /// this process is gone.
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            for window in NSApp.windows {
+                (window.delegate as? WindowCloseGuardProxy)?.model?.releaseWaitMarker()
+            }
+
+            let fileManager = FileManager.default
+            let spool = WaitMarkers.spoolDirectory
+            guard let names = try? fileManager.contentsOfDirectory(atPath: spool.path) else { return }
+            for name in names where name.hasSuffix(".claimed") {
+                let claimed = spool.appendingPathComponent(name, isDirectory: false)
+                guard WaitMarkers.creatorIsDead(claimed) else { continue }
+                try? fileManager.removeItem(at: claimed)
+            }
         }
     }
 

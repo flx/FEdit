@@ -1163,6 +1163,33 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
+    // MARK: - (git-editor-wait) The `fedit --wait` claim
+
+    /// The `<uuid>.claimed` file this window holds on behalf of a blocked `fedit --wait`, or `nil`
+    /// (almost always — only a window created by a waiting shim ever has one). Written exactly once,
+    /// by `ContentView.applyCLITokenIfNeeded`, at the moment this window is actually showing the
+    /// file the shim asked for; deleting it is what unblocks the shim, so it is the window's
+    /// promise, not a cache. See `WaitMarkers` for why the claim lives on disk.
+    ///
+    /// Deliberately **not** `@Published`: no view reads it, and publishing it would invalidate the
+    /// whole window's body on an open — for state whose only reader is a window-close callback.
+    var waitMarkerURL: URL?
+
+    /// Unblocks the waiting `fedit --wait`, if this window was opened by one. Called from
+    /// `WindowCloseGuardProxy.windowWillClose` (before it forwards, while this model is still
+    /// alive) and from `AppDelegate.applicationWillTerminate`, which is why it has to be idempotent:
+    /// clearing the property first means a second call has nothing to do, and a quit that closes
+    /// windows first cannot double-unlink.
+    ///
+    /// A failed unlink is left as it is on purpose. The shim is not stranded by it — its phase-2
+    /// liveness check ends the wait when this process goes away — and there is nothing useful to
+    /// report from a window that is in the middle of closing.
+    func releaseWaitMarker() {
+        guard let marker = waitMarkerURL else { return }
+        waitMarkerURL = nil
+        try? FileManager.default.removeItem(at: marker)
+    }
+
     // MARK: - New file creation (SPEC §7, §10)
 
     /// (new-file) The outcome of `createFile(named:)`. `.created` carries no inline message (the

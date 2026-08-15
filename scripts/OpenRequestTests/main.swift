@@ -20,10 +20,10 @@
 //  along with FEdit. If not, see <https://www.gnu.org/licenses/>.
 //
 //  Standalone assertion harness for `OpenRequest` (cli-open Tier 1) — the path→(root, file)
-//  mapping every external open goes through. Not part of the app target — compiled and run
-//  manually:
+//  mapping every external open goes through — and for `WaitMarkers` (git-editor-wait), the
+//  claim/GC scan behind `fedit --wait`. Not part of the app target — compiled and run manually:
 //
-//      swiftc FEdit/App/OpenRequest.swift scripts/OpenRequestTests/main.swift -o /tmp/openreqtests && /tmp/openreqtests
+//      swiftc FEdit/App/OpenRequest.swift FEdit/App/WaitMarkers.swift scripts/OpenRequestTests/main.swift -o /tmp/openreqtests && /tmp/openreqtests
 //
 //  Named `main.swift` because Swift only allows top-level statements in a file with that exact
 //  name when compiling multiple files together.
@@ -344,6 +344,187 @@ do {
     let roundTripped = try! decoder.decode(CLIOpenToken.self, from: try! JSONEncoder().encode(original))
     check(roundTripped == original, "current-version round trip yields an equal token (tolerance changed nothing for healthy tokens)")
 }
+
+// MARK: - (git-editor-wait) WaitMarkers: the spool constant
+
+section("WaitMarkers: the spool path IS the protocol constant")
+// The other half of this assertion lives in FeditShimTests, which runs the shim under a fake HOME
+// and checks where the marker lands. The path is spelled once here and once in `scripts/fedit`;
+// these two tests are the only thing holding those spellings together.
+check(WaitMarkers.spoolDirectory.path == NSHomeDirectory() + "/Library/Application Support/FEdit/wait",
+      "spoolDirectory is ~/Library/Application Support/FEdit/wait")
+check(WaitMarkers.spoolDirectory.hasDirectoryPath, "…spelled as a directory URL")
+
+// MARK: - (git-editor-wait) WaitMarkers: claiming
+
+let spool = fixtureRoot.appendingPathComponent("wait", isDirectory: true)
+
+/// Writes one marker exactly the way the shim writes it: PID, newline, then the path verbatim with
+/// no trailing newline. Defaults to this process's own (very much alive) PID.
+@discardableResult
+func writeMarker(path: String, pid: pid_t = getpid(), name: String = UUID().uuidString) -> URL {
+    let url = spool.appendingPathComponent(name, isDirectory: false)
+    fileManager.createFile(atPath: url.path, contents: Data("\(pid)\n\(path)".utf8))
+    return url
+}
+
+func resetSpool() {
+    try? fileManager.removeItem(at: spool)
+    try! fileManager.createDirectory(at: spool, withIntermediateDirectories: true)
+}
+
+func spoolEntries() -> [String] {
+    ((try? fileManager.contentsOfDirectory(atPath: spool.path)) ?? []).sorted()
+}
+
+section("Claiming a marker that names the file")
+resetSpool()
+let marker = writeMarker(path: notes.path)
+if let claimed = WaitMarkers.claimMarker(for: notes, in: spool) {
+    check(claimed.lastPathComponent == marker.lastPathComponent + ".claimed",
+          "the claim is the marker renamed to <name>.claimed")
+    check(!fileManager.fileExists(atPath: marker.path), "the unclaimed name is gone — the rename IS the claim")
+    check(fileManager.fileExists(atPath: claimed.path), "and the claimed name is what the window now holds")
+    // The exclusion the rename buys: nothing in memory records the claim, so this is the only
+    // thing keeping a second window from taking the same shim's marker.
+    check(WaitMarkers.claimMarker(for: notes, in: spool) == nil, "a claimed marker is not claimable again")
+} else {
+    check(false, "claimMarker returned nil for a marker naming the file")
+}
+
+section("A marker for some other file is left alone")
+resetSpool()
+let otherMarker = writeMarker(path: nested.path)
+check(WaitMarkers.claimMarker(for: notes, in: spool) == nil, "no marker names this file → nil")
+check(fileManager.fileExists(atPath: otherMarker.path), "the other file's marker is untouched")
+
+section("Two markers for the same file: one claim each, never the same one twice")
+resetSpool()
+let firstOfPair = writeMarker(path: notes.path)
+let secondOfPair = writeMarker(path: notes.path)
+if let claimedFirst = WaitMarkers.claimMarker(for: notes, in: spool),
+   let claimedSecond = WaitMarkers.claimMarker(for: notes, in: spool) {
+    check(claimedFirst != claimedSecond, "two waits on the same path get two different claims")
+    check(Set([claimedFirst.lastPathComponent, claimedSecond.lastPathComponent])
+        == Set([firstOfPair.lastPathComponent + ".claimed", secondOfPair.lastPathComponent + ".claimed"]),
+          "…which are exactly the two markers that were there")
+    check(WaitMarkers.claimMarker(for: notes, in: spool) == nil, "and a third call finds nothing left")
+} else {
+    check(false, "two same-path markers did not yield two claims")
+}
+
+section("Path spellings: both sides are standardized, so a /private prefix cancels out")
+// Measured, and the reason the compare standardizes BOTH sides rather than predicting the rewrite:
+// `standardizedFileURL` rewrites /private/tmp → /tmp only for a path that EXISTS, so this needs a
+// real file under /tmp (the fixture lives in $TMPDIR, which is /var/folders/… and is not rewritten).
+resetSpool()
+let tmpFile = URL(fileURLWithPath: "/tmp/OpenRequestTests-\(UUID().uuidString).md")
+fileManager.createFile(atPath: tmpFile.path, contents: Data("x\n".utf8))
+let privateSpelling = "/private" + tmpFile.path
+check(URL(fileURLWithPath: privateSpelling).standardizedFileURL.path != privateSpelling,
+      "the fixture really does exercise a rewritten spelling (/private/tmp → /tmp)")
+writeMarker(path: privateSpelling)
+check(WaitMarkers.claimMarker(for: tmpFile, in: spool) != nil,
+      "a marker written as /private/tmp/x is claimed for a file named /tmp/x")
+resetSpool()
+writeMarker(path: tmpFile.path)
+check(WaitMarkers.claimMarker(for: URL(fileURLWithPath: privateSpelling), in: spool) != nil,
+      "…and the other way round")
+try? fileManager.removeItem(at: tmpFile)
+
+// MARK: - (git-editor-wait) WaitMarkers: garbage collection and the entries it must not touch
+
+section("A dead creator's marker is deleted, not claimed")
+resetSpool()
+// pid_t.max is beyond any live PID (macOS PIDs are five digits), and `kill` reports ESRCH for it —
+// measured. This is the orphan case: a shim killed with -9, or one whose terminal closed before its
+// HUP trap ran. Left in place, it would answer — and be RELEASED by — some unrelated later wait on
+// the same fixed path, which for git is always the same .git/COMMIT_EDITMSG.
+let deadMarker = writeMarker(path: notes.path, pid: pid_t.max)
+check(WaitMarkers.claimMarker(for: notes, in: spool) == nil,
+      "a dead creator's marker is NOT claimed, even though its path matches")
+check(!fileManager.fileExists(atPath: deadMarker.path), "…it is deleted on the spot")
+check(spoolEntries().isEmpty, "and nothing is left behind under any name")
+
+section("A dead creator's marker for another path is collected too")
+resetSpool()
+let deadElsewhere = writeMarker(path: nested.path, pid: pid_t.max)
+check(WaitMarkers.claimMarker(for: notes, in: spool) == nil, "still nothing to claim")
+check(!fileManager.fileExists(atPath: deadElsewhere.path),
+      "GC is not conditional on the path matching — any dead creator's marker goes")
+
+section("Unparsable entries are skipped and NOT deleted")
+resetSpool()
+// The spool is a directory, and this function must never delete something it does not understand.
+let noNewline = spool.appendingPathComponent("no-newline", isDirectory: false)
+fileManager.createFile(atPath: noNewline.path, contents: Data("12345".utf8))
+let noPID = spool.appendingPathComponent("no-pid", isDirectory: false)
+fileManager.createFile(atPath: noPID.path, contents: Data("not-a-pid\n\(notes.path)".utf8))
+let zeroPID = spool.appendingPathComponent("zero-pid", isDirectory: false)
+fileManager.createFile(atPath: zeroPID.path, contents: Data("0\n\(notes.path)".utf8))
+check(WaitMarkers.claimMarker(for: notes, in: spool) == nil, "no claim comes out of junk")
+check(spoolEntries() == ["no-newline", "no-pid", "zero-pid"], "and every junk entry is still there")
+
+section("Already-claimed and half-written entries are never considered")
+resetSpool()
+let preClaimed = writeMarker(path: notes.path, name: "\(UUID().uuidString).claimed")
+let halfWritten = writeMarker(path: notes.path, name: "\(UUID().uuidString).tmp")
+check(WaitMarkers.claimMarker(for: notes, in: spool) == nil,
+      "a .claimed marker (another window's live claim) is not re-claimed")
+check(fileManager.fileExists(atPath: preClaimed.path), "…and is left exactly as it was")
+check(!fileManager.fileExists(atPath: halfWritten.path + ".claimed"),
+      "a .tmp marker (a shim mid-write) is not claimed either")
+check(fileManager.fileExists(atPath: halfWritten.path), "…and is left for its shim to rename")
+
+section("A FIFO in the spool is skipped, never opened")
+resetSpool()
+// Probed, and the reason `read` checks the file TYPE before it opens anything: `FileHandle` opens
+// with a blocking `open(2)`, and a FIFO with no writer never returns from it — the scan, and with it
+// the main actor, would be wedged by a file someone else dropped into a directory this protocol does
+// not own. The name here is UUID-shaped, exactly like a marker, so nothing but the type can save it.
+// (A regression makes this section HANG rather than fail. That is the defect itself, not the test.)
+let fifo = spool.appendingPathComponent(UUID().uuidString, isDirectory: false)
+check(mkfifo(fifo.path, 0o600) == 0, "the fixture really is a FIFO (mkfifo succeeded)")
+let fifoScanStarted = Date()
+let fifoClaim = WaitMarkers.claimMarker(for: notes, in: spool)
+let fifoScanSeconds = Date().timeIntervalSince(fifoScanStarted)
+check(fifoClaim == nil, "a FIFO is never claimed")
+check(fifoScanSeconds < 1,
+      "…and the scan returns promptly (\(String(format: "%.3f", fifoScanSeconds)) s), it does not block in open(2)")
+check(fileManager.fileExists(atPath: fifo.path), "…and it is left where it was, not deleted")
+
+section("A .tmp is collected when its creator is dead, and only then")
+resetSpool()
+// The `kill -9` between the shim's `printf` and its `mv`. Nobody else ever looks at another shim's
+// `.tmp`, so an uncollected one would sit in the spool forever, occupying a scan-budget slot. The
+// live one is the shim mid-write: still nobody's to claim, and NOT the scan's to delete either.
+let deadTmp = writeMarker(path: notes.path, pid: pid_t.max, name: "\(UUID().uuidString).tmp")
+let liveTmp = writeMarker(path: notes.path, name: "\(UUID().uuidString).tmp")
+check(WaitMarkers.claimMarker(for: notes, in: spool) == nil, "no .tmp is claimable, dead creator or live")
+check(!fileManager.fileExists(atPath: deadTmp.path), "a dead creator's .tmp is collected")
+check(fileManager.fileExists(atPath: liveTmp.path), "a live creator's .tmp is left for its own shim to rename")
+check(!fileManager.fileExists(atPath: liveTmp.path + ".claimed"), "…and was not claimed under any name")
+check(spoolEntries() == [liveTmp.lastPathComponent], "…so exactly one entry survives the scan")
+
+section("creatorIsDead: what the quit-time sweep asks of a .claimed entry")
+resetSpool()
+// `AppDelegate.applicationWillTerminate` sweeps `.claimed` residue on this. It must answer "dead"
+// only for a shim that really is gone: LaunchServices single-instancing is per bundle, so a
+// DerivedData build and an installed FEdit share this spool, and a quit that deleted every `.claimed`
+// would exit the OTHER instance's shims 0 in the middle of an edit.
+let deadClaim = writeMarker(path: notes.path, pid: pid_t.max, name: "\(UUID().uuidString).claimed")
+let liveClaim = writeMarker(path: notes.path, name: "\(UUID().uuidString).claimed")
+check(WaitMarkers.creatorIsDead(deadClaim), "a .claimed whose shim is gone is crash residue")
+check(!WaitMarkers.creatorIsDead(liveClaim), "a .claimed whose shim is alive is a live wait, and untouchable")
+let junkClaim = spool.appendingPathComponent("junk.claimed", isDirectory: false)
+fileManager.createFile(atPath: junkClaim.path, contents: Data("not-a-pid\n\(notes.path)".utf8))
+check(!WaitMarkers.creatorIsDead(junkClaim), "an entry that does not parse as a marker is never reported dead")
+check(!WaitMarkers.creatorIsDead(spool.appendingPathComponent("nothing-here.claimed", isDirectory: false)),
+      "and neither is a name that is not there at all")
+
+section("A missing spool is the normal state, not an error")
+try? fileManager.removeItem(at: spool)
+check(WaitMarkers.claimMarker(for: notes, in: spool) == nil, "a spool directory that does not exist yields nil")
 
 teardown()
 

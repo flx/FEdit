@@ -23,6 +23,7 @@ The sidebar is bounded to match: **each scanned root's tree is capped at ~50,000
 - `WindowGroup`-based: **multiple editor windows** opened via File → Open Folder… (Cmd+O), which opens a new window and prompts for a folder that becomes the new window's sole root (Cancel leaves an empty window).
 - File → New… (Cmd+N) is focused-window-scoped — it creates a file in the key window's target directory (§7) rather than opening a new window.
 - A file or folder handed to the app **from outside** (the `fedit` command, `open -a FEdit <path>`) always opens in a **new** window — no existing window, full or empty, is ever disturbed. The file's containing folder becomes that window's sole root and the file is opened in the editor; a folder argument just becomes the root. Several paths in one invocation give one window each (capped at 8 per delivery); a path that no longer exists is ignored. On a cold launch this window comes up **in addition to** the restored session's windows, and it is an ordinary window from then on — it is restored with the next session like any other.
+- (git-editor-wait) `fedit --wait <file>` takes **exactly one existing file**, opens it exactly as above, and blocks until that window closes or FEdit quits (either counts as "done editing", so `git config core.editor "fedit --wait"` works). The wait is bounded in every failure direction: an open that produces no window is reported as an error after a timeout rather than waited on forever.
 - Two window groups back this: `"editor"` (value-less) for Cmd+O/Cmd+N/restore, and `"cli-open"`, which presents the external open as the new window's **value** — the window a request lands in is the window the system created for it. An external open is applied **at most once, only by the process that issued it, and only to a window still empty at that moment**; a restored window — editor or cli-open alike — always wins with its own saved session state, and never re-runs the open it was originally created for (so a cli-open window quit before its first state save comes back empty). Each external open carries a unique identity, so repeating one gives a second window rather than refocusing the first.
 - Each window owns its own independent state: folder list, filter text, open file, cursor.
 - An ordinary launch always shows at least one window: the restored session's windows when there are any, otherwise one blank editor window — **including when the previous session ended with zero windows open** (a zero-window saved session must not produce a windowless launch). A launch whose only work is an external open shows that open's window instead. (zero-window-session-relaunch: a once-per-launch net presents the blank window if nothing else appeared; a launch into a hidden app is the recorded exception.)
@@ -211,8 +212,11 @@ FEdit/
                                 zero-window launch net (§3: a windowless launch gets one blank window)
   App/OpenRequest.swift         external-open path → (sidebar root, file to open), resolved on
                                 disk; plus CLIOpenToken, the window's presented value
+  App/WaitMarkers.swift         `fedit --wait` marker spool: the claim-on-apply scan, its dead-
+                                creator GC, and the spool path both sides spell (§3)
   App/WindowCloseGuard.swift    NSWindowDelegate proxy: flush-on-close/quit, Close-Without-Saving
-                                escape; app delegate's external-open (odoc) sink
+                                escape, wait-marker release; app delegate's external-open (odoc)
+                                sink and quit-time marker sweep
   Models/WorkspaceModel.swift   per-window state: roots, open file, dirty/save/autosave logic
   Models/FileNode.swift         tree node + breadth-first scanner (owns the skip predicate and the
                                 per-root node budget; records what it skipped, per root, for the
@@ -241,12 +245,15 @@ FEdit/
   Preview/MarkdownPreviewView.swift  read-only text view + scroll-to-anchor
 scripts/
   install.sh                    Release build + install of FEdit.app and the fedit shim
-  fedit                         /bin/sh command-line shim around `open -a` (§3 external opens)
+  fedit                         /bin/sh command-line shim around `open -a` (§3 external opens),
+                                plus the --wait marker protocol
   FileNodeTests, FilterQueryTests, FilterRowCacheTests, GitStatusTests,
   LogicalLineTests, MarkdownRendererTests, OpenRequestTests, RootScanTests,
   SnapshotTests, TreeSkipGateTests
-                                standalone swiftc-run regression harnesses (no XCTest target)
-  FeditShimTests                shell harness for scripts/fedit (stub `open`, no GUI)
+                                standalone swiftc-run regression harnesses (no XCTest target);
+                                OpenRequestTests compiles OpenRequest.swift + WaitMarkers.swift
+  FeditShimTests                shell harness for scripts/fedit (stub `open`/`pgrep`, no GUI), including
+                                the --wait cases (it plays the app's part on the spool by hand)
 ```
 
 ## 14. Implementation order

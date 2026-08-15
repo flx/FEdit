@@ -302,6 +302,17 @@ struct ContentView: View {
             workspace.addFolders([token.root])
             if let file = token.file {
                 workspace.requestOpen(file)
+                // (git-editor-wait) The acknowledgement, and the reason it is HERE rather than at
+                // token mint: claiming a marker means "a real window with a live model is showing
+                // this file", which is exactly what a blocked `fedit --wait` is waiting to hear.
+                // Every drop path upstream (vanished file, no window opener, an inert restored
+                // token, this block's own pristine re-check) therefore simply never acks, and the
+                // shim reports a bounded timeout instead of hanging. Ungated by "was this a wait?"
+                // because there is nothing to gate on — a plain open finds no marker naming its
+                // file and gets nil, *as long as* no unclaimed marker names it. Residual, recorded
+                // in the plan: a plain `fedit x` racing a `fedit --wait x` can claim the wait's
+                // marker before the wait's own token applies, and then owns the release.
+                workspace.waitMarkerURL = WaitMarkers.claimMarker(for: file, in: WaitMarkers.spoolDirectory)
             }
             LaunchCoordinator.shared.bringWindowToFront(for: workspace)
         }

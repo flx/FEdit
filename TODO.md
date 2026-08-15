@@ -10,6 +10,7 @@ files an item touches so overlapping items don't get batched in parallel.
 
 ## Features
 
+- [ ] (git-editor-wait) `fedit --wait` so fedit can be git's editor — git (and `crontab -e`, `GIT_EDITOR`, etc.) runs the editor command and blocks until it exits, but `scripts/fedit` is a thin `open -a` wrapper that returns immediately. Add a `--wait`/`-w` flag that keeps the CLI alive until the opened file's window closes (needs an app-side signal on window close, not `open -W`, which waits for the whole app to quit). Then `git config core.editor "fedit --wait"` works. Touches scripts/fedit, FEdit/App/OpenRequest.swift, FEdit/App/LaunchCoordinator.swift, FEdit/App/WindowCloseGuard.swift.
 
 ## Bugs
 

@@ -1,12 +1,14 @@
 # FEdit — Detailed Specification
 
-Version 1.0 — 2026-07-17. Expands `Specification.md` with the decisions from the design interview. This document is the implementation contract for v1.
+Version 1.1 — 2026-08-17. This document is the implementation contract for FEdit v1 and describes the code **as it stands**, not an intended future: every shipped item folds its own spec updates into the sections below. It absorbs and replaces the original one-page pitch (formerly `Specification.md`), whose brief is quoted in §1. Companions: [DONE.md](DONE.md) is the per-item record of what each change actually delivered, `TODO.md` holds open work (currently none), and [README.md](README.md) is the user-facing view.
 
 ## 1. Product overview
 
 FEdit is a lightweight macOS text editor with a strong focus on low memory usage. It provides a three-column window: folder sidebar, text editor with line numbers and syntax highlighting (Swift, Python, Markdown), and a Markdown preview column that appears only for Markdown files.
 
-**Memory goal:** working set well under 100 MB with a few small files open (motivating contrast: VS Code at ~1 GB). This goal drives two architectural choices: no web view for the preview, and plain AppKit text machinery instead of heavyweight editor frameworks.
+**The brief this expands:** *"a light weight, especially memory light weight text editor with Markdown preview capability and (simple) python, swift and markdown syntax highlighting"* — written against the observation that VS Code reaches ~1 GB of RAM while editing a couple of kB of text. The three columns, the one-file-at-a-time editor, the preview that exists only for Markdown, and the approximate (explicitly not instantaneous) scroll sync all come from that brief; everything below is a decision taken in its service.
+
+**Memory goal.** The operative rule is *no heavyweight machinery*: no web view for the preview, plain AppKit/TextKit 1 text views instead of an editor framework, and no file content held beyond the one open buffer per window. The honest measured figure is a steady state of **~80–190 MB** with only small files open — the (memory-use-audit) investigation traced that band to irreducible SwiftUI/AppKit/TextKit/CoreAnimation framework memory, finding no leak, no retain cycle, and no retained buffer (the one real defect it found, a full JSON encode of the session snapshot on every body evaluation, was fixed). Treat the band as the current floor and the goal as *add nothing that grows it* — not as a promise of a number below it. The order-of-magnitude gap to the ~1 GB motivating case is the thing being defended.
 
 The sidebar is bounded to match: **each scanned root's tree is capped at ~50,000 nodes** (low tens of MB, and the same cap bounds every derived per-node structure, e.g. filter mode's flat list), and a root that hits the cap declares it in the sidebar rather than showing a silently incomplete tree (§5.2). The cap is per root **per window** — several huge roots, or the same huge root in several windows, still multiply that cost.
 
@@ -23,7 +25,7 @@ The sidebar is bounded to match: **each scanned root's tree is capped at ~50,000
 - `WindowGroup`-based: **multiple editor windows** opened via File → Open Folder… (Cmd+O), which opens a new window and prompts for a folder that becomes the new window's sole root (Cancel leaves an empty window).
 - File → New… (Cmd+N) is focused-window-scoped — it creates a file in the key window's target directory (§7) rather than opening a new window.
 - A file or folder handed to the app **from outside** (the `fedit` command, `open -a FEdit <path>`) always opens in a **new** window — no existing window, full or empty, is ever disturbed. The file's containing folder becomes that window's sole root and the file is opened in the editor; a folder argument just becomes the root. Several paths in one invocation give one window each (capped at 8 per delivery); a path that no longer exists is ignored. On a cold launch this window comes up **in addition to** the restored session's windows, and it is an ordinary window from then on — it is restored with the next session like any other.
-- (git-editor-wait) `fedit --wait <file>` takes **exactly one existing file**, opens it exactly as above, and blocks until that window closes or FEdit quits (either counts as "done editing", so `git config core.editor "fedit --wait"` works). The wait is bounded in every failure direction: an open that produces no window is reported as an error after a timeout rather than waited on forever.
+- (git-editor-wait) `fedit --wait <file>` takes **exactly one existing file**, opens it exactly as above, and blocks until that window closes or FEdit quits (either counts as "done editing", so `git config core.editor "fedit --wait"` works). The wait is bounded in every failure direction: an open that produces no window is reported as an error after a timeout rather than waited on forever. The **command-line half** of both features — argument parsing, symlink canonicalization, exit codes, and the marker spool this app side claims, acknowledges and releases — is §15.
 - Two window groups back this: `"editor"` (value-less) for Cmd+O/Cmd+N/restore, and `"cli-open"`, which presents the external open as the new window's **value** — the window a request lands in is the window the system created for it. An external open is applied **at most once, only by the process that issued it, and only to a window still empty at that moment**; a restored window — editor or cli-open alike — always wins with its own saved session state, and never re-runs the open it was originally created for (so a cli-open window quit before its first state save comes back empty). Each external open carries a unique identity, so repeating one gives a second window rather than refocusing the first.
 - Each window owns its own independent state: folder list, filter text, open file, cursor.
 - An ordinary launch always shows at least one window: the restored session's windows when there are any, otherwise one blank editor window — **including when the previous session ended with zero windows open** (a zero-window saved session must not produce a windowless launch). A launch whose only work is an external open shows that open's window instead. (zero-window-session-relaunch: a once-per-launch net presents the blank window if nothing else appeared; a launch into a hidden app is the recorded exception.)
@@ -244,9 +246,9 @@ FEdit/
   Preview/MarkdownRenderer.swift  markdown → NSAttributedString + line anchors
   Preview/MarkdownPreviewView.swift  read-only text view + scroll-to-anchor
 scripts/
-  install.sh                    Release build + install of FEdit.app and the fedit shim
-  fedit                         /bin/sh command-line shim around `open -a` (§3 external opens),
-                                plus the --wait marker protocol
+  install.sh                    Release build + install of FEdit.app and the fedit shim (§15.3)
+  fedit                         /bin/sh command-line shim around `open -a` (§3 external opens,
+                                §15.1 arguments and exit codes), plus the --wait marker protocol (§15.2)
   FileNodeTests, FilterQueryTests, FilterRowCacheTests, GitStatusTests,
   LogicalLineTests, MarkdownRendererTests, OpenRequestTests, RootScanTests,
   SnapshotTests, TreeSkipGateTests
@@ -266,4 +268,48 @@ All items below have shipped, in this order (see [DONE.md](DONE.md) for the deta
 4. Syntax highlighting (Swift, Python, Markdown).
 5. Markdown renderer + preview column + scroll sync.
 6. Session persistence (scene snapshots, defaults) and multi-window polish.
-7. Font-size zoom, column header bars, the Cmd+O-opens-a-new-window rework, file-system watching, always-on autosave, the git "(changed)" badge, the Cmd+N/Cmd+O shortcut swap, File → New…, filter-query anchors, and sidebar row wrapping — each folded its own spec updates into the sections above; see `TODO.md`/`DONE.md` for anything still open.
+7. Font-size zoom, column header bars, the Cmd+O-opens-a-new-window rework, file-system watching, always-on autosave, the git "(changed)" badge, the Cmd+N/Cmd+O shortcut swap, File → New…, filter-query anchors, and sidebar row wrapping.
+8. Distribution and the command line (§15): `scripts/install.sh`, then `fedit <path>` external opens (§3), then `fedit --wait` so FEdit can be git's `core.editor`.
+9. A round of correctness and cost work on already-shipped code, all of it spec-visible: the root scan moved off the main thread and then consolidated behind one per-root scheduler; filter mode's flat rows cached instead of re-walked per render; the FSEvents skip gate aligned with the scanner's own recorded verdicts; path containment fixed for a `/` root; `CLIOpenToken` given a tolerant decode; the installer's shim skipped for non-default destinations; the zero-window relaunch net; and the ~50,000-node per-root tree budget (§1, §5.2).
+
+Each item folded its own spec updates into the sections above. `TODO.md` is currently **empty** — every planned item has shipped. New work is added there as a slug, planned under `plans/`, and folded back into these sections when it lands.
+
+## 15. Command line & installer
+
+Two shell scripts sit outside the app bundle and have contracts of their own. Both are exercised by `scripts/FeditShimTests/run.sh`, which runs the shim against a stub `open`/`pgrep` under a fake `HOME` (no GUI); `scripts/OpenRequestTests` pins the app half.
+
+### 15.1 `scripts/fedit` — the command-line shim
+
+- A `/bin/sh` wrapper around `open -a`. It resolves **paths only**; which window a path lands in is entirely the app's business (§3 — always a new one).
+- **Argument handling.** `-h`/`--help` and `-w`/`--wait` are recognized as the **first argument only**; after that every argument is a path, because a file really can be called `--help`. Help goes to stdout. Every path is canonicalized with `/bin/realpath`, so symlinks are resolved (the usual command-line convention) and the sidebar shows the *real* containing folder — unlike Cmd+O, which uses the picked path verbatim (§5.1).
+- **At most 8 paths** per invocation. The app enforces the same cap silently; the shim makes it a usage error, which is the more useful answer.
+- **App resolution.** `install.sh` rewrites the shim's `APP` to wherever the bundle was installed; `FEDIT_APP` overrides it. If no bundle exists there, the shim falls back to asking LaunchServices for an app *named* FEdit — so a stale `FEDIT_APP` can quietly open a differently-located copy and still succeed.
+- **Exit codes** (`sysexits` where one fits):
+
+  | Code | Meaning |
+  |---|---|
+  | `open`'s status (normally 0) | success |
+  | 64 (`EX_USAGE`) | more than 8 paths, or a `--wait` naming anything but exactly one existing regular file |
+  | 66 (`EX_NOINPUT`) | a path does not exist — **nothing** is opened, not even the valid paths |
+  | 69 (`EX_UNAVAILABLE`) | `FEdit.app` could not be found by either route |
+  | 78 (`EX_CONFIG`) | `--wait` is misconfigured: no spool directory can be located (neither `FEDIT_WAIT_DIR` nor `HOME` is set), or `FEDIT_WAIT_ACK_TIMEOUT` is not a whole number of seconds |
+  | 1 | a wait was abandoned: never acknowledged within the ack timeout, or FEdit died still holding the claim |
+  | 128 + n | a signal (INT, TERM, HUP) ended a wait |
+
+### 15.2 The `--wait` marker protocol
+
+`open` offers no way to be told about **one window's** fate — `open -W` waits for the whole app to quit, and the `odoc` Apple event carries nothing but paths — so the signal goes through the filesystem. This is the only protocol between the two halves; everything else is just paths.
+
+- **Spool:** `~/Library/Application Support/FEdit/wait` (`FEDIT_WAIT_DIR` overrides it for tests). The path is spelled twice — `scripts/fedit` and `App/WaitMarkers.swift` — and held together only by assertions in both harnesses.
+- **Marker format:** the shim's own PID, a newline, then the canonical path verbatim with no trailing newline (a path may itself contain newlines, so everything after the *first* one is the path). Written as `.tmp` and renamed into place.
+- **Claim = acknowledgement.** The window that ends up showing that file claims the marker by renaming it to `<name>.claimed`, at token *apply* time — a real window, on screen, with a live model, holding the file. Every way an open can be dropped upstream therefore simply never claims. `rename` of a given source succeeds exactly once, so two waits on the same path can never claim the same marker, and the state is crash-visible rather than in-memory.
+- **Release** happens when that window closes, and a quit sweeps everything the app still holds.
+- **Two phases, bounded where it matters.** Phase 1 (waiting for the claim) is bounded by `FEDIT_WAIT_ACK_TIMEOUT`, default **30 s** — this is what turns "the open produced no window" into exit 1 instead of a hang. Phase 2 (waiting for the release) is **unbounded by design** — an editing session takes as long as it takes — and is kept from spinning forever on an orphaned claim by a `pgrep -qx FEdit` liveness check every ~2 s. Only `pgrep`'s own "no match" (status 1) counts as death; every other nonzero status means "cannot tell" and keeps waiting.
+- **Garbage collection** rides along on each scan: a marker whose creator PID is gone (`kill(pid, 0)` returning `ESRCH`; `EPERM` means alive and someone else's) is deleted the moment it is seen, whatever path it names — otherwise a `kill -9`'d shim's marker would be claimed *and released* by an unrelated later wait on the same fixed path, which for git is always the same `.git/COMMIT_EDITMSG`. Orphaned `.tmp` entries are collected the same way. Anything the scan cannot parse is **skipped, never deleted** — the spool is a directory and other things may write there. A scan costs a bounded prefix (512 entries, 4 KB per marker read) because it runs on the main actor at window apply.
+- **Consequences worth stating.** Aborting a commit means deleting the message text and closing the window (autosave means there is no "close without saving", §7); quitting FEdit while the message window is open counts as finishing. `sudo crontab -e` is **not** supported — the marker lands in root's spool, where FEdit never looks, so it gives up after the ack timeout.
+
+### 15.3 `scripts/install.sh`
+
+- Builds the **Release** configuration with `xcodebuild` into a fixed derived-data folder under `$TMPDIR` (outside the repo), then installs `FEdit.app` into `/Applications`, replacing any previous copy. A single optional argument installs elsewhere; a non-writable destination is a hard error before any build.
+- Also drops a `fedit` shim into the first writable directory among `$FEDIT_BIN_DIR`, `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` (created if needed), rewriting its `APP` to the destination actually used. It **never** uses `sudo`, and a shim that cannot be placed is a warning, not a failed install.
+- A **non-default destination skips the shim** unless `FEDIT_BIN_DIR` is set explicitly — installing a throwaway copy to a temp directory must not silently repoint the user's real `fedit` at it.

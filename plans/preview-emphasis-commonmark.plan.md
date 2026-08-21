@@ -374,6 +374,251 @@ slip shows up as a compile error rather than a mismatch nobody can attribute.
 HEAD is **278**, of which exactly **3** change. Rev 1's "275 non-emphasis" was
 misleading, since 275 includes the eight unchanged emphasis assertions.
 
+## Rev 3 (2026-08-21) — what Rev 2 got wrong, found during implementation
+
+Rev 2 was itself reviewed, and three of its "fixes" were wrong. Each was caught
+by **measurement, not reading**, and each is recorded because the pattern is the
+point: a fix folded in from a review is not thereby correct.
+
+### E1 — R12's assertion count is wrong, and I had the data to know
+
+R12 "corrected" the baseline to **278**. It is **275**. The plan review reported
+278 and I folded it in without checking — even though this run's own gate had
+printed `MarkdownRendererTests: 275 PASS` immediately after `(preview-tables)`
+landed. Rev 1's original 275 was right and R12 made it worse. The lesson is
+narrow and worth keeping: **a number from a reviewer is evidence, not a
+correction**, and I had contradicting first-hand data in front of me.
+
+### E2 — R2's replacement oracle does not catch the mutant it was introduced for
+
+R2 replaced Rev 1's broken conservation property with a
+delimiter-**reconstructing** one, on the reviewer's arithmetic that the
+empty-emphasis mutant would reconstruct to `"**** bold****"` and so be caught.
+That arithmetic assumed `.bold` nodes. The mutant's actual output is
+`[.italic([]), .text(" bold"), .italic([])]` — **italic**, one asterisk per side
+per node — which reconstructs to `*` `*` `" bold"` `*` `*` = exactly
+`"** bold**"`, the input. The property **holds**, so it does not catch it.
+
+Measured further: run against **HEAD's** parser over both corpora, the
+reconstruction property scores **0 violations** — HEAD satisfies it too. So it
+could never have been "the independent oracle" R2 claimed.
+
+**Resolution:** the implementer added a second property — **no empty `.bold` or
+`.italic` node anywhere in the tree** — which scores **421 and 10 violations
+against HEAD** and 0 here. That is the one carrying the evidence. The
+reconstruction property is kept because it is not useless: deleting
+`removeDelimitersBetween` from production makes it fail on both corpora, a
+mutation no hand-written tree catches. Two properties, each catching what the
+other misses.
+
+### E3 — R3's `openers_bottom` numbers do not reproduce in the implementation R3 specifies
+
+R3 replaced Rev 1's untriggerable complexity test with `"a** * "` × 2,000, citing
+1,999 backward steps with `openers_bottom` versus 1,999,000 without. In the
+shipped implementation both measure **0 steps either way** — because R3's *own*
+fix (ii), removing a failed non-opening closer from the delimiter list, disposes
+of the shape before anything can scan past it. Both of R3's replacement inputs
+are untriggerable for the mechanism they were chosen to exercise. R3 diagnosed
+the shape wrongly for the second time in a row.
+
+**Resolution:** the implementer searched all 1,092 repeating units of length ≤ 6
+over {`a`, `*`, space} for superlinear growth. The shape that *does* exercise
+`openers_bottom` is `"a*a **"`: **5,999 steps with versus 2,003,000 without** at
+×4,000, and **59,999 versus 200,030,000 (0.054 s versus 0.784 s)** at ×40,000.
+Added as a third case; R3's two inputs are kept but re-attributed to the removal
+rule they actually test. With both rules in place every shape found is linear
+(worst doubling ratio 2.01).
+
+### E4 — a memory regression no revision of this plan anticipated
+
+Found by measuring, not by reading: the token stream is proportional to block
+length, so a 1.2 MB single paragraph containing 300,000 delimiter runs went
+**74.4 MB → 165.9 MB** peak RSS. Shrinking the token payload to index-only
+(56 → 40 bytes) bought **nothing on its own** (164.1 MB — geometric array growth
+rounded the smaller array straight back up); the fix is that *plus* a capacity
+reserve computed from the tokenizer's pre-scan, giving **121.1 MB**.
+
+A **1.63× residual remains and is deliberately not closed.** Closing it needs
+Int32 indices, which buys ~20 MB at the cost of a silent 2^31 block-length cliff
+— a worse trade for a text editor whose open cap is 100 MB. It is measured,
+documented in the code, and stated here rather than left to be rediscovered.
+
+Realistic input is unaffected or **better**: `SPEC.md` × 20 (1.09 MB, 3,700
+blocks) 28.21 → 28.34 MB; 1.2 MB of ordinary prose **78.2 → 38.0 MB**; 1 MB of
+`[` 84.5 → 47.9 MB. The regression is specific to pathologically
+delimiter-dense single blocks.
+
+### What Rev 2 got right, verified against HEAD's binary rather than trusted
+
+R7 (`render("a****b")` really was `"ab"`, and `****` alone really is a horizontal
+rule that never reaches the inline parser); R1's two scoping tables, including
+that `` *a `c b* `` genuinely does **not** change; R9 (ablating the rule of three
+yields exactly `italic([italic("a"), text("b")]), text("*")`); and R5's nine
+`CharacterSet.punctuationCharacters` gaps plus the FF/ZWSP `whitespaces` errors.
+
+## Code review — `adv-review-behavior`'s findings were substantially fabricated
+
+Recorded in full because it is the only review in this run that was wrong, and
+because the failure mode is instructive rather than random.
+
+It reported **five findings, four marked CONFIRMED with code quotations and
+traces. Four are refuted against source.**
+
+- **Finding 1 (HIGH, "silent text loss")** quoted this as shipped code:
+  `if !closerRun.canOpen { delimiters.remove(at: closerIndex); tokens.removeToken(at: closerTokenIndex) }`.
+  **`removeToken` does not exist in the file, and neither does that block.** Its
+  claimed reproducer `` a1*b**c*d**e `f` `` was said to drop the code span; run
+  against the shipped parser the span is present, and against HEAD the new output
+  is *longer*, not shorter. Refuted three ways: the exact reproducers; an
+  exhaustive conservation sweep over **66,437** inputs to length 5 across
+  `a * ` [ ] ( ) 1` with zero emphasis text loss; and **200,000** randomized
+  8-to-27-character inputs where the only cases rendering fewer characters than
+  HEAD are R1's *documented* link-scoping change (a URL moving into a link
+  attribute instead of being shown as literal text).
+- **Finding 2 (MEDIUM)** rests on a function `scanDelimiterRuns` at a cited line.
+  **No such function exists**; `tokenize` is the only pass.
+- **Finding 3 (LOW)** claimed `isCommonMarkPunctuation` returns false for `^` and
+  `` ` ``, predicting `x**^**y` → `<strong>^</strong>`. Both characters are
+  explicitly in the ASCII list, and measured: all nine of R5's symbols return
+  true, `x**^**y` parses as literal text, matching markdown-it exactly.
+- **Finding 5 (NIT)** quoted a harness message ("the rule of three forbids this
+  pair") that **does not appear anywhere in the file**.
+- **Finding 4 (LOW, documentation)** is the only one that stands, and it is a
+  judgement I independently agreed with: SPEC's "resolved over the whole block"
+  was accurate but abstract, and did not tell a reader that `*a [b* c](d)` now
+  produces a **live clickable link** where it used to produce plain text. SPEC
+  §8.2 now says so outright, including that rendered output can legitimately be
+  shorter for such inputs.
+
+**The likely mechanism, and why it matters:** the reviewer built ten mutants of
+the parser in its scratch directory. Finding 1's quoted code reads exactly like
+one of them. The most economical explanation is that mutant output was recorded
+as production behaviour — which also explains why its *verification* sections are
+sound (they independently corroborate the implementer's measurements and mine on
+the three changed trees, R8's three rules, coalescing at depth, both oracle
+claims, and the 44-file repo differ) while its *findings* are not.
+
+**Disposition:** the corroborated clean verdict is kept, since three independent
+parties now agree on it. The four fabricated findings are rejected with the
+evidence above rather than "fixed", because fixing code that matches a
+fabricated quotation would have meant editing a working parser to satisfy a
+description of a different one. AUTONOMY's verification duty is the only reason
+this did not happen: *"Subagents are frequently wrong in confident prose … spot-check
+cited evidence."* Here the evidence was not merely drifted line numbers — the
+cited symbols did not exist.
+
+## The critical defect: a 1.9 KB document crashed the app
+
+**Found by `adv-review-edge`, independently confirmed by `adv-review-behavior`,
+then reproduced and threshold-bisected by me before any fix was attempted.**
+
+HEAD's parser made nested emphasis impossible by construction — an italic body
+could never contain a `*` — so `emitInline`'s recursion depth was ≤ 3. The
+delimiter stack makes nesting depth **unbounded and linear in input length**, and
+`MarkdownRenderer.render` runs on `MarkdownPreviewView`'s render queue, whose
+worker threads get **512 KB of stack, not the main thread's 8 MB**.
+
+My bisection, rendering on a real `.utility` `DispatchQueue`:
+
+```
+depth 400 -> exit 0        depth 470 -> exit 138 (SIGBUS)  <- 1,881 chars
+depth 460 -> exit 0        depth 600, 1000 -> exit 138
+```
+
+And it was reachable from an ordinary-looking file, because paragraph lines merge
+with a space *before* inline parsing: 500 lines of `see *note` followed by 500 of
+`then note* here` is **12,999 bytes, one block, exit 138**. HEAD renders it fine.
+An uncatchable process kill on a background thread — it takes unsaved editor
+state with it.
+
+**Fixed in the parser, not the emitter**, for two reasons. First, this project's
+convention is to bound a derived structure and declare it: SPEC §5.2 caps tree
+nodes at 50,000, §6.5 caps find matches at 20,000, and `(preview-tables)` capped
+table cells at 50,000 earlier in this same run. Second, an iterative `emitInline`
+would not have been enough — **two further recursions exist at greater depths**:
+releasing the `[InlineNode]` tree, and synthesized `Equatable`. Only bounding the
+tree fixes all three.
+
+`MarkdownInlineParser.emphasisNestingLimit = 32`. Each delimiter run carries a
+depth maintained bottom-up; a pair whose depth would exceed the cap simply does
+not form, and both runs emit literally — the same path a rule-of-three rejection
+takes. `removeDelimitersBetween` propagates `max(depth)` onto the surviving
+opener, so the bound is exact rather than approximate.
+
+Verified by me after the fix — every previously-crashing depth now completes:
+
+```
+470 -> exit 0    1,000 -> exit 0    20,000 -> exit 0    100,000 -> exit 0
+the 13 KB prose file -> exit 0
+```
+
+The cap costs nothing real: depth 32 needs 64 balanced asterisks around one
+atom, and every document in this repository is depth ≤ 2. Both sides of the
+boundary are pinned by tests computed **from the constant**, so changing it
+cannot leave a stale hard-coded number passing.
+
+## The coverage gap that was hiding a live bug
+
+`adv-review-behavior` mutated `originalLength` → `remaining` in
+`ruleOfThreeForbids` and found **zero hand-written assertions fail** — only the
+differential fuzz, and only because `ReferenceInlineParser` kept the correct
+version. Delete it from both copies and the whole suite stays green. So R6, which
+Rev 2 called load-bearing, was pinned by nothing hand-written.
+
+I passed the plan review's claim that `**a*b**` discriminates the rule to the
+implementer **without checking it. It does not** — the reviewer actually ran the
+mutant and `**a*b**`, `***x***` and `*foo**bar**baz*` are all unchanged by it.
+That was my error, and the correction came from measurement rather than from
+re-reading.
+
+The real discriminator, `*a***a*`, then turned out to be **already wrong in the
+shipped code**, independently of any mutant: correct is
+`text(" "), italic[a], text("*"), italic[a]`; shipped produced
+`italic[a], text("**a*")`. Not a rule-of-three issue at all — the
+**leftover-ordering** rule, where a pair consuming fewer than all of a run's
+asterisks must leave the residue on the correct side. 813 of 40,000 short inputs
+diverged from CommonMark on it. **So the untested rule was concealing a live
+correctness defect, and finding the gap is what surfaced it.**
+
+## Other findings, all applied
+
+- **Trait composition (MEDIUM).** `InlineStyle` had `font`/`boldFont`/`italicFont`
+  and no bold-italic face, and each nested case *replaced* the trait instead of
+  composing it. `*a **b** c*` rendered `b` in plain bold, **losing the outer
+  italic** — the exact example SPEC §8.2 now advertises — and `*(*foo*)*` changed
+  output versus HEAD. `PreviewStyle` gains `boldItalicFont`; assertions are now
+  **render-level** (`NSFontManager.traits(of:)`), not tree-level.
+- **The five "call site" assertions exercised no call site** — each parsed a block,
+  extracted the text, and called the inline parser directly, so all five would
+  pass even if `emitBlock` stopped calling it entirely. *This is what hid the font
+  defect.* Three now go through `render`; two are renamed to say they pin text
+  extraction.
+- **Memory figures corrected.** Two comments disagreed with each other (121.1 vs
+  74.4 MB in one place, 164.1 vs 78.0 in another, for the same input). Reconciled
+  to one measured set, and the **worst shape was not the one recorded**: `"*a"` ×
+  600k is **1.92×** HEAD, not the 1.63× of `"a*a "`. Prose is genuinely better at
+  **0.49×**.
+- **Doc corrections**: `appendDelimiterRun` claimed `"a* "` is neither-flanking
+  when it is right-flanking (it leaves the list by a different mechanism); SPEC's
+  `****` sentence now says a whole line of `***`/`****` is a horizontal rule that
+  never reaches the inline parser; the step-count table now matches the shipped
+  counter.
+- **R1 quantified**: over 20,000 bracket-heavy inputs, 6,747 trees differ, **188
+  (0.94%) gain a `.link`**, 1,851 change code-span structure — with the property
+  recorded that `URL(string:)` accepts `javascript:` and `file:`, so the set of
+  source text that becomes a live link is enlarged. **Deliberately not filtered**:
+  pre-existing for genuine links, orthogonal to emphasis, and wants its own item.
+
+## The quadratic claim: unreproduced
+
+One edge report claimed `**a` × N is quadratic (0.104 → 0.410 → 1.634 → 6.519 s,
+~4× per doubling). **Three independent measurements say linear**: one reviewer
+timed all 363 repeating units of length ≤ 5 over `{a, *, space}`; another timed
+all periodic units of length 1–5 over a six-character alphabet; and the
+implementer measured `**a` × N directly against HEAD at 1.8× constant factor with
+doubling ratios 1.95 / 2.01 / 2.02, both before and after the depth cap, at `-O`
+and `-Onone`. Recorded as unreproduced rather than silently dropped.
+
 ## Out of scope, deliberately
 
 - `_` emphasis. Not supported today; adding it is a separate subset decision.

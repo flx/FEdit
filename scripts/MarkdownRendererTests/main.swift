@@ -334,7 +334,15 @@ check(
 
 section("Criterion 11: bold")
 check(MarkdownInlineParser.parse("**b**") == [.bold([.text("b")])], "**b** -> bold")
-check(MarkdownInlineParser.parse("****") == [.bold([])], "**** -> .bold([]) (empty, legal)")
+// (preview-emphasis-commonmark) **CHANGED EXPECTED VALUE — 1 of exactly 3 in this file.** A run of
+// four `*` with the start of the block on one side and the end on the other is neither left- nor
+// right-flanking, so it can neither open nor close and stays literal. The old `.bold([])` was not
+// just a different shape: `emitInline` appends nothing for empty children, so all four characters
+// were DELETED from the rendered output. That loss is invisible on THIS input — `isRule` accepts
+// three-or-more `*`, so a line of `****` is a horizontal rule and never reaches the inline parser
+// (plan R7 corrects Rev 1 on exactly this) — which is why the embedded form is asserted separately
+// below, where HEAD really did render `a****b` as `ab`.
+check(MarkdownInlineParser.parse("****") == [.text("****")], "**** -> text(\"****\"): a run flanked by neither text nor punctuation can neither open nor close")
 check(MarkdownInlineParser.parse("**b") == [.text("**b")], "unmatched ** renders literally")
 check(
     MarkdownInlineParser.parse("**bold *italic* code `x`**")
@@ -352,25 +360,43 @@ check(
     "italic content is parsed for code spans"
 )
 
-// MARK: - Criterion 13: Literality + closer-selection (four adversarial trees)
+// MARK: - Criterion 13: Literality + delimiter-run pairing (four adversarial trees)
+//
+// (preview-emphasis-commonmark) This section used to be titled "closer-selection rule" and existed
+// to pin the rule that item REVERSED: the closer was the nearest matching delimiter, chosen with no
+// backtracking and no flanking test. Two of its four trees changed as a result, and each is
+// justified inline. The other two are unchanged and are asserted here as regression guards for the
+// new algorithm, not as leftovers — `**a*b**` in particular is the case where CommonMark's rule of
+// three FORBIDS a pair, so ablating that rule trips it (plan R9).
 
-section("Criterion 13: closer-selection rule (adversarial cases)")
+section("Criterion 13: delimiter-run pairing (adversarial cases)")
 check(
     MarkdownInlineParser.parse("**a*b**") == [.bold([.text("a*b")])],
     "**a*b** -> bold(\"a*b\") (lone inner * is literal)"
 )
+// (preview-emphasis-commonmark) **CHANGED EXPECTED VALUE — 2 of exactly 3.** The old rule made the
+// nearest `**` the closer, which bolded a leading asterisk and stranded a literal `*` at the end.
+// The delimiter stack matches the same pair of runs twice: two asterisks from each side build the
+// strong node, then the one asterisk left on each side wraps it in emphasis. `<em><strong>x</strong>
+// </em>` is what every other renderer produces.
 check(
-    MarkdownInlineParser.parse("***x***") == [.bold([.text("*x")]), .text("*")],
-    "***x*** -> bold(\"*x\") + text(\"*\")"
+    MarkdownInlineParser.parse("***x***") == [.italic([.bold([.text("x")])])],
+    "***x*** -> italic(bold(\"x\")): one run matched twice, 2 asterisks then 1"
 )
 check(
     MarkdownInlineParser.parse("**a**b**") == [.bold([.text("a")]), .text("b**")],
     "**a**b** -> bold(\"a\") + text(\"b**\") (final ** literal, coalesced with b)"
 )
+// (preview-emphasis-commonmark) **CHANGED EXPECTED VALUE — 3 of exactly 3, and the one this whole
+// item was filed for.** Three sibling italics were *visually* near-correct by accident (adjacent
+// italic runs look like one) but the tree was wrong, and no opener-only flanking rule could fix the
+// stray-asterisk bug without wrecking it: the third italic opened at index 7, whose next character
+// is a space, so "an opener may not be followed by whitespace" turns the tail into a literal
+// `text("* c*")`. Only the full algorithm gives the nesting the construct actually means.
 check(
     MarkdownInlineParser.parse("*a **b** c*")
-        == [.italic([.text("a ")]), .italic([.text("b")]), .italic([.text(" c")])],
-    "*a **b** c* -> italic(\"a \") + italic(\"b\") + italic(\" c\")"
+        == [.italic([.text("a "), .bold([.text("b")]), .text(" c")])],
+    "*a **b** c* -> italic(\"a \", bold(\"b\"), \" c\"): emphasis nests"
 )
 
 section("Criterion 13: literal coalescing + no character loss")
@@ -398,6 +424,538 @@ for sample in ["hello world", "no delimiters here 42", "a b c d e", "日本語 �
 do {
     let long = String(repeating: "x", count: 10_000)
     check(MarkdownInlineParser.parse(long) == [.text(long)], "10 000-char delimiter-free line -> one text node")
+}
+
+// MARK: - (preview-emphasis-commonmark): the delimiter-stack algorithm
+//
+// The item that replaced "nearest closer, no backtracking" with CommonMark 0.30's delimiter-run +
+// delimiter-stack algorithm. The three trees it changed are asserted (and justified) in criteria 11
+// and 13 above, next to the eight it did not change; everything below is new ground.
+//
+// Every expected tree here is HAND-WRITTEN from the spec's rules rather than captured from the
+// implementation, because the two fuzz oracles at the bottom of this file are property-based: they
+// prove no character is invented or lost, not that any particular pairing is the right one. Only
+// these pin the pairing.
+
+section("(preview-emphasis-commonmark) criteria 1-3: nesting, partial consumption, no character loss")
+check(
+    MarkdownInlineParser.parse("***x**") == [.text("*"), .bold([.text("x")])],
+    "***x** -> text(\"*\") + bold(\"x\"): leftover OPENER asterisks emit BEFORE the node"
+)
+check(
+    MarkdownInlineParser.parse("**x***") == [.bold([.text("x")]), .text("*")],
+    "**x*** -> bold(\"x\") + text(\"*\"): leftover CLOSER asterisks emit AFTER the node"
+)
+check(
+    MarkdownInlineParser.parse("*(*foo*)*") == [.italic([.text("("), .italic([.text("foo")]), .text(")")])],
+    "*(*foo*)* -> em(\"(\", em(\"foo\"), \")\"): emphasis nests inside emphasis"
+)
+check(
+    MarkdownInlineParser.parse("**foo*bar*baz**")
+        == [.bold([.text("foo"), .italic([.text("bar")]), .text("baz")])],
+    "**foo*bar*baz** -> strong containing an em: the inner pair does not steal the outer closer"
+)
+// (plan R7) The character loss the `****` assertion above cannot show, because a whole line of `*`
+// is a horizontal rule. Embedded, HEAD rendered this as "ab" — `emitInline` appends nothing for
+// `.bold([])`'s children, so four source characters vanished from the preview.
+check(
+    MarkdownRenderer.render("a****b").output.string == "a****b",
+    "render(\"a****b\") keeps all six characters (HEAD rendered \"ab\" — four deleted)"
+)
+
+section("(preview-emphasis-commonmark) criterion 7: the rule of three")
+// CommonMark rule 9/10: when either run can both open and close, a pair is forbidden if the sum of
+// the two runs' ORIGINAL lengths is a multiple of 3, unless both lengths are multiples of 3.
+check(
+    MarkdownInlineParser.parse("*foo**bar**baz*")
+        == [.italic([.text("foo"), .bold([.text("bar")]), .text("baz")])],
+    "*foo**bar**baz* -> em(\"foo\", strong(\"bar\"), \"baz\") — without the rule of three this mis-nests"
+)
+// The case where the rule FORBIDS a pair, with its expected tree. In `**a*b**` the inner `*` (a run
+// of 1, both-flanking because it sits between two letters) is a potential closer for the opening
+// `**`; 1 + 2 = 3 and neither length is a multiple of 3, so the pair is refused and the `*` stays
+// literal. Ablating the rule of three turns this into `italic([italic("a"), text("b")]), text("*")`
+// — i.e. it fails loudly on an assertion this file already had (plan R9).
+check(
+    MarkdownInlineParser.parse("**a*b**") == [.bold([.text("a*b")])],
+    "rule of three FORBIDS the 1+2 pair in **a*b**, so the inner * is literal (tree pinned twice, on purpose)"
+)
+check(
+    MarkdownInlineParser.parse("*foo**bar***") == [.italic([.text("foo"), .bold([.text("bar")])])],
+    "*foo**bar*** -> em(\"foo\", strong(\"bar\")): the closing run of 3 pairs with 2 then 1 (sums 5 and 4, neither a multiple of 3)"
+)
+check(
+    MarkdownInlineParser.parse("***foo**bar*") == [.italic([.bold([.text("foo")]), .text("bar")])],
+    "***foo**bar* -> em(strong(\"foo\"), \"bar\")"
+)
+// Opener and closer must be different runs — this falls out of starting the backward scan at
+// `closer.previous`, but a self-pairing run would silently produce `bold([])` and delete three
+// characters, so it is pinned (plan R8).
+check(
+    MarkdownInlineParser.parse("a***b") == [.text("a***b")],
+    "a***b -> literal: a single run cannot be its own opener and closer"
+)
+
+section("(preview-emphasis-commonmark) criterion 8: flanking uses CommonMark's character classes")
+// (plan R5) Every input here DISCRIMINATES: it gives a different tree under Foundation's
+// `CharacterSet.punctuationCharacters` / `CharacterSet.whitespaces` than under the sets CommonMark
+// 0.30 actually defines. Rev 1's proposed cases (NBSP, em-dash, CJK, emoji) all pass on the wrong
+// implementation, so they could not fail: NBSP is whitespace and an em-dash is Pd under both
+// notions, and neither a CJK ideograph nor an emoji is either. Those three are kept below as
+// controls; the emoji is repurposed as a pin on the spec VERSION, where it does discriminate.
+//
+// Nine ASCII characters are CommonMark punctuation but are NOT in Unicode's P* categories (they are
+// Sc/Sk/Sm), so `CharacterSet.punctuationCharacters` misses all nine. With them misclassified, the
+// opening `**` here counts as "not followed by punctuation", becomes left-flanking, and bolds the
+// symbol.
+for symbol in ["$", "+", "<", "=", ">", "^", "`", "|", "~"] {
+    // A backtick would start a code span, so it is spelled as an unclosed one: `x**`**y` has a
+    // single backtick, which the tokenizer leaves literal, and the flanking question is unchanged.
+    let input = "x**\(symbol)**y"
+    let expected: [InlineNode] = [.text(input)]
+    check(
+        MarkdownInlineParser.parse(input) == expected,
+        "x**\(symbol)**y stays literal — `\(symbol)` IS CommonMark punctuation (CharacterSet.punctuationCharacters misses it)"
+    )
+}
+check(
+    MarkdownInlineParser.parse("x**\u{000C}**y") == [.text("x**\u{000C}**y")],
+    "FF (U+000C) IS CommonMark whitespace, so `**` before it cannot open — CharacterSet.whitespaces omits FF"
+)
+check(
+    MarkdownInlineParser.parse("x**\u{200B}**y") == [.text("x"), .bold([.text("\u{200B}")]), .text("y")],
+    "ZWSP (U+200B) is NOT CommonMark whitespace, so `**` before it CAN open — CharacterSet.whitespaces contains ZWSP"
+)
+check(
+    MarkdownInlineParser.parse("x**\u{00A0}**y") == [.text("x**\u{00A0}**y")],
+    "control: NBSP is Zs, so it IS whitespace on both notions and the run stays literal"
+)
+check(
+    MarkdownInlineParser.parse("x**\u{2014}**y") == [.text("x**\u{2014}**y")],
+    "control: an em-dash is Pd, punctuation on both notions, so the run stays literal"
+)
+check(
+    MarkdownInlineParser.parse("x**\u{4E2D}**y") == [.text("x"), .bold([.text("\u{4E2D}")]), .text("y")],
+    "control: a CJK ideograph is Lo — neither whitespace nor punctuation — so the run bolds"
+)
+// **This one pins the spec VERSION.** CommonMark 0.30 counts only P* plus ASCII punctuation, so an
+// emoji (So) is neither, the opening `**` is left-flanking, and this bolds. CommonMark 0.31.2 folds
+// the Symbol categories into "Unicode punctuation", which would make it literal instead. If this
+// assertion ever flips, the parser has silently moved to a different spec revision.
+check(
+    MarkdownInlineParser.parse("x**\u{1F642}**y") == [.text("x"), .bold([.text("\u{1F642}")]), .text("y")],
+    "CommonMark 0.30: an emoji is NOT punctuation, so x**🙂**y bolds (0.31.2 would leave it literal)"
+)
+
+section("(preview-emphasis-commonmark) criteria 5-6: the (preview-bold-spans) cause-2 report cases")
+// All five inputs from `plans/preview-bold-repro.md` cause 2, with the trees they produce now. The
+// mechanism is uniform: a `*` with whitespace on both sides is neither left- nor right-flanking, so
+// it can neither open nor close and never joins the delimiter list at all.
+check(
+    MarkdownInlineParser.parse("2 * 3 and **bold** here")
+        == [.text("2 * 3 and "), .bold([.text("bold")]), .text(" here")],
+    "report case 1: `2 * 3 and **bold** here` — the stray * is literal and \"bold\" is BOLD, not italic"
+)
+// The UNSPACED stray, which (preview-bold-spans) recorded as unreachable by its opener-only rule.
+// Here `*` sits between two digits, so it is both left- and right-flanking and CAN open and close —
+// it fails to match anyway, because the `**` before "bold" is preceded by a space (cannot close) and
+// the one after is followed by a space (cannot open), so the only pair available is those two.
+check(
+    MarkdownInlineParser.parse("2*3 and **bold** here")
+        == [.text("2*3 and "), .bold([.text("bold")]), .text(" here")],
+    "report case 2: `2*3 and **bold** here` — the UNSPACED stray, unreachable by any opener-only rule"
+)
+check(
+    MarkdownInlineParser.parse("see footnote * and **bold**")
+        == [.text("see footnote * and "), .bold([.text("bold")])],
+    "report case 3: `see footnote * and **bold**`"
+)
+check(
+    MarkdownInlineParser.parse("a ** b and **bold** c")
+        == [.text("a ** b and "), .bold([.text("bold")]), .text(" c")],
+    "report case 4: `a ** b and **bold** c` — the space-flanked ** run is inert, so the right run bolds"
+)
+check(
+    MarkdownInlineParser.parse("5 * 4 = 20, 6 * 7 = 42, **bold**")
+        == [.text("5 * 4 = 20, 6 * 7 = 42, "), .bold([.text("bold")])],
+    "report case 5: `5 * 4 = 20, 6 * 7 = 42, **bold**` — an even count no longer re-syncs by luck"
+)
+do {
+    // The sixth case, and the only one that exercises the block-level line merge: the stray `*` is
+    // on a DIFFERENT LINE from the emphasis, and paragraph lines merge with a space before the
+    // inline parser ever runs. Rev 1 of the plan counted four report cases; there are five plus this
+    // one (plan R11).
+    let source = "Rate is 5 * 4 per unit\nand the result is **very important**."
+    let blocks = MarkdownBlockParser.parse(source)
+    var text = ""
+    if case let .paragraph(value, _)? = blocks.first { text = value }
+    check(blocks.count == 1 && text == "Rate is 5 * 4 per unit and the result is **very important**.", "report case 6 merges to one paragraph before inline parsing")
+    check(
+        MarkdownInlineParser.parse(text)
+            == [.text("Rate is 5 * 4 per unit and the result is "), .bold([.text("very important")]), .text(".")],
+        "report case 6: a stray * on the PREVIOUS LINE no longer re-pairs the paragraph's emphasis"
+    )
+}
+// The repro's "working baseline (must not regress)" list, verbatim. Nothing asserted these before.
+check(
+    MarkdownInlineParser.parse("**bold** alone") == [.bold([.text("bold")]), .text(" alone")],
+    "baseline: `**bold** alone` unchanged"
+)
+check(
+    MarkdownInlineParser.parse("**a * b** tail") == [.bold([.text("a * b")]), .text(" tail")],
+    "baseline: `**a * b** tail` unchanged — and its body is ONE coalesced text node across the inert run"
+)
+check(
+    MarkdownInlineParser.parse("*italic* and **bold**")
+        == [.italic([.text("italic")]), .text(" and "), .bold([.text("bold")])],
+    "baseline: `*italic* and **bold**` unchanged"
+)
+// Two more shapes the item's TODO entry called out by name, both now literal. The first is the
+// mutant tree that motivated this item's oracles (`[.italic([]), .text(" bold"), .italic([])]` would
+// delete four asterisks and satisfy a flatten-and-strip property exactly); the second is the case an
+// opener-only rule provably could NOT fix, because nothing there rejects a closer preceded by
+// whitespace.
+check(
+    MarkdownInlineParser.parse("** bold**") == [.text("** bold**")],
+    "`** bold**` is literal: the opener is followed by whitespace, and no empty emphasis is produced"
+)
+check(
+    MarkdownInlineParser.parse("**bold **") == [.text("**bold **")],
+    "`**bold **` is literal: the CLOSER is preceded by whitespace (an opener-only rule left this bold)"
+)
+
+
+section("(preview-emphasis-commonmark, review) the rule of three's OTHER half: original lengths")
+// **The four assertions above pin only half the rule, and a reviewer proved it by building the
+// mutant.** Evaluating the rule of three on `remaining` instead of `originalLength` — exactly the
+// mistake plan R6 exists to prevent — leaves `*foo**bar**baz*`, `**a*b**` and `***x***` all
+// UNCHANGED, and the whole hand-written battery green; only the differential fuzz notices, and only
+// because `ReferenceInlineParser` kept the correct field. Verified here by compiling that mutant
+// against this working tree before writing these three lines.
+//
+// These are inputs where a run is matched twice, so `remaining` and `originalLength` differ at the
+// moment the second match is judged: in `*a***a*` the middle run is 3 long, gives 1 asterisk to the
+// opening `*`, and is then judged against the closing `*` with 2 left. Original lengths 3 + 1 = 4,
+// not a multiple of 3, so the pair is allowed; the mutant sees 2 + 1 = 3 and refuses it, stranding
+// `**a*` as literal text.
+check(
+    MarkdownInlineParser.parse("*a***a*")
+        == [.italic([.text("a")]), .text("*"), .italic([.text("a")])],
+    "*a***a* -> em(a) + \"*\" + em(a): the rule of three judges ORIGINAL run lengths, not what is left"
+)
+check(
+    MarkdownInlineParser.parse("*aa***a*")
+        == [.italic([.text("aa")]), .text("*"), .italic([.text("a")])],
+    "*aa***a* -> em(aa) + \"*\" + em(a) (the mutant gives em(aa) + text(\"**a*\"))"
+)
+check(
+    MarkdownInlineParser.parse("**a***a**")
+        == [.bold([.text("a")]), .italic([.text("a")]), .text("*")],
+    "**a***a** -> strong(a) + em(a) + \"*\": same discriminator with the strong/em roles swapped"
+)
+
+// MARK: - (preview-emphasis-commonmark, review) the emphasis nesting cap
+//
+// The delimiter stack made emphasis depth unbounded and linear in input length, and every consumer
+// of the tree recurses once per level. On `MarkdownPreviewView`'s `.utility` render queue — 512 KB
+// of stack, not the main thread's 8 MB — that was a **1,881-character document that killed the
+// app** (measured: depth 465 renders, depth 470 SIGBUSes), and it was reachable from ordinary
+// prose. `MarkdownInlineParser.emphasisNestingLimit` bounds it; these pin the bound.
+
+/// Deepest chain of `.bold`/`.italic` ancestors in a tree.
+func treeDepth(_ nodes: [InlineNode]) -> Int {
+    var deepest = 0
+    for node in nodes {
+        switch node {
+        case let .bold(children), let .italic(children):
+            deepest = max(deepest, 1 + treeDepth(children))
+        case .text, .code, .link:
+            continue
+        }
+    }
+    return deepest
+}
+
+section("(preview-emphasis-commonmark, review) emphasis nesting is capped, and nothing is lost")
+do {
+    // Every input here is computed FROM the constant, so changing the constant cannot leave a stale
+    // hard-coded number passing. `"*"x2d + "x" + "*"x2d` nests exactly d deep while d is allowed:
+    // two runs, matched over and over, two asterisks from each side per level.
+    let limit = MarkdownInlineParser.emphasisNestingLimit
+    func nested(_ depth: Int) -> String {
+        String(repeating: "*", count: 2 * depth) + "x" + String(repeating: "*", count: 2 * depth)
+    }
+
+    check(
+        treeDepth(MarkdownInlineParser.parse(nested(limit - 1))) == limit - 1,
+        "one level below the cap nests fully (\(limit - 1) deep)"
+    )
+    check(
+        treeDepth(MarkdownInlineParser.parse(nested(limit))) == limit,
+        "at the cap it still nests fully (\(limit) deep) — the limit is inclusive"
+    )
+    check(
+        treeDepth(MarkdownInlineParser.parse(nested(limit + 1))) == limit,
+        "one level past the cap stops at \(limit): the \(limit + 1)th pair refuses to form"
+    )
+    check(
+        treeDepth(MarkdownInlineParser.parse(nested(4 * limit))) == limit,
+        "and it stays at \(limit) however deep the input goes (\(4 * limit) levels of input)"
+    )
+    // The refused delimiters are LITERAL, not dropped — the cap must not become a second way to
+    // delete characters, which is the failure mode this whole item exists to remove. Two asterisks
+    // per side survive at `limit + 1`, and 6 * limit per side at 4 * limit.
+    let leftoverOne = String(repeating: "*", count: 2)
+    check(
+        MarkdownRenderer.render(nested(limit + 1)).output.string == leftoverOne + "x" + leftoverOne,
+        "the refused pair renders as literal asterisks: \"**x**\""
+    )
+    let leftoverMany = String(repeating: "*", count: 2 * (4 * limit) - 2 * limit)
+    check(
+        MarkdownRenderer.render(nested(4 * limit)).output.string == leftoverMany + "x" + leftoverMany,
+        "…and so does every pair past the cap (\(leftoverMany.count) literal asterisks per side)"
+    )
+}
+
+section("(preview-emphasis-commonmark, review) the reported crash: 13 KB of ordinary prose")
+do {
+    // The shape that makes this urgent rather than theoretical. Neither line looks like nested
+    // emphasis, and neither is; paragraph lines MERGE with a space before the inline parser runs, so
+    // 500 unmatched openers meet 500 unmatched closers inside ONE block and nest ~500 deep.
+    let limit = MarkdownInlineParser.emphasisNestingLimit
+    let prose = (Array(repeating: "see *note", count: 500)
+        + Array(repeating: "then note* here", count: 500)).joined(separator: "\n")
+    check(prose.count == 12_999, "the reproducer is 12,999 characters of plain-looking prose")
+    check(MarkdownBlockParser.parse(prose).count == 1, "…which merges into exactly ONE paragraph block")
+    check(
+        treeDepth(MarkdownInlineParser.parse(prose)) == limit,
+        "…whose emphasis nests to the cap (\(limit)) instead of ~500 deep"
+    )
+
+    // **On a real background queue**, because that is where the crash lived: the main thread's 8 MB
+    // stack survives to ~8,000 levels, so a main-thread render passed even with the defect present.
+    // A regression here does not print FAIL — it takes SIGBUS and kills the harness. That is the
+    // loudest signal a stack overflow offers, and it is the same 512 KB-stack path
+    // `MarkdownPreviewView.renderQueue` uses.
+    let queue = DispatchQueue(label: "FEdit.MarkdownPreview.render.test", qos: .utility)
+    let semaphore = DispatchSemaphore(value: 0)
+    var renderedLength = 0
+    queue.async {
+        renderedLength = MarkdownRenderer.render(prose).output.length
+        semaphore.signal()
+    }
+    semaphore.wait()
+    check(
+        renderedLength == prose.count - 2 * limit,
+        "…and renders on a .utility queue worker, keeping every character but the \(2 * limit) consumed delimiters"
+    )
+}
+
+// MARK: - (preview-emphasis-commonmark, review) rendered FONT TRAITS, not just trees
+//
+// Every other assertion in this file checks the tree. That is exactly what hid a real defect:
+// `*a **b** c*` produced the right tree while `emitInline` rendered `b` in plain `.SFNS-Bold`,
+// dropping the outer italic, because the old `InlineStyle` replaced the face at each level instead
+// of composing traits. `***x***` rendered bold-only for the same reason. These go through
+// `MarkdownRenderer.render` and read the `.font` attribute that ships.
+
+/// Symbolic traits of the font on the first character of `substring` in the rendered output of
+/// `source`, or `nil` if the substring is not in the output at all (which is itself a failure worth
+/// reporting rather than trapping on).
+func renderedTraits(_ source: String, _ substring: String) -> NSFontDescriptor.SymbolicTraits? {
+    let output = MarkdownRenderer.render(source).output
+    let range = (output.string as NSString).range(of: substring)
+    guard range.location != NSNotFound else { return nil }
+    guard let font = output.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont else { return nil }
+    return font.fontDescriptor.symbolicTraits
+}
+
+section("(preview-emphasis-commonmark, review) nested emphasis composes bold + italic")
+check(
+    renderedTraits("*a **b** c*", "b") == [.bold, .italic],
+    "*a **b** c*: the bold inside the italic renders BOLD+ITALIC (it rendered plain bold, losing the italic)"
+)
+check(
+    renderedTraits("*a **b** c*", "a ")?.contains(.italic) == true
+        && renderedTraits("*a **b** c*", "a ")?.contains(.bold) == false,
+    "…and the italic either side of it is italic and NOT bold"
+)
+check(
+    renderedTraits("**a *b* c**", "b") == [.bold, .italic],
+    "**a *b* c**: the mirror direction composes too (italic inside bold)"
+)
+check(
+    renderedTraits("***x***", "x") == [.bold, .italic],
+    "***x***: em(strong(x)) renders bold+italic (it rendered bold only)"
+)
+check(
+    renderedTraits("*(*foo*)*", "foo")?.contains(.italic) == true,
+    "*(*foo*)*: em inside em stays italic"
+)
+// Regression guards for the un-nested cases, which must not have moved.
+check(
+    renderedTraits("**b**", "b")?.contains(.bold) == true && renderedTraits("**b**", "b")?.contains(.italic) == false,
+    "**b** is still bold and not italic"
+)
+check(
+    renderedTraits("*i*", "i")?.contains(.italic) == true && renderedTraits("*i*", "i")?.contains(.bold) == false,
+    "*i* is still italic and not bold"
+)
+check(
+    renderedTraits("plain text", "plain") == [],
+    "plain text still carries no emphasis traits"
+)
+
+section("(preview-emphasis-commonmark) plan R1: code spans and links now scope over the whole block")
+// **An intended behaviour change, not a regression.** The old parser recursed into the emphasis
+// BODY SLICE, so a backtick's or bracket's closer search was truncated at the emphasis boundary.
+// Phase 1 resolves both over the whole block, before any emphasis pairing, so a code span or link
+// may now span what used to be an emphasis delimiter. Verified against markdown-it; hand-written
+// here because the differential fuzz shares the implementation and cannot see it.
+check(
+    MarkdownInlineParser.parse("*a`b* c`d") == [.text("*a"), .code("b* c"), .text("d")],
+    "R1: *a`b* c`d -> code span across the `*` (was italic(\"a`b\") + text(\" c`d\"))"
+)
+check(
+    MarkdownInlineParser.parse("*a [b* c](d)") == [.text("*a "), .link(text: "b* c", url: "d")],
+    "R1: *a [b* c](d) -> a REAL link (was italic(\"a [b\") + text(\" c](d)\")) — text that was plain is now clickable"
+)
+check(
+    MarkdownRenderer.render("*a [b* c](d)").output.attribute(.link, at: 3, effectiveRange: nil) is URL,
+    "R1: …and the emitter attaches a live .link attribute to it, since URL(string: \"d\") is non-nil"
+)
+check(
+    MarkdownInlineParser.parse("*a `c b*") == [.italic([.text("a `c b")])],
+    "R1 control: *a `c b* is UNCHANGED — an unclosed backtick is literal at block scope too"
+)
+
+section("(preview-emphasis-commonmark) plan R11: the text each block type hands the inline parser")
+// **What these five pin, stated honestly, because an earlier wording overclaimed it.** Each one
+// takes a block's text out of `MarkdownBlockParser` and inline-parses it directly; none of them goes
+// through `MarkdownRenderer.render`, so none of them would notice if `emit` stopped calling the
+// inline parser for that block type at all. They pin the PARSE, on the exact string each block type
+// produces — which is worth pinning, because that string differs per block type (a heading strips
+// its `#`, a list item its marker, a blockquote its `>`, a table cell its pipes and padding, and a
+// paragraph merges lines) and each one is a distinct opportunity to hand emphasis something it
+// cannot pair.
+//
+// The section below this one is the half that was missing: the same five constructs through
+// `render`, checking the attributes that actually ship. That gap is not hypothetical — it is what
+// let the composed-font defect through review.
+do {
+    let blocks = MarkdownBlockParser.parse("## *heading **b** c*")
+    var text = ""
+    if case let .heading(_, value, _)? = blocks.first { text = value }
+    check(
+        MarkdownInlineParser.parse(text) == [.italic([.text("heading "), .bold([.text("b")]), .text(" c")])],
+        "heading: `## *heading **b** c*` hands the parser `*heading **b** c*`, which nests"
+    )
+}
+do {
+    let blocks = MarkdownBlockParser.parse("- *item **b** c*")
+    var text = ""
+    if case let .listItem(_, value, _)? = blocks.first { text = value }
+    check(
+        MarkdownInlineParser.parse(text) == [.italic([.text("item "), .bold([.text("b")]), .text(" c")])],
+        "list item: the marker is stripped before the parser sees the text, and the rest nests"
+    )
+}
+do {
+    let blocks = MarkdownBlockParser.parse("> *quoted **b** c*")
+    var text = ""
+    if case let .blockquote(value, _)? = blocks.first { text = value }
+    check(
+        MarkdownInlineParser.parse(text) == [.italic([.text("quoted "), .bold([.text("b")]), .text(" c")])],
+        "blockquote: `> ` is stripped before the parser sees the text, and the rest nests"
+    )
+}
+do {
+    // The paragraph case is the one that MERGES lines, so the emphasis here spans a line break in the
+    // source and only exists at all because the block parser joined them with a space.
+    let blocks = MarkdownBlockParser.parse("para *a **b**\nc* tail")
+    var text = ""
+    if case let .paragraph(value, _)? = blocks.first { text = value }
+    check(
+        MarkdownInlineParser.parse(text)
+            == [.text("para "), .italic([.text("a "), .bold([.text("b")]), .text(" c")]), .text(" tail")],
+        "paragraph: two source lines merge into one block, and the emphasis pairs across the join"
+    )
+}
+do {
+    // Table cells are inline-parsed too ((preview-tables)), so the change reaches them.
+    let blocks = MarkdownBlockParser.parse("| h |\n| --- |\n| *cell **b** c* |")
+    var cell = ""
+    if case let .table(_, rows, _, _)? = blocks.first, let first = rows.first?.first { cell = first }
+    check(
+        MarkdownInlineParser.parse(cell) == [.italic([.text("cell "), .bold([.text("b")]), .text(" c")])],
+        "table cell: pipes and padding are stripped before the parser sees the text, and the rest nests"
+    )
+    // `splitTableCells` documents a hard dependency on this parser's backtick pairing (1-2, 3-4, …,
+    // final odd one literal). The rewrite keeps that rule and now applies it in ONE pass over the
+    // whole block instead of restarting inside each emphasis body, so the split and the render agree
+    // strictly more often than before, never less (plan R11).
+    let spanned = MarkdownBlockParser.parse("| h |\n| --- |\n| `a | b` and *c* |")
+    var spannedCells: [String] = []
+    if case let .table(_, rows, _, _)? = spanned.first, let first = rows.first { spannedCells = first }
+    check(
+        spannedCells == ["`a | b` and *c*"],
+        "a pipe inside a backtick pair still does not split a cell, and the cell's emphasis still parses"
+    )
+    check(
+        MarkdownInlineParser.parse(spannedCells.first ?? "")
+            == [.code("a | b"), .text(" and "), .italic([.text("c")])],
+        "…and that cell inline-parses to code(\"a | b\") + em(\"c\")"
+    )
+}
+
+section("(preview-emphasis-commonmark, review) …and the same five constructs through render")
+// The missing half. Each of these renders the whole document and checks the shipped attributes: the
+// delimiters are gone from the output, and the nested run carries BOTH traits. A heading is the
+// exception and is asserted as such — `headingStyle` passes the heading face for all four slots, so
+// nesting is deliberately invisible there, which is precisely why the tree-level check above exists.
+do {
+    let (heading, _) = MarkdownRenderer.render("## *heading **b** c*")
+    check(heading.string == "heading b c", "heading: renders with every delimiter consumed")
+    let headingFont = attribute(heading, .font, at: 0) as? NSFont
+    let nestedFont = attribute(heading, .font, at: (heading.string as NSString).range(of: "b").location) as? NSFont
+    check(
+        headingFont != nil && headingFont == nestedFont && headingFont == Theme.headingFont(level: 2),
+        "heading: the nested bold keeps the level-2 heading face — nesting is invisible here BY DESIGN"
+    )
+}
+check(
+    MarkdownRenderer.render("- *item **b** c*").output.string == "•\titem b c",
+    "list item: renders through the marker with every delimiter consumed"
+)
+check(
+    renderedTraits("- *item **b** c*", "b") == [.bold, .italic],
+    "list item: …and the nested run composes bold+italic in list style"
+)
+check(
+    MarkdownRenderer.render("> *quoted **b** c*").output.string == "quoted b c",
+    "blockquote: renders with every delimiter consumed"
+)
+check(
+    renderedTraits("> *quoted **b** c*", "b") == [.bold, .italic],
+    "blockquote: …and the nested run composes bold+italic in quote style"
+)
+check(
+    renderedTraits("para *a **b**\nc* tail", "b") == [.bold, .italic],
+    "paragraph: …and it composes across the line merge too"
+)
+do {
+    let (table, _) = MarkdownRenderer.render("| h |\n| --- |\n| *cell **b** c* |")
+    check(
+        renderedTraits("| h |\n| --- |\n| *cell **b** c* |", "b") == [.bold, .italic],
+        "table cell: the nested run composes bold+italic inside the grid"
+    )
+    let cellRange = (table.string as NSString).range(of: "cell ")
+    check(
+        cellRange.location != NSNotFound
+            && (attribute(table, .paragraphStyle, at: cellRange.location) as? NSParagraphStyle)?
+                .textBlocks.first is NSTextTableBlock,
+        "…and the emphasized run is still inside the table's grid (its paragraph style keeps the cell block)"
+    )
 }
 
 // MARK: - Tier 3 emitter helpers
@@ -1764,30 +2322,60 @@ do {
 
 // MARK: - md-link-scan-quadratic: differential fuzz
 //
-// A harness-local reference reimplementing the PRE-FIX `MarkdownInlineParser`/`MarkdownRenderer`
-// semantics (the naive to-EOF `firstIndex` link scan, unmemoized) diffs against the shipped,
-// memoized parser/renderer over a seeded randomized battery of bracket-heavy inputs. This proves
-// the memoization is byte-identical to the old algorithm on thousands of inputs the hand-enumerated
-// battery above does not cover, catching an off-by-one the enumerated cases might miss.
+// A harness-local reference reimplementing `MarkdownInlineParser`/`MarkdownRenderer` with the naive
+// to-EOF `firstIndex` link scan (unmemoized) diffs against the shipped, memoized parser/renderer
+// over a seeded randomized battery of bracket-heavy inputs. This proves the memoization is
+// byte-identical to the unmemoized algorithm on thousands of inputs the hand-enumerated battery
+// above does not cover, catching an off-by-one the enumerated cases might miss.
+//
+// (preview-emphasis-commonmark) **This reference had to receive the delimiter-stack algorithm too**,
+// or every input containing a `*` would mismatch and the oracle would be red for a reason that has
+// nothing to do with `parseLink`. The plan's R10 states the consequence: once both sides share the
+// algorithm this oracle cannot judge whether that algorithm is RIGHT — it goes on proving exactly
+// what it was built to prove (memoized link scan == unmemoized link scan). It is not quite vacuous,
+// as R10 has it: because the two copies are separate code, it still catches a one-sided edit, and it
+// was measured doing so (deleting `removeDelimitersBetween` from the production copy fails both
+// assertions below). What it cannot catch is a rule that is wrong in both copies, which is what the
+// ~50 hand-written expected trees above, the reconstruction property fuzz further down, and the
+// standalone HEAD-vs-working-tree differ run out of tree are for.
 
-/// The pre-fix `MarkdownInlineParser`, reimplemented standalone: identical code-span -> link ->
-/// bold -> italic scan, but `parseLink`'s closer search is the naive two-to-EOF-scan version that
-/// shipped before md-link-scan-quadratic (no memo arrays). This is the differential oracle.
+/// `MarkdownInlineParser` with the PRE-FIX link scan: identical phase 1 / phase 2 / phase 3
+/// structure, but `parseLink`'s closer search is the naive two-to-EOF-scan version that shipped
+/// before md-link-scan-quadratic (no memo arrays). This is the differential oracle.
+///
+/// **What is shared and what is duplicated** (plan R10). Shared with production, deliberately:
+/// `InlineToken`, `InlineDelimiterRun`, `InlineTokenStream` (including its list surgery and its
+/// fold), and `MarkdownInlineParser.asteriskRunFlanking` with the two character-class predicates
+/// underneath it. A second, hand-rolled copy of the flanking rule or of the list plumbing would
+/// make any divergence show up as an unattributable fuzz mismatch; sharing them means a slip is a
+/// compile error instead. Duplicated on purpose: `tokenize` (which is where the link scan differs,
+/// i.e. the whole point of this oracle) and `processEmphasis` (transcribed rule for rule, so a
+/// misreading of the algorithm in one copy is at least visible as a mismatch in the other).
 enum ReferenceInlineParser {
     static func parse(_ text: String) -> [InlineNode] {
-        parseNodes(Array(text))
+        var stream = tokenize(Array(text))
+        processEmphasis(&stream)
+        return stream.foldTokens(from: stream.head, until: InlineTokenStream.nilIndex)
     }
 
-    private static func parseNodes(_ characters: [Character]) -> [InlineNode] {
-        var nodes: [InlineNode] = []
-        var literal: [Character] = []
+    /// Phase 1, with the unmemoized `parseLink`.
+    private static func tokenize(_ characters: [Character]) -> InlineTokenStream {
+        var stream = InlineTokenStream(characters)
         var index = 0
         let count = characters.count
+        var literalStart = InlineTokenStream.nilIndex
+
+        func takeLiteral() {
+            if literalStart == InlineTokenStream.nilIndex {
+                literalStart = index
+            }
+            index += 1
+        }
 
         func flushLiteral() {
-            guard !literal.isEmpty else { return }
-            nodes.append(.text(String(literal)))
-            literal.removeAll()
+            guard literalStart != InlineTokenStream.nilIndex else { return }
+            stream.appendText(from: literalStart, to: index)
+            literalStart = InlineTokenStream.nilIndex
         }
 
         while index < count {
@@ -1796,75 +2384,125 @@ enum ReferenceInlineParser {
             if character == "`" {
                 if let close = firstIndex(of: "`", in: characters, from: index + 1) {
                     flushLiteral()
-                    nodes.append(.code(String(characters[(index + 1)..<close])))
+                    stream.appendNode(InlineNode.code(String(characters[(index + 1)..<close])))
                     index = close + 1
                     continue
                 }
-                literal.append(character)
-                index += 1
+                takeLiteral()
                 continue
             }
 
             if character == "[" {
                 if let link = parseLink(characters, from: index) {
                     flushLiteral()
-                    nodes.append(.link(text: link.title, url: link.url))
+                    stream.appendNode(InlineNode.link(text: link.title, url: link.url))
                     index = link.end
                     continue
                 }
-                literal.append(character)
-                index += 1
-                continue
-            }
-
-            if character == "*", index + 1 < count, characters[index + 1] == "*" {
-                if let close = firstDoubleIndex(of: "*", in: characters, from: index + 2) {
-                    flushLiteral()
-                    nodes.append(.bold(parseNodes(Array(characters[(index + 2)..<close]))))
-                    index = close + 2
-                    continue
-                }
-                literal.append("*")
-                literal.append("*")
-                index += 2
+                takeLiteral()
                 continue
             }
 
             if character == "*" {
-                if let close = firstIndex(of: "*", in: characters, from: index + 1) {
-                    flushLiteral()
-                    nodes.append(.italic(parseNodes(Array(characters[(index + 1)..<close]))))
-                    index = close + 1
-                    continue
+                var end = index
+                while end < count, characters[end] == "*" {
+                    end += 1
                 }
-                literal.append(character)
-                index += 1
+                flushLiteral()
+                let flanking = MarkdownInlineParser.asteriskRunFlanking(
+                    before: index > 0 ? characters[index - 1] : nil,
+                    after: end < count ? characters[end] : nil
+                )
+                stream.appendDelimiterRun(length: end - index, canOpen: flanking.canOpen, canClose: flanking.canClose)
+                index = end
                 continue
             }
 
-            literal.append(character)
-            index += 1
+            takeLiteral()
         }
 
         flushLiteral()
-        return nodes
+        return stream
+    }
+
+    /// Phase 2, transcribed from CommonMark 0.30's `process_emphasis`.
+    private static func processEmphasis(_ stream: inout InlineTokenStream) {
+        var openersBottom = [Int](repeating: InlineTokenStream.nilIndex, count: 6)
+        var closer = stream.firstDelimiter
+
+        while closer != InlineTokenStream.nilIndex {
+            guard stream.delimiters[closer].canClose else {
+                closer = stream.delimiters[closer].next
+                continue
+            }
+
+            let key = openersBottomKey(stream.delimiters[closer])
+
+            var opener = stream.delimiters[closer].previous
+            var openerFound = false
+            var spanMaxDepth = 0
+            while opener != InlineTokenStream.nilIndex, opener != openersBottom[key] {
+                spanMaxDepth = max(spanMaxDepth, stream.delimiters[opener].spanMaxDepth)
+                if spanMaxDepth >= MarkdownInlineParser.emphasisNestingLimit {
+                    break
+                }
+                if stream.delimiters[opener].canOpen,
+                   !ruleOfThreeForbids(opener: stream.delimiters[opener], closer: stream.delimiters[closer]) {
+                    openerFound = true
+                    break
+                }
+                opener = stream.delimiters[opener].previous
+            }
+
+            let oldCloser = closer
+
+            if openerFound {
+                let use = (stream.delimiters[opener].remaining >= 2 && stream.delimiters[closer].remaining >= 2) ? 2 : 1
+                stream.delimiters[opener].remaining -= use
+                stream.delimiters[closer].remaining -= use
+
+                let openerToken = stream.delimiters[opener].token
+                let closerToken = stream.delimiters[closer].token
+                let children = stream.foldTokens(from: stream.tokens[openerToken].next, until: closerToken)
+                let node = stream.appendDetachedNode(use == 2 ? .bold(children) : .italic(children))
+                stream.spliceToken(node, between: openerToken, and: closerToken)
+                stream.removeDelimitersBetween(opener: opener, closer: closer)
+                stream.delimiters[opener].spanMaxDepth = spanMaxDepth + 1
+
+                if stream.delimiters[opener].remaining == 0 {
+                    stream.unlinkToken(openerToken)
+                    stream.removeDelimiter(opener)
+                }
+                if stream.delimiters[closer].remaining == 0 {
+                    stream.unlinkToken(closerToken)
+                    let resume = stream.delimiters[closer].next
+                    stream.removeDelimiter(closer)
+                    closer = resume
+                }
+            } else {
+                closer = stream.delimiters[closer].next
+                openersBottom[key] = stream.delimiters[oldCloser].previous
+                if !stream.delimiters[oldCloser].canOpen {
+                    stream.removeDelimiter(oldCloser)
+                }
+            }
+        }
+    }
+
+    private static func openersBottomKey(_ closer: InlineDelimiterRun) -> Int {
+        (closer.canOpen ? 3 : 0) + closer.originalLength % 3
+    }
+
+    private static func ruleOfThreeForbids(opener: InlineDelimiterRun, closer: InlineDelimiterRun) -> Bool {
+        guard closer.canOpen || opener.canClose else { return false }
+        guard (opener.originalLength + closer.originalLength) % 3 == 0 else { return false }
+        return !(opener.originalLength % 3 == 0 && closer.originalLength % 3 == 0)
     }
 
     private static func firstIndex(of character: Character, in characters: [Character], from: Int) -> Int? {
         var index = from
         while index < characters.count {
             if characters[index] == character {
-                return index
-            }
-            index += 1
-        }
-        return nil
-    }
-
-    private static func firstDoubleIndex(of character: Character, in characters: [Character], from: Int) -> Int? {
-        var index = from
-        while index + 1 < characters.count {
-            if characters[index] == character, characters[index + 1] == character {
                 return index
             }
             index += 1
@@ -1951,30 +2589,71 @@ enum ReferenceRenderer {
         return candidate.fontDescriptor.symbolicTraits.contains(.italic) ? candidate : Theme.bodyFont
     }()
 
+    // (preview-emphasis-commonmark) Mirrors `PreviewFont.bodyBoldItalic`, including its
+    // fall-back-to-bold rule. The differential fuzz below compares rendered ATTRIBUTES byte for
+    // byte, so a face this reference does not have is a mismatch, not a cosmetic difference.
+    private static let bodyBoldItalic: NSFont = {
+        let descriptor = Theme.bodyFont.fontDescriptor.withSymbolicTraits([.bold, .italic])
+        let candidate = NSFont(descriptor: descriptor, size: Theme.bodyFont.pointSize) ?? bodyBold
+        let traits = candidate.fontDescriptor.symbolicTraits
+        return traits.contains(.italic) && traits.contains(.bold) ? candidate : bodyBold
+    }()
+
     private struct InlineStyle {
-        let font: NSFont
+        let regularFont: NSFont
         let boldFont: NSFont
         let italicFont: NSFont
+        let boldItalicFont: NSFont
+        let isBold: Bool
+        let isItalic: Bool
         let color: NSColor
         let paragraphStyle: NSParagraphStyle
+
+        var font: NSFont {
+            switch (isBold, isItalic) {
+            case (false, false): return regularFont
+            case (true, false): return boldFont
+            case (false, true): return italicFont
+            case (true, true): return boldItalicFont
+            }
+        }
+
+        func adding(bold addBold: Bool = false, italic addItalic: Bool = false) -> InlineStyle {
+            InlineStyle(
+                regularFont: regularFont,
+                boldFont: boldFont,
+                italicFont: italicFont,
+                boldItalicFont: boldItalicFont,
+                isBold: isBold || addBold,
+                isItalic: isItalic || addItalic,
+                color: color,
+                paragraphStyle: paragraphStyle
+            )
+        }
     }
 
     private static let bodyStyle = InlineStyle(
-        font: Theme.bodyFont, boldFont: bodyBold, italicFont: bodyItalic,
+        regularFont: Theme.bodyFont, boldFont: bodyBold, italicFont: bodyItalic,
+        boldItalicFont: bodyBoldItalic, isBold: false, isItalic: false,
         color: Theme.text, paragraphStyle: bodyParagraph
     )
     private static let listStyle = InlineStyle(
-        font: Theme.bodyFont, boldFont: bodyBold, italicFont: bodyItalic,
+        regularFont: Theme.bodyFont, boldFont: bodyBold, italicFont: bodyItalic,
+        boldItalicFont: bodyBoldItalic, isBold: false, isItalic: false,
         color: Theme.text, paragraphStyle: listParagraph
     )
     private static let quoteStyle = InlineStyle(
-        font: Theme.bodyFont, boldFont: bodyBold, italicFont: bodyItalic,
+        regularFont: Theme.bodyFont, boldFont: bodyBold, italicFont: bodyItalic,
+        boldItalicFont: bodyBoldItalic, isBold: false, isItalic: false,
         color: Theme.mutedText, paragraphStyle: quoteParagraph
     )
 
     private static func headingStyle(level: Int) -> InlineStyle {
         let font = Theme.headingFont(level: level)
-        return InlineStyle(font: font, boldFont: font, italicFont: font, color: Theme.text, paragraphStyle: headingParagraph)
+        return InlineStyle(
+            regularFont: font, boldFont: font, italicFont: font, boldItalicFont: font,
+            isBold: false, isItalic: false, color: Theme.text, paragraphStyle: headingParagraph
+        )
     }
 
     static func render(_ source: String) -> (output: NSAttributedString, anchors: [MarkdownAnchor]) {
@@ -2051,18 +2730,10 @@ enum ReferenceRenderer {
                 ]))
 
             case let .bold(children):
-                let boldStyle = InlineStyle(
-                    font: style.boldFont, boldFont: style.boldFont, italicFont: style.italicFont,
-                    color: style.color, paragraphStyle: style.paragraphStyle
-                )
-                emitInline(children, style: boldStyle, into: output)
+                emitInline(children, style: style.adding(bold: true), into: output)
 
             case let .italic(children):
-                let italicStyle = InlineStyle(
-                    font: style.italicFont, boldFont: style.boldFont, italicFont: style.italicFont,
-                    color: style.color, paragraphStyle: style.paragraphStyle
-                )
-                emitInline(children, style: italicStyle, into: output)
+                emitInline(children, style: style.adding(italic: true), into: output)
 
             case let .code(value):
                 output.append(NSAttributedString(string: value, attributes: [
@@ -2215,6 +2886,14 @@ do {
 // to `" bold"` — even though `emitInline` appends nothing for empty children, so all four asterisks
 // would vanish from the rendered output. Only a hand-written expected tree for that specific input
 // pins that failure mode; this fuzz is the guard for character loss, not for delimiter visibility.
+//
+// (preview-emphasis-commonmark) That gap is now closed by the section below, which adds two stronger
+// properties over the same shape of corpus: byte-exact delimiter RECONSTRUCTION (which also pins how
+// many asterisks each node consumed, not just which characters survived) and a structural
+// "no empty .bold/.italic anywhere" guard (which is the one that actually catches the mutant quoted
+// above — reconstruction is blind to it too, for the reason recorded there). This fuzz is kept
+// unchanged rather than folded in: it is a different property with a different seed, it is cheap,
+// and it was the oracle the previous item shipped on.
 
 section("(preview-bold-spans): emphasis character-preservation property fuzz")
 do {
@@ -2265,6 +2944,185 @@ do {
     )
 }
 
+// MARK: - (preview-emphasis-commonmark): delimiter reconstruction property fuzz
+//
+// The oracle plan R2 designed to be the independent one for the delimiter-stack change (R2/R10) —
+// and it is independent in the sense that matters structurally: the differential fuzz above compares
+// two copies of one algorithm, while this one is checked against the INPUT. How much that buys is
+// measured further down, and it is less than R2 claims. The property is:
+//
+//     reconstruct(parse(s)) == s          — byte for byte
+//
+// where `reconstruct` walks the tree re-emitting the delimiters each node claims to have consumed:
+// `**` around a `.bold`, `*` around an `.italic`, backticks around a `.code`, `[…](…)` around a
+// `.link`, literals verbatim. It is a pure function of the tree — unlike the property Rev 1 of the
+// plan proposed ("re-insert the delimiters of UNMATCHED runs"), which is not computable from
+// `[InlineNode]` at all, since "unmatched" is internal `processEmphasis` state.
+//
+// What it proves: every character of the input is accounted for exactly once, in order, and every
+// emphasis node consumed exactly as many asterisks as its type says it did. A parser that drops a
+// character, duplicates one, reorders two nodes, or builds a `.bold` out of one asterisk fails it.
+//
+// **What it does NOT prove, measured rather than assumed.** Plan R2 states that this property
+// "gives `"**** bold****"` ≠ `"** bold**"` for the mutant", meaning the character-swallowing tree
+// `[.italic([]), .text(" bold"), .italic([])]` that `(preview-bold-spans)` measured as invisible to
+// the older flatten-and-strip property. **That is wrong, and the plan is wrong about it**: that
+// mutant is built from `.italic` nodes, so reconstruction re-emits one asterisk per side per node —
+// `"*" + "" + "*"` twice — which is exactly the four asterisks of the input. It reconstructs to
+// `"** bold**"` and scores zero violations, the identical blind spot. R2's arithmetic works only for
+// the `.bold` sibling of that mutant, which is checked below.
+//
+// The consequence was measured, not reasoned about: this property was run against **HEAD's**
+// parser — the one this item replaces, which loses characters and mis-pairs delimiters — over these
+// exact two corpora, and scored **0 violations on both**. It is a conservation law that the old
+// algorithm satisfies too (it also only ever consumed the delimiters it emitted), so it is a guard
+// against future breakage rather than evidence that this change is an improvement. Plan R2 calls it
+// "**the** independent oracle for the emphasis change"; on the evidence it is not, and the hand
+// written trees above are.
+//
+// It is emphatically not vacuous, though, and that was measured too: deleting the single
+// `removeDelimitersBetween` call from `processEmphasis` — the rule plan R8 adds, whose absence lets
+// a later closer match an opener already nested inside a finished node — makes this property fail on
+// **both** corpora (and the differential fuzz fail as well). No hand-written tree in this file
+// catches that mutation; this fuzz is what stands between it and a green run.
+//
+// So the blind spot is closed by a SECOND property rather than papered over: **no `.bold`/`.italic`
+// node in any parse may have empty children.** Balanced empty emphasis is precisely the shape both
+// character-conservation properties are blind to, and it is the shape that deletes text from the
+// preview, because `emitInline` appends nothing for empty children. Under the delimiter-stack
+// algorithm it is structurally unreachable — an emphasis node's children come from the tokens
+// strictly between two DIFFERENT delimiter runs, and two `*` runs can never be adjacent because
+// runs are maximal — so this fuzz pins a property the design guarantees rather than hoping for one.
+//
+// **This is the one that discriminates, and it was measured against HEAD too**: HEAD's parser
+// scores **421 violations on the emphasis-only corpus and 10 on the second** (first hit:
+// `"   ****"` → `[.text("   "), .bold([])]`, four deleted characters), against 0 here. So of the
+// two properties in this section, the cheap structural one is the one carrying the evidence.
+
+/// Re-emits the delimiters the tree says it consumed. See the section comment above.
+func reconstruct(_ nodes: [InlineNode]) -> String {
+    nodes.map { node -> String in
+        switch node {
+        case let .text(value): return value
+        case let .code(value): return "`" + value + "`"
+        case let .link(title, url): return "[" + title + "](" + url + ")"
+        case let .bold(children): return "**" + reconstruct(children) + "**"
+        case let .italic(children): return "*" + reconstruct(children) + "*"
+        }
+    }.joined()
+}
+
+/// Whether any `.bold`/`.italic` node anywhere in the tree has empty children.
+func containsEmptyEmphasis(_ nodes: [InlineNode]) -> Bool {
+    for node in nodes {
+        switch node {
+        case let .bold(children), let .italic(children):
+            if children.isEmpty || containsEmptyEmphasis(children) { return true }
+        case .text, .code, .link:
+            continue
+        }
+    }
+    return false
+}
+
+section("(preview-emphasis-commonmark) criterion 9: the two properties can fail")
+// Neither property is worth anything unless a wrong tree trips it, so each is run against
+// hand-written wrong trees BEFORE being run against the parser. Without these six assertions the
+// "0 violations" results below would be indistinguishable from an oracle that always returns true.
+check(
+    reconstruct([.bold([]), .text(" bold"), .bold([])]) != "** bold**",
+    "non-vacuity: reconstruction REJECTS the delimiter-doubling mutant (it re-emits \"**** bold****\")"
+)
+check(
+    reconstruct([.italic([.text("a")]), .text("b")]) != "*a*b*",
+    "non-vacuity: reconstruction REJECTS a tree that silently swallowed a trailing delimiter"
+)
+check(
+    reconstruct([.bold([.text("a")])]) != "*a*",
+    "non-vacuity: reconstruction REJECTS an italic parsed as bold (delimiter COUNT is part of the property)"
+)
+check(
+    containsEmptyEmphasis([.italic([]), .text(" bold"), .italic([])]),
+    "non-vacuity: the empty-emphasis guard FIRES on the exact mutant reconstruction is blind to"
+)
+check(
+    containsEmptyEmphasis([.text("a"), .bold([.text("b"), .italic([])])]),
+    "non-vacuity: the empty-emphasis guard reaches nested children, not just the top level"
+)
+check(
+    !containsEmptyEmphasis([.text("a"), .bold([.italic([.text("b")])]), .code("")]),
+    "…and does not fire on a legitimately nested tree, or on an empty CODE span, which is legal"
+)
+
+section("(preview-emphasis-commonmark) criterion 9: reconstruction + no-empty-emphasis over fuzz")
+do {
+    // A third seed, visibly unlike the two above it (`0x5EED_1234_ABCD_9876`,
+    // `0xB01D_5EED_2026_0821`). `SeededLCG` is deterministic, so reusing either would replay the
+    // identical stream of lengths and character indices and this fuzz would add far less than its
+    // name claims.
+    var rng = SeededLCG(seed: 0xA57E_9153_C0DE_0030)
+    let fuzzCount = 5000
+
+    // Two corpora. The first is emphasis-only, so every draw is delimiter arithmetic and nothing
+    // dilutes it. The second adds backticks and brackets, which is where plan R1's change lives:
+    // code spans and links now resolve over the whole block, so an input like `*a`b* c`d` produces a
+    // code span that spans a `*` — a shape the first alphabet cannot generate at all.
+    let corpora: [(name: String, alphabet: [Character])] = [
+        ("emphasis-only", ["a", "*", " "]),
+        ("with code spans and links", ["a", "*", " ", "`", "[", "]", "(", ")"]),
+    ]
+
+    for corpus in corpora {
+        var reconstructionViolations = 0
+        var emptyEmphasisViolations = 0
+        var distinctInputs = Set<String>()
+
+        for _ in 0..<fuzzCount {
+            let length = rng.nextInt(upperBound: 48)
+            var chars: [Character] = []
+            chars.reserveCapacity(length)
+            for _ in 0..<length {
+                chars.append(corpus.alphabet[rng.nextInt(upperBound: corpus.alphabet.count)])
+            }
+            let input = String(chars)
+            distinctInputs.insert(input)
+
+            let tree = MarkdownInlineParser.parse(input)
+            let rebuilt = reconstruct(tree)
+            if rebuilt != input {
+                reconstructionViolations += 1
+                if reconstructionViolations <= 5 {
+                    print("  RECONSTRUCTION VIOLATION on \(input.debugDescription): rebuilt \(rebuilt.debugDescription) from \(tree)")
+                }
+            }
+            if containsEmptyEmphasis(tree) {
+                emptyEmphasisViolations += 1
+                if emptyEmphasisViolations <= 5 {
+                    print("  EMPTY EMPHASIS on \(input.debugDescription): \(tree)")
+                }
+            }
+        }
+
+        // The corpus guard both fuzzes above carry, for the same reason: "0 violations over 5000
+        // inputs" is satisfiable by a degenerate corpus, which is exactly the defect
+        // (fuzz-rng-low-bits) found. Threshold 4000 of 5000, matching them; measured today is **4570**
+        // for the 3-character alphabet and **4704** for the 8-character one (short draws collide by
+        // birthday paradox, and `length == 0` alone recurs ~1/48 of the time).
+        check(
+            distinctInputs.count > 4_000,
+            "\(corpus.name): \(fuzzCount) inputs are genuinely distinct (\(distinctInputs.count) unique) — the corpus is not degenerate"
+        )
+        check(
+            reconstructionViolations == 0,
+            "\(corpus.name): re-emitting each node's delimiters reproduces the input BYTE FOR BYTE (0 violations in \(fuzzCount))"
+        )
+        check(
+            emptyEmphasisViolations == 0,
+            "\(corpus.name): no parse contains an empty .bold/.italic — the shape that deletes text from the preview (0 in \(fuzzCount))"
+        )
+    }
+}
+
 // MARK: - md-link-scan-quadratic: no quadratic cliff (advisory)
 //
 // ADVISORY tripwire only (plan criterion 5): the ceiling below is deliberately loose (~100x margin
@@ -2285,6 +3143,37 @@ func measureRender(_ label: String, ceiling: TimeInterval, _ source: String) {
 measureRender("[×40000 (no ], family 1)", ceiling: 1.0, String(repeating: "[", count: 40_000))
 measureRender("[a](b×10000 (no ), family 2)", ceiling: 1.0, String(repeating: "[a](b", count: 10_000))
 measureRender("[×40000 + \"]\" (family 3)", ceiling: 1.0, String(repeating: "[", count: 40_000) + "]")
+
+// (preview-emphasis-commonmark) criterion 12 — the DELIMITER-dense shapes. The plan (R3) names two
+// of the three below and attributes the risk to `openers_bottom`; **the attribution is wrong for the
+// implementation the plan itself specifies**, and the numbers here are measured by instrumenting a
+// copy of the shipped parser with a backward-step counter, not taken from the plan:
+//
+//     input                  steps WITH openers_bottom   steps WITHOUT
+//     "*"×40000                            0                    0     (Rev 1's criterion)
+//     "*a "×20000                          0                    0     (Rev 1's named input)
+//     "a** * "×2000                        0                    0     (R3's replacement input)
+//     "a* "×10000                          0                    0     (R3's replacement input)
+//     "a*a **"×4000                    5,999            2,003,000
+//     "a*a **"×40000                  59,999          200,030,000     (0.054 s vs 0.784 s)
+//
+// R3 measured `"a** * "`×2000 at 1,999 steps with and 1,999,000 without. It is **0 and 0** here,
+// because R3's other fix removes it: a closer that cannot also open leaves the delimiter list as
+// soon as it fails, so the 2,000 closers in that input never accumulate for anyone to scan past.
+// R3's two inputs therefore test the removal rule, which is worth testing, but they cannot fail if
+// `openers_bottom` is deleted. The third input below is the one that can: its `**` closers CAN also
+// open (they sit between two letters), so they stay on the list, and every one of them is refused by
+// the rule of three against every `*` before it (1 + 2 = 3) — a scan that is exactly quadratic
+// without the bound, and 1.5 steps per repetition with it.
+//
+// The `"a* "` case guards something else entirely, and is kept for it: if the backward scan walked
+// the TOKEN array instead of the delimiter list, `openers_bottom` would not bound it at all, and an
+// array-based implementation measured **1.235 s** on this input (30 KB) and 5.05 s at double the
+// size — 4× input for 16× time, past this ceiling, with zero backward *delimiter* steps taken. The
+// cost was pure token traversal, invisible to reading and to any step counter.
+measureRender("a** * ×2000 (failed closers leave the list)", ceiling: 1.0, String(repeating: "a** * ", count: 2_000))
+measureRender("a* ×10000 (30 KB of failed closers)", ceiling: 1.0, String(repeating: "a* ", count: 10_000))
+measureRender("a*a **×4000 (24 KB, the shape openers_bottom bounds)", ceiling: 1.0, String(repeating: "a*a **", count: 4_000))
 
 // MARK: - Summary
 

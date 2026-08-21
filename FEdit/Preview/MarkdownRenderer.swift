@@ -619,6 +619,13 @@ enum MarkdownBlockParser {
     /// rule §1 imposes. (§1 states a memory-footprint goal; it does not forbid a data structure. The
     /// earlier wording here claimed it did.)
     ///
+    /// ((preview-emphasis-commonmark) verified this dependency survives, and tightened it. The
+    /// inline parser used to recurse into emphasis *bodies*, restarting the backtick scan inside
+    /// each one, so `` *a`b*c`d `` paired no backticks at all while this counter paired 1-2. Phase 1
+    /// now resolves code spans in ONE pass over the whole block, which is exactly the pairing
+    /// counted here, so the split and the render agree strictly more often than before and never
+    /// less. The rule this comment states is unchanged.)
+    ///
     /// This is a deliberate divergence from GFM proper, which splits cells before any inline
     /// parsing and therefore *does* let a pipe inside backticks break a cell; `\|` remains the only
     /// escape GFM offers and this subset supports neither it nor GFM's behaviour here.
@@ -879,35 +886,540 @@ enum InlineNode: Equatable {
     case link(text: String, url: String)
 }
 
-/// The inline parser for the SPEC §8.2 subset. A single left-to-right character scan with recursive
-/// descent for emphasis bodies. At each scan position it checks opener patterns in the fixed
-/// precedence order code span → link → bold → italic; the FIRST pattern that matches is the
-/// committed construct at that position — there is no fall-through to a lower-precedence construct
-/// once an opener matches. The closer is the nearest matching closing delimiter after the opener,
-/// scanning left to right with NO backtracking; if none exists, the opener's delimiter character(s)
-/// emit as literal text and scanning resumes just after them. Consecutive literal characters
-/// coalesce into a single `.text` node so `Equatable` trees are deterministic (criteria 9-13).
+// MARK: - Inline delimiter machinery ((preview-emphasis-commonmark), Tier 2)
+
+/// One token of the flat stream `MarkdownInlineParser` builds in phase 1 and rewrites in phase 2.
 ///
-/// This rule pins exactly one parse for every ambiguous input. Note that an italic body can never
-/// contain a `*` (the nearest `*` after the opener is always taken as the closer), so running the
-/// full recursive parser on an italic body can only ever produce code spans / links / text — never
-/// nested emphasis — which is exactly criterion 12's "recursively parsed for code spans and links
-/// (not for bold)". Pure `Foundation`-only code.
-enum MarkdownInlineParser {
-    static func parse(_ text: String) -> [InlineNode] {
-        parseNodes(Array(text))
+/// The stream is a **doubly-linked list held in an array**: `previous`/`next` are indices into
+/// `InlineTokenStream.tokens`, with `InlineTokenStream.nilIndex` standing in for "no neighbour".
+/// Indices rather than a class-based list because phase 2 splices whole ranges out of the middle (an
+/// emphasis match absorbs every token between its opener and its closer) and appends new ones, and
+/// an array of values keeps that pointer surgery allocation-free after the initial growth — the
+/// stream is a few contiguous buffers, not one object per token.
+///
+/// **Every payload here is an index, and that is a memory decision.** The obvious spelling — `case
+/// text(String)` and `case node(InlineNode)` — makes `Kind` as wide as an `InlineNode` (33 bytes,
+/// stride 40) and the token 56 bytes, because a Swift enum is as large as its widest case. Carrying
+/// a text run as a RANGE into the source characters and a finished node as an index into
+/// `InlineTokenStream.nodes` takes `Kind` to 17 bytes (stride 24) and the token to 40, and removes
+/// the tokenizer's per-run `String` copies and its whole `[Character]` literal buffer along with it.
+///
+/// **Measured, and the attribution matters.** Taking `"a*b **c** d "` x100,000 (1.2 MB, 300,000
+/// delimiter runs) as one fixed input: peak RSS was 165.9 MB with 56-byte tokens and 164.1 MB with
+/// 40-byte tokens — the narrowing on its own bought nothing, because geometric growth simply rounded
+/// the smaller array up to the same power of two. It is the capacity reserve in `tokenize` that
+/// converts it into a real saving; the two changes are only worth anything together.
+///
+/// **The residual, on the WORST shape rather than a convenient one** (an earlier version of this
+/// comment quoted only the row above, which understated it). All at 1.2 MB of source, HEAD vs here:
+///
+///     "*a"          x600,000    106.1 MB -> 207.4 MB   (1.95x, +101 MB)  <- worst measured
+///     "*a* "        x300,000    106.1 MB -> 207.3 MB   (1.95x)
+///     "[*"          x600,000    124.4 MB -> 226.0 MB   (1.82x)
+///     "a*b **c** d " x100,000    74.4 MB -> 123.7 MB   (1.66x)
+///     "`*`"         x400,000     73.0 MB -> 103.8 MB   (1.42x)
+///     plain prose   x48,000      78.2 MB ->  38.2 MB   (0.49x)  <- better than HEAD
+///
+/// Strictly linear in input either way — ~169 bytes of peak per source byte here against HEAD's ~88
+/// — and the shapes that regress are all ONE enormous paragraph made almost entirely of delimiters,
+/// where the token stream is the whole document. A realistic 1.09 MB document (SPEC.md x20, 3,700
+/// blocks) is 28.21 MB at HEAD and 28.34 MB here, +0.5%, because the stream is per block and dies
+/// with it. That is the trade the delimiter stack costs: HEAD's recursive descent built the tree
+/// directly and needed no intermediate representation at all.
+///
+/// Internal rather than private because `scripts/MarkdownRendererTests`' `ReferenceInlineParser`
+/// builds one too; see the note on `MarkdownInlineParser` for what that harness shares and what it
+/// deliberately re-implements (plan R10). Same precedent as `MarkdownRenderer.emitTable`.
+struct InlineToken {
+    enum Kind {
+        /// A literal run, as the half-open range `characters[start..<end]` of the block the stream
+        /// was built from. **Never empty** — the tokenizer flushes only non-empty runs, so folding
+        /// need not distinguish "no text token" from "empty text token".
+        case text(start: Int, end: Int)
+        /// A construct that is already final — a code span or link resolved in phase 1, or an
+        /// emphasis node built by phase 2 — by index into `InlineTokenStream.nodes`. Opaque to
+        /// emphasis.
+        case node(Int)
+        /// A maximal run of `*`, by index into `InlineTokenStream.delimiters`. The run's asterisks
+        /// are NOT stored here — `InlineDelimiterRun.remaining` is the single source of truth for
+        /// how many of them survived phase 2, and folding reads it.
+        case delimiterRun(Int)
     }
 
-    private static func parseNodes(_ characters: [Character]) -> [InlineNode] {
-        var nodes: [InlineNode] = []
-        var literal: [Character] = []
+    var kind: Kind
+    var previous: Int
+    var next: Int
+
+    init(_ kind: Kind) {
+        self.kind = kind
+        self.previous = InlineTokenStream.nilIndex
+        self.next = InlineTokenStream.nilIndex
+    }
+}
+
+/// One maximal run of `*` characters, with everything CommonMark 0.30's delimiter-stack algorithm
+/// needs to decide whether it may open or close emphasis and which run it pairs with.
+///
+/// **`originalLength` and `remaining` are both required and are not the same number** (plan R6).
+/// Phase 2 decrements `remaining` as asterisks are consumed — `***x***` takes 2 from each side to
+/// build the strong node and then 1 more from each to build the emphasis around it — while the
+/// "rule of three" (CommonMark's rule 9/10 tie-breaker) is defined on the lengths of the delimiter
+/// *runs as they appeared in the source*. Evaluating it on the decremented count silently
+/// mis-nests `*foo**bar**baz*`, so the original is kept immutable alongside.
+///
+/// `previous`/`next` are the delimiter list's own links — indices into
+/// `InlineTokenStream.delimiters`, NOT into `tokens`. Phase 2's backward scan for an opener walks
+/// **this** list and never the token array (plan R3): walking tokens would be O(tokens) per closer,
+/// which `openers_bottom` does not bound. The plan's reviewer measured an array-walking
+/// implementation at 1.235 s on `"a* "` × 10,000 — past the harness's advisory ceiling — while
+/// taking zero backward *delimiter* steps, the cost being pure token traversal. That input is in the
+/// harness's no-quadratic-cliff section for this reason; it renders in ~8 ms here.
+struct InlineDelimiterRun {
+    let originalLength: Int
+    var remaining: Int
+    let canOpen: Bool
+    let canClose: Bool
+    /// Index into `InlineTokenStream.tokens` of the token this run owns.
+    let token: Int
+    var previous: Int
+    var next: Int
+
+    /// The deepest emphasis nesting among the tokens lying strictly between **this** run's token
+    /// and the next run's token in the delimiter list (0 if there is none, and code spans and links
+    /// count as 0 — they are leaves).
+    ///
+    /// This is how `MarkdownInlineParser.emphasisNestingLimit` is enforced in O(1) per step instead
+    /// of by re-walking the token range. The backward scan for an opener visits exactly the
+    /// delimiters strictly between the closer and the opener, so accumulating the maximum of their
+    /// spans (plus the opener's own) as it walks yields the depth the new node would have, before
+    /// anything is consumed. The invariant is maintained by two rules and nothing else:
+    /// forming a node sets the opener's span to the new node's depth (after the splice the new node
+    /// is the only token between opener and closer), and a run leaving the delimiter list merges its
+    /// span into its predecessor's.
+    var spanMaxDepth: Int
+}
+
+/// Phase 1's output and phase 2's working set: the token list, the delimiter list, and the pointer
+/// surgery both phases need. Folding a token range back into `[InlineNode]` (phase 3) lives here
+/// too, because phase 2 uses the *same* function to build an emphasis node's children — which is
+/// what makes literal coalescing hold at every nesting depth rather than only at the root
+/// (plan R8: otherwise `**a*b**` yields `bold([text("a"), text("*"), text("b")])`).
+struct InlineTokenStream {
+    /// The sentinel standing in for `nil` in every `previous`/`next` field of BOTH lists. A plain
+    /// `-1` rather than `Optional<Int>` so the hot loops compare two `Int`s with no unwrapping.
+    static let nilIndex = -1
+
+    /// The block's characters. `.text` tokens are ranges into this, so it must outlive them — it is
+    /// held here rather than passed to `foldTokens`, which cannot then be handed the wrong array.
+    /// Costs nothing: `[Character]` is copy-on-write and this stream only ever reads it.
+    let characters: [Character]
+    var tokens: [InlineToken] = []
+    var delimiters: [InlineDelimiterRun] = []
+    /// Finished code spans, links and emphasis nodes, referenced by index from `.node` tokens.
+    var nodes: [InlineNode] = []
+    /// Head/tail of the token list.
+    var head = InlineTokenStream.nilIndex
+    var tail = InlineTokenStream.nilIndex
+    /// Head/tail of the delimiter list. Only runs that can open or close are ever on it.
+    var firstDelimiter = InlineTokenStream.nilIndex
+    var lastDelimiter = InlineTokenStream.nilIndex
+
+    init(_ characters: [Character]) {
+        self.characters = characters
+    }
+
+    // MARK: Phase 1 construction
+
+    /// Appends the literal run `characters[start..<end]`. The emptiness check is an `assert` rather
+    /// than a `precondition` to match the anchor invariants below — the harness compiles without
+    /// `-O`, so it is live there, and a release-build violation would produce a token that folds to
+    /// nothing rather than a wrong tree. `InlineToken.Kind.text` promises non-empty runs and
+    /// `foldTokens` relies on it; a silently tolerated empty one would hide a bookkeeping bug in the
+    /// tokenizer.
+    mutating func appendText(from start: Int, to end: Int) {
+        assert(start < end, "an empty literal run must never be tokenized")
+        appendLinked(InlineToken(.text(start: start, end: end)))
+    }
+
+    mutating func appendNode(_ node: InlineNode) {
+        let index = nodes.count
+        nodes.append(node)
+        appendLinked(InlineToken(.node(index)))
+    }
+
+    /// Appends a `*` run's token and its delimiter record, linking the record into the delimiter
+    /// list **only if the run can open or close**.
+    ///
+    /// That guard is load-bearing for complexity, not tidiness (plan R3 ii). A run that is neither
+    /// left- nor right-flanking — the `*` in `2 * 3`, space on both sides — can never participate in
+    /// a match, so leaving it out keeps every backward scan proportional to the delimiters that
+    /// could conceivably match rather than to every asterisk in the block.
+    ///
+    /// Note which example does NOT belong here, because an earlier version of this comment claimed
+    /// it did: the `*` in `"a* "` is preceded by a letter, so it IS right-flanking
+    /// (`asteriskRunFlanking(before: "a", after: " ")` is `canOpen: false, canClose: true`) and it
+    /// IS put on the list. It leaves later, via `processEmphasis`'s "a failed closer that cannot
+    /// open is removed" rule — a different mechanism, and the one that actually makes `"a* "`x10000
+    /// linear.
+    mutating func appendDelimiterRun(length: Int, canOpen: Bool, canClose: Bool) {
+        let token = tokens.count
+        let run = delimiters.count
+        appendLinked(InlineToken(.delimiterRun(run)))
+        let linked = canOpen || canClose
+        delimiters.append(InlineDelimiterRun(
+            originalLength: length,
+            remaining: length,
+            canOpen: canOpen,
+            canClose: canClose,
+            token: token,
+            previous: linked ? lastDelimiter : InlineTokenStream.nilIndex,
+            next: InlineTokenStream.nilIndex,
+            spanMaxDepth: 0
+        ))
+        guard linked else { return }
+        if lastDelimiter == InlineTokenStream.nilIndex {
+            firstDelimiter = run
+        } else {
+            delimiters[lastDelimiter].next = run
+        }
+        lastDelimiter = run
+    }
+
+    /// Appends a node token **without** linking it into the token list, returning its token index.
+    /// Phase 2 uses this for a new emphasis node, which is spliced between its opener and closer
+    /// rather than at the tail.
+    mutating func appendDetachedNode(_ node: InlineNode) -> Int {
+        let nodeIndex = nodes.count
+        nodes.append(node)
+        let tokenIndex = tokens.count
+        tokens.append(InlineToken(.node(nodeIndex)))
+        return tokenIndex
+    }
+
+    private mutating func appendLinked(_ token: InlineToken) {
+        var token = token
+        token.previous = tail
+        let index = tokens.count
+        tokens.append(token)
+        if tail == InlineTokenStream.nilIndex {
+            head = index
+        } else {
+            tokens[tail].next = index
+        }
+        tail = index
+    }
+
+    /// Hints both arrays' final size. See the caller in `tokenize` for how the estimate is derived
+    /// and what it measured; a wrong estimate costs allocation, never correctness.
+    mutating func reserveCapacity(tokens tokenCount: Int, delimiters delimiterCount: Int) {
+        tokens.reserveCapacity(tokenCount)
+        delimiters.reserveCapacity(delimiterCount)
+    }
+
+    // MARK: Phase 2 surgery
+
+    /// Splices `token` in as the ONLY element between `left` and `right`, dropping everything that
+    /// was between them from the token list. Callers must have folded that range into the new
+    /// token's node first — this is what absorbs an emphasis body into its emphasis node.
+    ///
+    /// Amortized linear over a whole block even though each call is O(range): every splice removes
+    /// `k` tokens and adds 1, so the total number of tokens ever visited across all splices is
+    /// bounded by the initial token count plus the number of splices.
+    mutating func spliceToken(_ token: Int, between left: Int, and right: Int) {
+        tokens[left].next = token
+        tokens[token].previous = left
+        tokens[token].next = right
+        tokens[right].previous = token
+    }
+
+    /// Unlinks one token from the token list (used when a delimiter run's last asterisk is consumed).
+    mutating func unlinkToken(_ index: Int) {
+        let previous = tokens[index].previous
+        let next = tokens[index].next
+        if previous == InlineTokenStream.nilIndex {
+            head = next
+        } else {
+            tokens[previous].next = next
+        }
+        if next == InlineTokenStream.nilIndex {
+            tail = previous
+        } else {
+            tokens[next].previous = previous
+        }
+    }
+
+    /// Removes one run from the delimiter list. Its token, and its `remaining` asterisks, are
+    /// untouched: a closer that found no opener leaves the list but still folds back to literal
+    /// text.
+    ///
+    /// The departing run's `spanMaxDepth` merges into its predecessor's, because the tokens it used
+    /// to account for are now part of the predecessor's span. Missing this would under-report depth
+    /// and let the nesting cap through.
+    mutating func removeDelimiter(_ index: Int) {
+        let previous = delimiters[index].previous
+        let next = delimiters[index].next
+        if previous != InlineTokenStream.nilIndex {
+            delimiters[previous].spanMaxDepth = max(delimiters[previous].spanMaxDepth, delimiters[index].spanMaxDepth)
+        }
+        if previous == InlineTokenStream.nilIndex {
+            firstDelimiter = next
+        } else {
+            delimiters[previous].next = next
+        }
+        if next == InlineTokenStream.nilIndex {
+            lastDelimiter = previous
+        } else {
+            delimiters[next].previous = previous
+        }
+    }
+
+    /// Drops every delimiter strictly between a matched opener and closer from the delimiter list
+    /// (plan R8). Required, not an optimization: those runs' tokens are about to be absorbed into
+    /// the new emphasis node, so leaving them on the list would let a later closer "match" an
+    /// opener that is now nested inside a finished node — `**a*b**` is exactly that shape.
+    ///
+    /// Only relinks the two endpoints, so a dropped run keeps stale `previous`/`next` values. That
+    /// is safe because nothing ever walks from a dropped run; the one place a dropped index can
+    /// still be observed is `openers_bottom`, where it degrades to a bound that never matches (the
+    /// scan then simply runs to the bottom of the list) — the same behaviour the reference
+    /// implementations have with a stale pointer.
+    mutating func removeDelimitersBetween(opener: Int, closer: Int) {
+        guard delimiters[opener].next != closer else { return }
+        delimiters[opener].next = closer
+        delimiters[closer].previous = opener
+    }
+
+    // MARK: Phase 3 fold
+
+    /// Folds the token range `[start, end)` — walking `next` links, `end == nilIndex` meaning "to
+    /// the end of the list" — into inline nodes.
+    ///
+    /// Unmatched delimiter runs come back as their literal asterisks, and **adjacent literals
+    /// coalesce into a single `.text` node**. Because phase 2 calls this for an emphasis node's
+    /// children as well, that coalescing holds at every nesting depth: the parser's literality
+    /// contract ("consecutive literal characters coalesce so `Equatable` trees are deterministic")
+    /// is a whole-tree property, not a root-level one (plan R8).
+    func foldTokens(from start: Int, until end: Int) -> [InlineNode] {
+        var folded: [InlineNode] = []
+        var literal = ""
+        var index = start
+        while index != InlineTokenStream.nilIndex, index != end {
+            switch tokens[index].kind {
+            // Named `textStart`/`textEnd` rather than `start`/`end`: those are this function's own
+            // parameters, and `end` is the loop's terminator — shadowing it here would be a trap
+            // waiting for the next edit.
+            case let .text(textStart, textEnd):
+                literal.append(contentsOf: characters[textStart..<textEnd])
+            case let .delimiterRun(run):
+                let remaining = delimiters[run].remaining
+                if remaining > 0 {
+                    literal += String(repeating: "*", count: remaining)
+                }
+            case let .node(node):
+                if !literal.isEmpty {
+                    folded.append(.text(literal))
+                    literal = ""
+                }
+                folded.append(nodes[node])
+            }
+            index = tokens[index].next
+        }
+        if !literal.isEmpty {
+            folded.append(.text(literal))
+        }
+        return folded
+    }
+}
+
+/// The inline parser for the SPEC §8.2 subset, in three phases over the whole block.
+///
+/// **Phase 1 (`tokenize`)** is one left-to-right character scan producing a flat token stream. Code
+/// spans and links are resolved here, in the fixed precedence order code span → link, and are
+/// **opaque to emphasis**: their content is never re-scanned for delimiters. A `*` character starts
+/// a *maximal run* of asterisks, recorded with its length and with the CommonMark left/right
+/// flanking flags computed from the characters on either side of the run.
+///
+/// **Phase 2 (`processEmphasis`)** is CommonMark 0.30's delimiter-stack algorithm: walk forward to
+/// each potential closer, walk *back* along the delimiter list for the nearest compatible opener,
+/// and on a match wrap the tokens between them in a `.bold` (two asterisks from each side) or
+/// `.italic` (one) node. `openers_bottom` records where a failed backward scan gave up so the scan
+/// stays linear overall.
+///
+/// **Phase 3 (`InlineTokenStream.foldTokens`)** folds what is left into `[InlineNode]`, turning
+/// still-unmatched delimiter runs back into literal asterisks and coalescing adjacent literals.
+///
+/// **This REVERSES the rule this comment used to document.** Until
+/// `(preview-emphasis-commonmark)` the parser committed to the *nearest* matching closer with no
+/// backtracking and no flanking test, which pinned exactly one parse for every ambiguous input and
+/// made nested emphasis impossible by construction. It also made a single stray `*` earlier in a
+/// block re-pair every asterisk after it (`2 * 3 and **bold** here` rendered "bold" in *italics*
+/// with a leftover `*`), and it deleted characters: `a****b` rendered as `ab`. The delimiter stack
+/// replaces both properties — emphasis nests, a run that cannot open or close is inert, and no
+/// asterisk is ever dropped without being rendered as a delimiter.
+///
+/// **Two consequences worth stating, because they are behaviour changes rather than fixes**
+/// (plan R1). The old parser recursed into an emphasis *body slice*, so a code span's or link's
+/// closer search was truncated at the emphasis boundary. Phase 1 resolves them over the **whole
+/// block**, so `` *a`b* c`d `` is now a code span spanning the `*`, and `*a [b* c](d)` is now a real
+/// link — text that used to render plain is now clickable. This is the direction every other
+/// renderer takes, and running two different scoping rules in one parser (per-body for code spans,
+/// whole-block for emphasis) would be worse than either.
+///
+/// The subset is unchanged and is NOT full CommonMark: no `_` emphasis, no backslash escapes, no
+/// HTML, no reference links, and code spans still pair backticks 1-2, 3-4, … rather than by run
+/// length. Pure `Foundation`-only code.
+enum MarkdownInlineParser {
+    /// The deepest emphasis nesting one block may produce: an `.bold`/`.italic` node whose chain of
+    /// emphasis ancestors is already this long refuses to form, and its delimiters emit literally,
+    /// exactly as an unmatched run does.
+    ///
+    /// **This is a crash fix, not tidiness, and it is the direct cost of nesting existing at all.**
+    /// Before `(preview-emphasis-commonmark)` an italic body could not contain a `*`, so the tree
+    /// was at most three deep no matter what the input said. The delimiter stack makes depth
+    /// unbounded and linear in input length — `"*"x2N + "x" + "*"x2N` nests N deep — and every
+    /// consumer of the tree recurses once per level: `MarkdownRenderer.emitInline`, the compiler's
+    /// synthesized `InlineNode.==`, and ARC's release of the nested arrays. `MarkdownRenderer.render`
+    /// runs on `MarkdownPreviewView`'s `.utility` `renderQueue`, whose worker threads get a **512 KB
+    /// stack**, not the main thread's 8 MB. Measured on a real queue worker: depth 465 renders,
+    /// depth 470 takes **SIGBUS** — a **1,881-character document that kills the app**. And it is
+    /// reachable from ordinary prose, because paragraph lines merge before inline parsing: 500 lines
+    /// of `see *note` followed by 500 lines of `then note* here` is 12,999 bytes of plain-looking
+    /// text, parses to one block, and crashed. HEAD renders both fine.
+    ///
+    /// **32**, chosen the way `MarkdownBlockParser.tableCellLimit` is: bound the derived structure
+    /// and declare it, rather than let it grow with the input. What it admits: every document anyone
+    /// writes. Real Markdown nests emphasis two or three deep (`*a **b** c*` is 2); the CommonMark
+    /// 0.30 spec's own examples never exceed 3. What it costs: `"*"x66 + "x" + "*"x66` renders with
+    /// literal asterisks where the 33rd level would have been. What it buys: a **14x margin** below
+    /// the measured 470-level emitter cliff, and ~100x below the ~3,500-level cliff for merely
+    /// *releasing* the tree on the same stack — so it fixes all three recursions at once, which an
+    /// iterative emitter would not.
+    static let emphasisNestingLimit = 32
+
+    static func parse(_ text: String) -> [InlineNode] {
+        var stream = tokenize(Array(text))
+        processEmphasis(&stream)
+        return stream.foldTokens(from: stream.head, until: InlineTokenStream.nilIndex)
+    }
+
+    // MARK: - Character classes (CommonMark 0.30, plan R5)
+    //
+    // Both predicates are OWNED here rather than delegated to a Foundation `CharacterSet`, because
+    // both stock sets are wrong in both directions and the errors are silent:
+    //
+    //   * `CharacterSet.punctuationCharacters` is the Unicode P* categories only, so it is missing
+    //     `$ + < = > ^ ` | ~` — all nine ARE CommonMark punctuation (they are ASCII punctuation,
+    //     which the spec folds in wholesale). With that set `x**$**y` would render `$` in bold
+    //     instead of literally.
+    //   * `CharacterSet.whitespaces` omits FF (U+000C), which CommonMark counts, and contains
+    //     ZWSP (U+200B), which it does not; `whitespacesAndNewlines` additionally contains NEL
+    //     (U+0085), which it does not either.
+    //
+    // Both measured against this project's SDK, not assumed. The target is **CommonMark 0.30**
+    // specifically: 0.31.2 moved the Unicode Symbol categories into "Unicode punctuation", which
+    // flips cases like `x**🙂**y`. Naming the version is the difference between a decision and an
+    // accident.
+
+    /// CommonMark 0.30's "Unicode whitespace character": the Zs general category plus tab, LF, FF
+    /// and CR. Note VT (U+000B) is deliberately absent — it is a "whitespace character" for block
+    /// parsing in that spec but not a *Unicode* whitespace character for flanking.
+    static func isCommonMarkWhitespace(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar {
+        case "\u{0009}", "\u{000A}", "\u{000C}", "\u{000D}":
+            return true
+        default:
+            return scalar.properties.generalCategory == .spaceSeparator
+        }
+    }
+
+    /// CommonMark 0.30's "Unicode punctuation character": an ASCII punctuation character, or
+    /// anything in the general categories Pc, Pd, Pe, Pf, Pi, Po, Ps. The ASCII half is spelled out
+    /// because nine of its members (`$ + < = > ^ ` | ~`) are in Sc/Sk/Sm and would be missed by the
+    /// category test alone.
+    static func isCommonMarkPunctuation(_ scalar: Unicode.Scalar) -> Bool {
+        if scalar.isASCII {
+            switch scalar {
+            case "!", "\"", "#", "$", "%", "&", "'", "(", ")", "*", "+", ",", "-", ".", "/",
+                 ":", ";", "<", "=", ">", "?", "@", "[", "\\", "]", "^", "_", "`", "{", "|", "}", "~":
+                return true
+            default:
+                return false
+            }
+        }
+        switch scalar.properties.generalCategory {
+        case .connectorPunctuation, .dashPunctuation, .closePunctuation, .finalPunctuation,
+             .initialPunctuation, .otherPunctuation, .openPunctuation:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Whether a `*` run flanked by these two characters can open and/or close emphasis, per
+    /// CommonMark 0.30 §6.2. `nil` on either side means the start or end of the block, which the
+    /// spec counts as whitespace.
+    ///
+    /// left-flanking  = not followed by whitespace, and (not followed by punctuation, or preceded by
+    ///                  whitespace or punctuation)
+    /// right-flanking = not preceded by whitespace, and (not preceded by punctuation, or followed by
+    ///                  whitespace or punctuation)
+    ///
+    /// For `*` (unlike `_`) that is the whole rule: `canOpen` is left-flanking, `canClose` is
+    /// right-flanking. `_` would need two further clauses, and is not in this subset.
+    ///
+    /// The two neighbours are classified on the scalar *nearest the run* — the last scalar of the
+    /// preceding character and the first scalar of the following one. Swift's `Character` is a
+    /// grapheme cluster while CommonMark is defined over scalars, so `é` spelled `e` + U+0301 must
+    /// be judged on the scalar that actually abuts the run, exactly as a scalar-based reference
+    /// implementation would.
+    ///
+    /// Internal (not private) so `ReferenceInlineParser` in the test harness shares this one
+    /// definition instead of re-deriving it — a divergence here would be an unattributable
+    /// differential mismatch, whereas a shared helper turns any slip into a compile error (plan R10).
+    static func asteriskRunFlanking(before: Character?, after: Character?) -> (canOpen: Bool, canClose: Bool) {
+        let precedingScalar = before?.unicodeScalars.last
+        let followingScalar = after?.unicodeScalars.first
+        let precededByWhitespace = precedingScalar.map(isCommonMarkWhitespace) ?? true
+        let followedByWhitespace = followingScalar.map(isCommonMarkWhitespace) ?? true
+        let precededByPunctuation = precedingScalar.map(isCommonMarkPunctuation) ?? false
+        let followedByPunctuation = followingScalar.map(isCommonMarkPunctuation) ?? false
+
+        let leftFlanking = !followedByWhitespace
+            && (!followedByPunctuation || precededByWhitespace || precededByPunctuation)
+        let rightFlanking = !precededByWhitespace
+            && (!precededByPunctuation || followedByWhitespace || followedByPunctuation)
+        return (canOpen: leftFlanking, canClose: rightFlanking)
+    }
+
+    // MARK: - Phase 1: tokenize
+
+    /// One left-to-right pass over the block: code spans and links resolve to finished nodes,
+    /// maximal `*` runs become delimiter runs, everything else accumulates into literal text.
+    private static func tokenize(_ characters: [Character]) -> InlineTokenStream {
+        var stream = InlineTokenStream(characters)
         var index = 0
         let count = characters.count
 
+        // The literal run in progress, as a start index into `characters` — `nilIndex` when there is
+        // none. Carrying the range rather than accumulating a `[Character]` buffer is why this
+        // tokenizer allocates nothing per literal character; see `InlineToken.Kind.text`.
+        var literalStart = InlineTokenStream.nilIndex
+
+        /// Extends the literal run in progress over `characters[index]` and advances.
+        func takeLiteral() {
+            if literalStart == InlineTokenStream.nilIndex {
+                literalStart = index
+            }
+            index += 1
+        }
+
+        /// Closes the literal run in progress, if any. Must be called while `index` still points at
+        /// the character *after* the run — every caller below does, because a construct's own first
+        /// character is what ends the run.
         func flushLiteral() {
-            guard !literal.isEmpty else { return }
-            nodes.append(.text(String(literal)))
-            literal.removeAll()
+            guard literalStart != InlineTokenStream.nilIndex else { return }
+            stream.appendText(from: literalStart, to: index)
+            literalStart = InlineTokenStream.nilIndex
         }
 
         // `parseLink`'s two closer scans (`]` then `)`) are the only quadratic-prone construct in
@@ -915,13 +1427,66 @@ enum MarkdownInlineParser {
         // character, so the next `[` would otherwise re-scan to EOF. Precompute, in one backward
         // pass, "nearest `]`/`)` at or after i" so `parseLink` becomes O(1) per call. Built ONLY when
         // `characters` contains a `[` — `parseLink` is reached only after the driver sees a `[`, so a
-        // bracket-free slice never builds or reads these arrays (zero extra allocation on the hot
+        // bracket-free block never builds or reads these arrays (zero extra allocation on the hot
         // path). `nextCloseBracket[i]`/`nextCloseParen[i]` equal exactly what
-        // `firstIndex(of: "]"/")" , from: i)` return today, with the sentinel `count` standing in for
-        // `nil` — this memoization is what keeps the produced tree byte-identical.
+        // `firstIndex(of: "]"/")" , from: i)` return, with the sentinel `count` standing in for
+        // `nil` — this memoization is what keeps the produced tree byte-identical to the unmemoized
+        // scan, which is what the harness's differential fuzz exists to prove.
+        //
+        // The arrays are now built ONCE for the whole block rather than once per emphasis body,
+        // because emphasis no longer recurses. That is strictly less work, and it is also why the
+        // scoping of links changed (plan R1) — the memo is not the cause, the single pass is.
+        // One pre-pass answers both questions phase 1 needs before it starts: does a `[` exist (the
+        // link memo below is built only then, exactly as before — this loop replaces the
+        // `characters.contains("[")` scan rather than adding to it), and how many `*` characters and
+        // maximal `*` runs are there.
+        //
+        // **The counts are a capacity hint, and they were measured before being added.** A block's
+        // token count is proportional to its length, and geometric growth then costs roughly twice
+        // the final size, because a doubling holds the old buffer and the new one at once. Phase 2
+        // is where that bit: on `"a*b **c** d "` x100,000 the token array reached 629,144 entries in
+        // phase 1 and then doubled to 1,258,290 when phase 2 appended its emphasis nodes, and that
+        // one growth accounted for ~40 MB of peak RSS. Reserving up front removes it, with no change
+        // to any output. The full HEAD-vs-here table lives on `InlineToken`; it is deliberately in
+        // ONE place, because an earlier revision of this file carried two measurement sets for the
+        // same input that disagreed with each other.
+        //
+        // The estimate: at most one literal token per delimiter run plus one delimiter token per
+        // run plus a trailing literal (`2 * runs + 1`), plus phase 2's emphasis nodes, of which
+        // there can be at most one per two asterisks. It is a HINT, not a bound, in both directions.
+        // Under-reserving: code spans and links split literal runs and can push the real count above
+        // it, in which case the array grows as it would have anyway. Over-reserving: this pre-scan
+        // counts asterisks in the raw text, before it is known that a code span or a link title will
+        // swallow them and produce no delimiter at all — `` "`*`" `` x400,000 reserves ~1.0 M tokens
+        // for the ~400,000 it actually uses, measured at 103.8 MB peak against HEAD's 73.0 MB. The
+        // waste is bounded at ~60 bytes per source character (`runs <= characters.count / 2`), and
+        // buying it back would mean resolving code spans twice.
+        var asteriskRuns = 0
+        var asteriskCount = 0
+        var containsBracket = false
+        var scan = 0
+        while scan < count {
+            if characters[scan] == "*" {
+                asteriskRuns += 1
+                while scan < count, characters[scan] == "*" {
+                    asteriskCount += 1
+                    scan += 1
+                }
+            } else {
+                if characters[scan] == "[" {
+                    containsBracket = true
+                }
+                scan += 1
+            }
+        }
+        stream.reserveCapacity(
+            tokens: 2 * asteriskRuns + 1 + asteriskCount / 2,
+            delimiters: asteriskRuns
+        )
+
         var nextCloseBracket: [Int] = []
         var nextCloseParen: [Int] = []
-        if characters.contains("[") {
+        if containsBracket {
             nextCloseBracket = [Int](repeating: 0, count: count + 1)
             nextCloseParen = [Int](repeating: 0, count: count + 1)
             nextCloseBracket[count] = count
@@ -941,13 +1506,12 @@ enum MarkdownInlineParser {
             if character == "`" {
                 if let close = firstIndex(of: "`", in: characters, from: index + 1) {
                     flushLiteral()
-                    nodes.append(.code(String(characters[(index + 1)..<close])))
+                    stream.appendNode(.code(String(characters[(index + 1)..<close])))
                     index = close + 1
                     continue
                 }
                 // No closer: the backtick is literal.
-                literal.append(character)
-                index += 1
+                takeLiteral()
                 continue
             }
 
@@ -955,54 +1519,166 @@ enum MarkdownInlineParser {
             if character == "[" {
                 if let link = parseLink(characters, from: index, nextCloseBracket: nextCloseBracket, nextCloseParen: nextCloseParen) {
                     flushLiteral()
-                    nodes.append(.link(text: link.title, url: link.url))
+                    stream.appendNode(.link(text: link.title, url: link.url))
                     index = link.end
                     continue
                 }
                 // No valid link form: the `[` is literal.
-                literal.append(character)
-                index += 1
+                takeLiteral()
                 continue
             }
 
-            // 3. Bold — `**...**`, checked before italic so `**` is never two italic delimiters.
-            if character == "*", index + 1 < count, characters[index + 1] == "*" {
-                if let close = firstDoubleIndex(of: "*", in: characters, from: index + 2) {
-                    flushLiteral()
-                    nodes.append(.bold(parseNodes(Array(characters[(index + 2)..<close]))))
-                    index = close + 2
-                    continue
-                }
-                // No closer: the `**` opener emits literally; resume after both characters. It does
-                // NOT fall through to be re-read as two italic delimiters.
-                literal.append("*")
-                literal.append("*")
-                index += 2
-                continue
-            }
-
-            // 4. Italic — `*...*`.
+            // 3. A maximal run of `*`. Maximal is what makes `**` one run of two rather than two
+            //    runs of one, so bold and italic need no separate cases: the run's length, and how
+            //    much of it a match consumes, decide that in phase 2.
             if character == "*" {
-                if let close = firstIndex(of: "*", in: characters, from: index + 1) {
-                    flushLiteral()
-                    nodes.append(.italic(parseNodes(Array(characters[(index + 1)..<close]))))
-                    index = close + 1
-                    continue
+                var end = index
+                while end < count, characters[end] == "*" {
+                    end += 1
                 }
-                // No closer: the `*` is literal.
-                literal.append(character)
-                index += 1
+                flushLiteral()
+                let flanking = asteriskRunFlanking(
+                    before: index > 0 ? characters[index - 1] : nil,
+                    after: end < count ? characters[end] : nil
+                )
+                stream.appendDelimiterRun(length: end - index, canOpen: flanking.canOpen, canClose: flanking.canClose)
+                index = end
                 continue
             }
 
             // Ordinary character.
-            literal.append(character)
-            index += 1
+            takeLiteral()
         }
 
         flushLiteral()
-        return nodes
+        return stream
     }
+
+    // MARK: - Phase 2: the delimiter stack
+
+    /// CommonMark 0.30's `process_emphasis`, over the whole block (there is no `stack_bottom` to
+    /// pass: links do not recurse here, so the stack is only ever processed once).
+    private static func processEmphasis(_ stream: inout InlineTokenStream) {
+        // `openers_bottom` — the lower bound that keeps the backward scan linear overall. Keyed by
+        // (delimiter char, CLOSER run length mod 3, whether the CLOSER can also open) (plan R4).
+        // The flag belongs to the closer, not to the opener: at the moment the key is formed there
+        // is no opener yet — finding one is what the scan is about. Only `*` exists in this subset,
+        // so the character dimension collapses and six slots remain.
+        var openersBottom = [Int](repeating: InlineTokenStream.nilIndex, count: 6)
+        var closer = stream.firstDelimiter
+
+        while closer != InlineTokenStream.nilIndex {
+            guard stream.delimiters[closer].canClose else {
+                closer = stream.delimiters[closer].next
+                continue
+            }
+
+            let key = openersBottomKey(stream.delimiters[closer])
+
+            // The backward scan. It walks the DELIMITER list (plan R3) — never the token array —
+            // and it starts at `closer.previous`, so an opener and its closer are always separate
+            // runs and `a***b` cannot pair with itself.
+            //
+            // It also carries `spanMaxDepth`, the deepest emphasis nesting already present in the
+            // tokens it has walked past. Those tokens are exactly the children the new node would
+            // adopt, so `spanMaxDepth + 1` is the depth this pair would produce — known before
+            // anything is consumed, in O(1) per step. See `emphasisNestingLimit`.
+            var opener = stream.delimiters[closer].previous
+            var openerFound = false
+            var spanMaxDepth = 0
+            while opener != InlineTokenStream.nilIndex, opener != openersBottom[key] {
+                // Accumulate BEFORE testing the candidate: a run's span covers the tokens between it
+                // and the next run toward the closer, so the opener's own span is part of the body.
+                spanMaxDepth = max(spanMaxDepth, stream.delimiters[opener].spanMaxDepth)
+                // At the cap, stop the scan entirely rather than skipping this candidate. The
+                // accumulated depth only grows as the scan walks back, so no earlier opener can
+                // produce a shallower node — every one of them would wrap this body and more.
+                if spanMaxDepth >= emphasisNestingLimit {
+                    break
+                }
+                if stream.delimiters[opener].canOpen,
+                   !ruleOfThreeForbids(opener: stream.delimiters[opener], closer: stream.delimiters[closer]) {
+                    openerFound = true
+                    break
+                }
+                opener = stream.delimiters[opener].previous
+            }
+
+            let oldCloser = closer
+
+            if openerFound {
+                // Strong iff BOTH sides still have at least two UNCONSUMED asterisks (plan R8).
+                // `***x***` is two passes over the same pair — 2 then 1 — and is impossible without
+                // testing `remaining` rather than the original lengths.
+                let use = (stream.delimiters[opener].remaining >= 2 && stream.delimiters[closer].remaining >= 2) ? 2 : 1
+                stream.delimiters[opener].remaining -= use
+                stream.delimiters[closer].remaining -= use
+
+                let openerToken = stream.delimiters[opener].token
+                let closerToken = stream.delimiters[closer].token
+
+                // Partial consumption keeps its ordering for free (plan R8): leftover OPENER
+                // asterisks stay in the opener's token, which is still before the new node, and
+                // leftover CLOSER asterisks stay in the closer's token, still after it — so
+                // `***x**` folds to `*` + strong(x).
+                let children = stream.foldTokens(from: stream.tokens[openerToken].next, until: closerToken)
+                let node = stream.appendDetachedNode(use == 2 ? .bold(children) : .italic(children))
+                stream.spliceToken(node, between: openerToken, and: closerToken)
+                stream.removeDelimitersBetween(opener: opener, closer: closer)
+                // After the splice the new node is the ONLY token between opener and closer, so the
+                // opener's span is exactly that node's depth. The runs just dropped from the list
+                // need no merge: their spans are all strictly less than this, by construction.
+                stream.delimiters[opener].spanMaxDepth = spanMaxDepth + 1
+
+                if stream.delimiters[opener].remaining == 0 {
+                    stream.unlinkToken(openerToken)
+                    stream.removeDelimiter(opener)
+                }
+                if stream.delimiters[closer].remaining == 0 {
+                    stream.unlinkToken(closerToken)
+                    let resume = stream.delimiters[closer].next
+                    stream.removeDelimiter(closer)
+                    closer = resume
+                }
+                // If the closer survives with asterisks to spare, it is re-examined on the next
+                // iteration — that second look is what turns `***x***` into em(strong(x)).
+            } else {
+                closer = stream.delimiters[closer].next
+                // No opener exists at or below this point for this key, so future scans with the
+                // same key can stop here.
+                openersBottom[key] = stream.delimiters[oldCloser].previous
+                // A closer that cannot also open can never match anything later either, so it
+                // leaves the list entirely (plan R3 ii). Its token — and its asterisks — remain,
+                // and fold back to literal text.
+                if !stream.delimiters[oldCloser].canOpen {
+                    stream.removeDelimiter(oldCloser)
+                }
+            }
+        }
+    }
+
+    /// `openers_bottom`'s key: (closer run length mod 3, whether the closer can also open), per
+    /// plan R4. The **original** length, not `remaining`, so a run that is matched twice keeps one
+    /// stable key.
+    private static func openersBottomKey(_ closer: InlineDelimiterRun) -> Int {
+        (closer.canOpen ? 3 : 0) + closer.originalLength % 3
+    }
+
+    /// CommonMark's "rule of three": if either run can both open and close, the pair is forbidden
+    /// when the sum of the two runs' ORIGINAL lengths is a multiple of 3, unless both lengths are
+    /// multiples of 3.
+    ///
+    /// It is three lines and it is load-bearing in both directions: without it `*foo**bar**baz*`
+    /// mis-nests, and `**a*b**` — an existing assertion — becomes
+    /// `italic([italic("a"), text("b")]), text("*")`. So it fails loudly rather than silently, which
+    /// is the opposite of what this plan's first revision assumed (plan R9).
+    private static func ruleOfThreeForbids(opener: InlineDelimiterRun, closer: InlineDelimiterRun) -> Bool {
+        guard closer.canOpen || opener.canClose else { return false }
+        guard (opener.originalLength + closer.originalLength) % 3 == 0 else { return false }
+        return !(opener.originalLength % 3 == 0 && closer.originalLength % 3 == 0)
+    }
+
+    // MARK: - Shared scanning helpers
 
     /// Index of the nearest `character` at or after `from`, else nil.
     private static func firstIndex(of character: Character, in characters: [Character], from: Int) -> Int? {
@@ -1016,25 +1692,12 @@ enum MarkdownInlineParser {
         return nil
     }
 
-    /// Index of the nearest pair `character` immediately followed by `character` starting at or
-    /// after `from`, else nil.
-    private static func firstDoubleIndex(of character: Character, in characters: [Character], from: Int) -> Int? {
-        var index = from
-        while index + 1 < characters.count {
-            if characters[index] == character, characters[index + 1] == character {
-                return index
-            }
-            index += 1
-        }
-        return nil
-    }
-
     /// Parses `[title](url)` starting at `open` (`characters[open] == "["`). Uses the nearest `]`
     /// after `[`, which must be immediately followed by `(`, then the nearest `)` after that.
     /// Returns the verbatim title, verbatim url, and the index just past the closing `)`; nil if
     /// the full form is not present (the caller then emits `[` literally).
     ///
-    /// `nextCloseBracket`/`nextCloseParen` are the per-invocation memo built in `parseNodes`:
+    /// `nextCloseBracket`/`nextCloseParen` are the per-block memo built in `tokenize`:
     /// `nextCloseBracket[f]`/`nextCloseParen[f]` equal exactly what
     /// `firstIndex(of: "]"/")" , in: characters, from: f)` would return, with the sentinel
     /// `characters.count` standing in for `nil`. Guaranteed built and non-empty here because this
@@ -1156,6 +1819,24 @@ private enum PreviewFont {
         let descriptor = Theme.bodyFont.fontDescriptor.withSymbolicTraits(.italic)
         let candidate = NSFont(descriptor: descriptor, size: Theme.bodyFont.pointSize) ?? Theme.bodyFont
         return candidate.fontDescriptor.symbolicTraits.contains(.italic) ? candidate : Theme.bodyFont
+    }()
+
+    /// Bold *and* italic. Required as its own face because a font's traits are selected together,
+    /// not layered: asking for `.italic` alone returns the regular italic and silently drops bold.
+    /// Before `(preview-emphasis-commonmark)` nothing could reach this combination — an italic body
+    /// could not contain a `*`, so bold-inside-italic did not exist — and `emitInline` "composed"
+    /// traits by replacing them, which now loses the outer trait on `*a **b** c*`, the exact
+    /// construct SPEC §8.2 advertises.
+    ///
+    /// Falls back to **bold** rather than to the plain body font when the platform reports no real
+    /// bold-italic face: with both traits requested, keeping the stronger, more visible one is the
+    /// better degradation, and `bodyItalic` already establishes the "verify the trait actually
+    /// took" pattern.
+    static let bodyBoldItalic: NSFont = {
+        let descriptor = Theme.bodyFont.fontDescriptor.withSymbolicTraits([.bold, .italic])
+        let candidate = NSFont(descriptor: descriptor, size: Theme.bodyFont.pointSize) ?? bodyBold
+        let traits = candidate.fontDescriptor.symbolicTraits
+        return traits.contains(.italic) && traits.contains(.bold) ? candidate : bodyBold
     }()
 }
 
@@ -1343,10 +2024,17 @@ enum MarkdownRenderer {
             paragraph.textBlocks = [block]
             paragraph.alignment = textAlignment(for: alignment)
 
+            // `regularFont` is the row's own face — bold for a header row, which is what makes a
+            // header distinguishable. The three emphasis faces are the body ones, unchanged, so a
+            // `*span*` in a header cell still renders plain-italic exactly as it did before this
+            // item; making it bold-italic instead would be an unforced change to shipped output.
             let style = InlineStyle(
-                font: font,
+                regularFont: font,
                 boldFont: PreviewFont.bodyBold,
                 italicFont: PreviewFont.bodyItalic,
+                boldItalicFont: PreviewFont.bodyBoldItalic,
+                isBold: false,
+                isItalic: false,
                 color: Theme.text,
                 paragraphStyle: paragraph
             )
@@ -1374,34 +2062,83 @@ enum MarkdownRenderer {
 
     /// The font/color/paragraph context an inline run is emitted in. Value type so recursive
     /// emphasis emission can hand children a modified copy without shared mutation.
+    /// The font faces available to one block, plus **which emphasis traits are currently in
+    /// effect** — not "the current font" plus two spares.
+    ///
+    /// That distinction is the fix for a real defect. The previous shape (`font`/`boldFont`/
+    /// `italicFont`) made `emitInline` *replace* the face at each nesting level while passing the
+    /// original spares down, so traits could never compose: `*a **b** c*` rendered `b` in plain
+    /// `.SFNS-Bold`, losing the outer italic, and `***x***` rendered `x` bold-only. Both are
+    /// constructs `(preview-emphasis-commonmark)` made reachable and SPEC §8.2 now advertises.
+    /// Keeping the traits as booleans and resolving the face at the leaf makes composition the
+    /// default and un-composition impossible.
     private struct InlineStyle {
-        let font: NSFont
+        let regularFont: NSFont
         let boldFont: NSFont
         let italicFont: NSFont
+        let boldItalicFont: NSFont
+        let isBold: Bool
+        let isItalic: Bool
         let color: NSColor
         let paragraphStyle: NSParagraphStyle
+
+        /// The face for the trait combination in effect. A heading passes the same font for all
+        /// four, so this is a no-op there and nested emphasis keeps the heading face exactly as
+        /// before.
+        var font: NSFont {
+            switch (isBold, isItalic) {
+            case (false, false): return regularFont
+            case (true, false): return boldFont
+            case (false, true): return italicFont
+            case (true, true): return boldItalicFont
+            }
+        }
+
+        /// The same style with one more trait added. Adding a trait already in effect is a no-op,
+        /// so `**a **b** c**` cannot un-bold anything.
+        func adding(bold addBold: Bool = false, italic addItalic: Bool = false) -> InlineStyle {
+            InlineStyle(
+                regularFont: regularFont,
+                boldFont: boldFont,
+                italicFont: italicFont,
+                boldItalicFont: boldItalicFont,
+                isBold: isBold || addBold,
+                isItalic: isItalic || addItalic,
+                color: color,
+                paragraphStyle: paragraphStyle
+            )
+        }
     }
 
     private static let bodyStyle = InlineStyle(
-        font: Theme.bodyFont,
+        regularFont: Theme.bodyFont,
         boldFont: PreviewFont.bodyBold,
         italicFont: PreviewFont.bodyItalic,
+        boldItalicFont: PreviewFont.bodyBoldItalic,
+        isBold: false,
+        isItalic: false,
         color: Theme.text,
         paragraphStyle: PreviewStyle.bodyParagraph
     )
 
     private static let listStyle = InlineStyle(
-        font: Theme.bodyFont,
+        regularFont: Theme.bodyFont,
         boldFont: PreviewFont.bodyBold,
         italicFont: PreviewFont.bodyItalic,
+        boldItalicFont: PreviewFont.bodyBoldItalic,
+        isBold: false,
+        isItalic: false,
         color: Theme.text,
         paragraphStyle: PreviewStyle.listParagraph
     )
 
     private static let quoteStyle = InlineStyle(
-        font: Theme.bodyFont,
+        regularFont: Theme.bodyFont,
         boldFont: PreviewFont.bodyBold,
         italicFont: PreviewFont.bodyItalic,
+        boldItalicFont: PreviewFont.bodyBoldItalic,
+        isBold: false,
+        isItalic: false,
         color: Theme.mutedText,
         paragraphStyle: PreviewStyle.quoteParagraph
     )
@@ -1411,9 +2148,12 @@ enum MarkdownRenderer {
         // a heading keeps the heading font.
         let font = Theme.headingFont(level: level)
         return InlineStyle(
-            font: font,
+            regularFont: font,
             boldFont: font,
             italicFont: font,
+            boldItalicFont: font,
+            isBold: false,
+            isItalic: false,
             color: Theme.text,
             paragraphStyle: PreviewStyle.headingParagraph
         )
@@ -1430,24 +2170,10 @@ enum MarkdownRenderer {
                 ]))
 
             case let .bold(children):
-                let boldStyle = InlineStyle(
-                    font: style.boldFont,
-                    boldFont: style.boldFont,
-                    italicFont: style.italicFont,
-                    color: style.color,
-                    paragraphStyle: style.paragraphStyle
-                )
-                emitInline(children, style: boldStyle, into: output)
+                emitInline(children, style: style.adding(bold: true), into: output)
 
             case let .italic(children):
-                let italicStyle = InlineStyle(
-                    font: style.italicFont,
-                    boldFont: style.boldFont,
-                    italicFont: style.italicFont,
-                    color: style.color,
-                    paragraphStyle: style.paragraphStyle
-                )
-                emitInline(children, style: italicStyle, into: output)
+                emitInline(children, style: style.adding(italic: true), into: output)
 
             case let .code(value):
                 output.append(NSAttributedString(string: value, attributes: [

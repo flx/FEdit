@@ -242,8 +242,100 @@ cells. §8.3 gains the one-anchor-per-table sentence.
 and the accumulator mutual-exclusion comments (`:87-89`, `:193-194`) —
 `scripts/MarkdownRendererTests/main.swift`, `SPEC.md` §8.2/§8.3.
 
-**Not README**: it has no Markdown-subset section to edit (`README.md:13` is a
-single sentence about the preview), which Rev 1 listed in error.
+**Not README** ~~: it has no Markdown-subset section to edit (`README.md:13` is a
+single sentence about the preview), which Rev 1 listed in error.~~
+
+**Overruled at implementation time (2026-08-21), deliberately.** The premise is
+true — there is no subset section — but it is a reason not to *enumerate* the
+subset, not a reason to say nothing. README is the user-facing view and lists
+features; GFM tables rendering as real aligned grids is a visible capability a
+reader would want to know about, and its absence would have been the only place
+in the repo where this item left no trace. `README.md:13`'s preview bullet gains
+one clause (grids via `NSTextTable`, bold header, `:---:` honored, ragged rows
+degrading gracefully). `adv-review-behavior` flagged the edit as contradicting
+this line — correctly, which is why the contradiction is resolved here rather
+than left standing.
+
+## Code review — one HIGH defect, found by measurement
+
+Both reviewers, blind and in parallel. **`adv-review-behavior` found no
+functional defect** (8 mutants built, all killed; a 200,000-document property
+fuzz with `assertStrictlyAscending` live giving 0 anchor violations and 0
+character loss; a 113,763-row fuzz proving `splitTableCells` splits at exactly
+the pipes `MarkdownInlineParser` does not treat as code; and a layout probe
+confirming `MarkdownPreviewView` really is a hand-built **TextKit 1** stack, so
+`NSTextTable` is genuinely supported rather than silently ignored). Its six
+findings were all documentation, and all are applied.
+
+**`adv-review-edge` found a HIGH-severity real defect: quadratic cell blow-up.**
+
+The header alone fixes the column count, and a body row as short as a single `|`
+is padded to full width — so the produced cell count is `columns × (rows + 1)`
+while the source is only `O(columns + rows)` bytes, and the emitter allocates an
+`NSTextTableBlock` plus an `NSMutableParagraphStyle` per cell. Measured:
+
+| source | cells | render | peak RSS |
+|---|---|---|---|
+| 1,209 B | 160,400 | 442 ms | 171.5 MB |
+| 2,409 B | 640,800 | 1,813 ms | 647.4 MB |
+| **3,009 B** | **1,001,000** | **2,660 ms** | **944.6 MB** |
+
+Doubling the source multiplies memory by 3.8× — clean quadratic. One more octave,
+a **12 kB file**, extrapolates to ~15 GB, i.e. an OOM kill. Nothing stops such a
+file being opened (SPEC §7's cap is 100 MB), and it need not be adversarial: a
+CSV export with a wide header and trailing empty fields dropped has exactly this
+shape. Against HEAD the same inputs are 77×–1,438× faster and 400×–1,300×
+smaller, so the defect is entirely this item's.
+
+**Fixed with a declared cell budget**, following the reviewer's suggested shape
+and this project's own convention: `MarkdownBlockParser.tableCellLimit = 50_000`,
+deliberately the same number SPEC §5.2 already declares for a scanned tree. Over
+budget the construct is simply **not a table** and falls through to paragraph
+continuation — byte-for-byte what HEAD did with it, so the worst case is "no
+better than before", never a hang. The budget is checked **before any row is
+split**, by walking `continuesTable` forward with line tests only, so the guard
+allocates nothing per cell; and the comparison is a division rather than a
+multiplication so it cannot overflow on the very input it exists to catch.
+
+Verified on the reviewer's exact case — the 3,009-byte / 1,001,000-cell document
+that measured 944.6 MB and 2.66 s — now **13.8 MB peak RSS and 0.017 s**,
+rendering as a single paragraph block. Seven assertions pin it, including both
+sides of the boundary computed from the constant rather than hard-coded.
+
+Other edge findings:
+
+- **~371 bytes retained per cell (MEDIUM), accepted as a design cost and now
+  stated in SPEC.** An ordinary 10-column × 10,000-row table (1 MB of source)
+  costs +37.1 MB over HEAD and renders 7.8× slower. Inherent to `NSTextTable` —
+  the block must be per-cell because it carries `startingRow`/`startingColumn` —
+  so not a code bug. It is precisely why the cap is 50,000 and not higher.
+- **`startingColumn` clamped (INFO).** The `.leading` fallback covered
+  `alignments` only; `NSTextTableBlock` is not bounded by
+  `table.numberOfColumns`. Unreachable from the parser, but `emitTable` is
+  `internal` so `ReferenceRenderer` can delegate to it, and a hand-built block
+  with a row longer than its header would place a cell outside the declared grid.
+- **Two cosmetic Unicode findings recorded, not fixed.** A VT/FF/NEL-indented row
+  produces a phantom leading cell (`CharacterSet.whitespaces` excludes those —
+  the same gap already recorded for `isBlank`), and a `|` immediately followed by
+  a combining mark is not a `|` (grapheme-cluster comparison). Both preserve
+  every character, neither traps, and both are consistent across the `contains`
+  guard, the splitter and the delimiter matcher.
+- **Header-wins normalization accepts two shapes GFM rejects** (long delimiter row
+  truncated, long body row re-joined) — already a documented subset choice, and
+  no text is lost.
+
+Edge confirmed clean on everything else, by measurement: `splitTableCells` can
+never return an empty array (proved, so `columnCount >= 1` is total);
+`alignments` normalized in both directions on every path; **690,000 fuzz
+documents at `-Onone` with asserts live**, across two alphabets plus all 43 repo
+`.md` files — 0 invariant violations, 0 traps, 0 block-order or anchor-order
+violations; the long-row re-join linear and lossless over 300,000 documents; no
+`NSTextTable` retain cycle (verified with weak references) and safe to build off
+the main thread; no scan-cost cliff on 40,000 near-miss header/delimiter pairs.
+
+Whole-repo text-loss check against HEAD: exactly one file differs, by exactly two
+characters — two literal `*` in `plans/syntax-highlighting.plan.md` that no
+longer pair because a cell boundary now separates them. Zero characters lost.
 
 ## Decisions taken
 

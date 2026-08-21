@@ -884,15 +884,35 @@ do {
     )
 
     // (adv-review-edge finding 3) A `|` row must not be absorbed either. This repo's own
-    // `SPEC.md:122-128` is a six-row table indented under a bullet; absorbing it would turn text
-    // that renders as an ugly-but-complete paragraph today into a run-on glued onto a list item.
-    // `(preview-tables)` replaces this with real recognition; until then the parse must match HEAD.
+    // `SPEC.md:123-128` is a six-row table indented under a bullet; absorbing it would turn text
+    // into a run-on glued onto a list item.
+    //
+    // **(preview-tables) CHANGED THIS EXPECTED VALUE, and it is the only pre-existing assertion in
+    // this file that it changed.** Before that item the second block was
+    // `.paragraph(text: "  | Class | Color |   |---|---|", line: 1)` — HEAD's ugly-but-complete
+    // rendering. Now the two indented lines are a header row plus a qualifying delimiter row, so
+    // step 7.5 (which runs AHEAD of the list-item continuation branch) consumes them as a real
+    // `.table`. That is the plan's explicitly recorded interaction between the two items, and the
+    // better outcome. What has NOT changed, and is what this assertion still guards, is the parent
+    // bullet: its text is `"Token classes:"` and nothing more — the pipe lines are a separate block
+    // either way, never absorbed into the item.
     check(
         MarkdownBlockParser.parse("- Token classes:\n  | Class | Color |\n  |---|---|") == [
             .listItem(marker: "•", text: "Token classes:", line: 0),
-            .paragraph(text: "  | Class | Color |   |---|---|", line: 1),
+            .table(header: ["Class", "Color"], rows: [], alignments: [.leading, .leading], line: 1),
         ],
-        "an indented pipe-table row is NOT absorbed into the bullet above it (SPEC.md:122-128's own shape)"
+        "an indented QUALIFYING pipe table under a bullet becomes a .table, not part of the bullet (SPEC.md:123-128's own shape)"
+    )
+    // …and the non-qualifying half, which is what keeps `startsBlock`'s `|` clause alive. With no
+    // delimiter row under it the pipe line is not a table, and it must still land in its own
+    // paragraph rather than being swallowed by the bullet. Deleting that clause turns this into
+    // ONE list item reading "a | b | c |".
+    check(
+        MarkdownBlockParser.parse("- a\n  | b | c |") == [
+            .listItem(marker: "•", text: "a", line: 0),
+            .paragraph(text: "  | b | c |", line: 1),
+        ],
+        "an indented NON-qualifying pipe line (no delimiter row) is still not absorbed into the bullet — byte-identical to HEAD"
     )
 
     // Controls: the three forms that never needed a following character must still terminate.
@@ -1070,6 +1090,676 @@ do {
         wrappedAnchors.map { $0.sourceLine } == [0, 2, 5],
         "the continuation line contributes no anchor of its own; §8.3 resolves it to its item's anchor at line 2"
     )
+}
+
+// MARK: - (preview-tables): GFM pipe tables
+//
+// A `|…|` row used to match none of the classification steps and fall through to paragraph
+// continuation, so an entire table — plus any prose touching it — collapsed into ONE space-joined
+// paragraph and even the source's line structure was lost. `MarkdownBlock` now has a `.table` case,
+// recognized at step 7.5 (after the list item, ahead of the list-item continuation) and rendered as
+// a real `NSTextTable` grid.
+//
+// Four of the checks below exist because the obvious implementation is subtly broken in ways that
+// were caught only by review, and each is a regression guard for a specific defect: the delimiter
+// row must itself contain a `|` (or a horizontal rule silently vanishes); a long row's surplus is
+// re-joined, never truncated (truncating deleted 65 of 69 cells from a real line in this repo);
+// `alignments` is normalized to the header's column count (or the emitter indexes out of range and
+// TRAPS on the background render queue); and cells split on `|` outside backtick pairs (or
+// `` `a | b` `` shreds).
+
+/// Every table cell in `string`, recovered the way the plan's criterion 7 specifies — by iterating
+/// `.paragraphStyle` runs and reading the `NSTextTableBlock` each one carries. One cell is one
+/// paragraph (its content plus a `\n` sharing the same style object), and two cells' styles are
+/// never equal because their `textBlocks` hold distinct objects, so the runs land exactly one per
+/// cell in document order. Paragraphs with no text block — ordinary body/heading/list text, and the
+/// separator `\n` `render` puts between blocks — are skipped, which is also what makes "the
+/// delimiter row produces no cell" observable.
+func tableCells(_ string: NSAttributedString) -> [(row: Int, column: Int, range: NSRange, style: NSParagraphStyle)] {
+    var cells: [(row: Int, column: Int, range: NSRange, style: NSParagraphStyle)] = []
+    string.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: string.length)) { value, range, _ in
+        guard let style = value as? NSParagraphStyle,
+              let block = style.textBlocks.first as? NSTextTableBlock else { return }
+        cells.append((block.startingRow, block.startingColumn, range, style))
+    }
+    return cells
+}
+
+section("(preview-tables) criteria 1-2: the reporter's exact seven-line source")
+do {
+    // `plans/preview-tables-repro.md:8-14`, verbatim. Written as an array join rather than a `"""`
+    // literal so the ragged interior spacing — which is the whole point of the report — cannot be
+    // silently reflowed by a formatter. Header: 6 pipes -> 5 cells. Last row: 5 pipes -> 4 cells.
+    let source = [
+        "| skill #100 | skill #99     |   skill #98 | skill #75 | skill #50 |",
+        "| ---------- | ------------- | ----------- | --------- | --------- |",
+        "| gama radar | 99luftbaloons | pickpocket  | railgun   |cheeky     |",
+        "|shoot gases | float away &  | steal a     | explosion | cheeky    |",
+        "|that KILL   | ESCAPE!!!     | ROLE!!!     | EXPLODE   | ALL items in |",
+        "|taggers!!!  |               |             | the map!!!| all roles!!! |",
+        "|20,000$     |   17,500$     |  10,000$    |  16,450$       17,450$ |",
+    ].joined(separator: "\n")
+
+    let blocks = MarkdownBlockParser.parse(source)
+    check(blocks.count == 1, "the reported seven-line source parses to exactly ONE block (was one run-on paragraph)")
+    check(
+        blocks == [.table(
+            header: ["skill #100", "skill #99", "skill #98", "skill #75", "skill #50"],
+            rows: [
+                ["gama radar", "99luftbaloons", "pickpocket", "railgun", "cheeky"],
+                ["shoot gases", "float away &", "steal a", "explosion", "cheeky"],
+                ["that KILL", "ESCAPE!!!", "ROLE!!!", "EXPLODE", "ALL items in"],
+                ["taggers!!!", "", "", "the map!!!", "all roles!!!"],
+                // Criterion 2: the ragged last row's 4 cells PADDED to 5 — the fifth is empty, and
+                // `16,450$       17,450$` (the two amounts that share a cell in the source) stays
+                // one cell with its interior spacing intact rather than being split or dropped.
+                ["20,000$", "17,500$", "10,000$", "16,450$       17,450$", ""],
+            ],
+            alignments: [.leading, .leading, .leading, .leading, .leading],
+            line: 0
+        )],
+        "it is one 5-column .table at line 0 whose delimiter row is consumed and whose ragged last row is padded to 5 cells"
+    )
+
+    // Criterion 2's second half, asserted separately so a trap could not hide behind the tree
+    // comparison: rendering the ragged source must not trap. (`emitTableRow` indexes `alignments`
+    // per column; an un-normalized delimiter row is exactly how that goes out of range.)
+    let (output, anchors) = MarkdownRenderer.render(source)
+    check(output.length > 0 && anchors.count == 1, "the ragged source renders (no trap) and emits exactly one anchor")
+    // Guarded before indexing, deliberately: a regression that emitted zero anchors would TRAP on
+    // `anchors[0]` and a trapped harness reports nothing about what broke (the standard
+    // adv-review-behavior finding 5 set for this file).
+    check(
+        anchors == [MarkdownAnchor(sourceLine: 0, location: 0)],
+        "that anchor sits at the HEADER row's source line, not the delimiter's or a body row's"
+    )
+    check(tableCells(output).count == 6 * 5, "it renders 6 rows x 5 columns = 30 cells (header + 5 body rows; the delimiter row contributes none)")
+}
+
+section("(preview-tables) criterion 3: a long row keeps every character")
+do {
+    // The real `plans/syntax-highlighting.plan.md:52`, verbatim. **The plan's criterion 3 describes
+    // this line as "69 cells against a 4-column header", which was measured under revision 1's RAW
+    // pipe split.** Revision 2 splits outside backtick pairs, and this line's 68 interior pipes are
+    // all inside the backticked regex — so it yields exactly FOUR cells and never reaches the
+    // surplus path at all. The criterion's actual requirement (the keyword list survives into the
+    // preview intact) is what is asserted, against the exact cell text.
+    let row = "| 2 | keyword | `\\b(?:associatedtype|class|deinit|enum|extension|fileprivate|func|import|init|inout|internal|let|open|operator|private|protocol|public|static|struct|subscript|typealias|var|break|case|continue|default|defer|do|else|fallthrough|for|guard|if|in|repeat|return|switch|where|while|as|any|catch|is|nil|rethrows|self|Self|some|super|throw|throws|true|false|try|async|await|actor|lazy|weak|unowned|mutating|override|final|required|convenience|indirect)\\b` | `.foregroundColor: Theme.keyword`, `.font: Theme.editorBoldFont` |"
+    let pattern = "`\\b(?:associatedtype|class|deinit|enum|extension|fileprivate|func|import|init|inout|internal|let|open|operator|private|protocol|public|static|struct|subscript|typealias|var|break|case|continue|default|defer|do|else|fallthrough|for|guard|if|in|repeat|return|switch|where|while|as|any|catch|is|nil|rethrows|self|Self|some|super|throw|throws|true|false|try|async|await|actor|lazy|weak|unowned|mutating|override|final|required|convenience|indirect)\\b`"
+    check(row.filter { $0 == "|" }.count == 70, "sanity: the real repo line really does carry 70 pipes")
+
+    let blocks = MarkdownBlockParser.parse("| # | Class | Pattern | Attributes |\n|---|---|---|---|\n" + row)
+    var patternCell = ""
+    var cellCount = 0
+    // Every index below is guarded by the count that precedes it, so a regression FAILs here
+    // instead of trapping the whole harness.
+    if case let .table(_, rows, _, _)? = blocks.first, let first = rows.first {
+        cellCount = first.count
+        if cellCount > 2 { patternCell = first[2] }
+    }
+    check(cellCount == 4, "the backtick rule keeps it at 4 cells (NOT the 69 a raw split produces) — got \(cellCount)")
+    check(patternCell == pattern, "its Pattern cell is the complete backticked regex, byte for byte — the whole Swift keyword list survives")
+
+    // And the surplus path itself, which the line above no longer exercises. Same row with its
+    // backticks stripped: now the 68 interior pipes DO split, the row is far longer than the
+    // 4-column header, and the surplus must be re-joined into the last cell. Revision 1 truncated
+    // here and deleted 65 of 69 cells.
+    let unbackticked = row.filter { $0 != "`" }
+    let strippedBlocks = MarkdownBlockParser.parse("| # | Class | Pattern | Attributes |\n|---|---|---|---|\n" + unbackticked)
+    var wideRow: [String] = []
+    if case let .table(_, rows, _, _)? = strippedBlocks.first, let first = rows.first { wideRow = first }
+    check(wideRow.count == 4, "the de-backticked 69-segment row is fitted to the header's 4 columns (got \(wideRow.count))")
+    // The exact no-loss property, and it is not a spot check: re-joining the produced cells with
+    // `|` reproduces the source row's interior character-for-character once whitespace (the only
+    // thing trimming removes) is discounted. Truncation fails this by thousands of characters.
+    let inner = String(unbackticked.dropFirst().dropLast())
+    check(
+        wideRow.joined(separator: "|").filter { !$0.isWhitespace } == inner.filter { !$0.isWhitespace },
+        "NOTHING is deleted: the fitted cells re-join to the source row's interior exactly, modulo trimmed whitespace"
+    )
+    check(
+        wideRow.last?.contains("convenience|indirect)\\b") == true,
+        "the tail of the keyword list is present in the LAST cell (the surplus was re-joined, not dropped)"
+    )
+
+    // The small, readable form of the same rule.
+    check(
+        MarkdownBlockParser.parse("| a | b |\n| --- | --- |\n| p | q | r | s |") == [.table(
+            header: ["a", "b"],
+            rows: [["p", "q | r | s"]],
+            alignments: [.leading, .leading],
+            line: 0
+        )],
+        "a 4-cell row against a 2-column header: cells 2-4 re-join into the last cell with their `|` separators restored"
+    )
+    check(
+        MarkdownBlockParser.parse("| a | b | c |\n| --- | --- | --- |\n| p |") == [.table(
+            header: ["a", "b", "c"],
+            rows: [["p", "", ""]],
+            alignments: [.leading, .leading, .leading],
+            line: 0
+        )],
+        "a 1-cell row against a 3-column header is padded with empty cells"
+    )
+}
+
+section("(preview-tables) criteria 4, 10-11, 18: delimiter row, alignment, optional pipes, degenerate shapes")
+check(
+    MarkdownBlockParser.parse("| a | b | c |\n| --- |") == [.table(
+        header: ["a", "b", "c"],
+        rows: [],
+        alignments: [.leading, .leading, .leading],
+        line: 0
+    )],
+    "criterion 4: a SHORT delimiter row is padded to the header's column count (an un-normalized one indexes out of range and traps)"
+)
+do {
+    // The trap the normalization prevents is in the EMITTER, not the parser, so the parse check
+    // above is only half of criterion 4. This renders it.
+    let (output, _) = MarkdownRenderer.render("| a | b | c |\n| --- |\n| x | y | z |")
+    check(tableCells(output).count == 6, "criterion 4: and it RENDERS — 2 rows x 3 columns of cells, no out-of-range trap")
+}
+check(
+    MarkdownBlockParser.parse("| a |\n| :--- | ---: | :---: |") == [.table(
+        header: ["a"],
+        rows: [],
+        alignments: [.leading],
+        line: 0
+    )],
+    "a LONG delimiter row is truncated to the header's column count (an alignment is not document text, so dropping one loses nothing)"
+)
+check(
+    MarkdownBlockParser.parse("| l | c | r |\n| :--- | :---: | ---: |") == [.table(
+        header: ["l", "c", "r"],
+        rows: [],
+        alignments: [.leading, .center, .trailing],
+        line: 0
+    )],
+    "criterion 10: `:---` / `:---:` / `---:` parse to leading / center / trailing"
+)
+do {
+    let (output, _) = MarkdownRenderer.render("| l | c | r |\n| :--- | :---: | ---: |\n| 1 | 2 | 3 |")
+    let cells = tableCells(output)
+    check(cells.count == 6, "criterion 10: the aligned table renders 6 cells")
+    check(
+        cells.map { $0.style.alignment } == [.left, .center, .right, .left, .center, .right],
+        "criterion 10: every cell's paragraph style carries .left / .center / .right, body rows included — got \(cells.map { $0.style.alignment.rawValue })"
+    )
+}
+do {
+    // Criterion 11: leading/trailing pipes are optional. Asserted as EQUALITY of the two parses
+    // rather than by writing the expected tree twice, so the two forms cannot drift apart.
+    let bare = MarkdownBlockParser.parse("a | b\n--- | ---\nx | y")
+    let piped = MarkdownBlockParser.parse("| a | b |\n| --- | --- |\n| x | y |")
+    check(bare == piped, "criterion 11: `a | b` + `--- | ---` gives the IDENTICAL table to the fully-piped form")
+    check(
+        bare == [.table(header: ["a", "b"], rows: [["x", "y"]], alignments: [.leading, .leading], line: 0)],
+        "criterion 11: …and that table is the expected 2-column one (so the equality above is not two identical failures)"
+    )
+}
+check(
+    MarkdownBlockParser.parse("| only |\n| --- |\n| one |") == [.table(
+        header: ["only"],
+        rows: [["one"]],
+        alignments: [.leading],
+        line: 0
+    )],
+    "criterion 18: a ONE-column table works"
+)
+do {
+    let (output, _) = MarkdownRenderer.render("| a | b |\n| --- | --- |\n| x |  |")
+    let cells = tableCells(output)
+    check(cells.count == 4, "criterion 18: a row with an EMPTY cell still renders 4 cells — the empty one is a cell, not a missing column")
+    check(
+        cells.map { [$0.row, $0.column] } == [[0, 0], [0, 1], [1, 0], [1, 1]],
+        "criterion 18: and the empty cell occupies (1,1) — the grid does not collapse"
+    )
+    check(
+        cells.count == 4 && cells[3].range.length == 1,
+        "criterion 18: the empty cell is exactly its paragraph terminator (length 1), which is what keeps it addressable"
+    )
+}
+
+section("(preview-tables) criterion 5: the bare-`---` guard")
+do {
+    // THE critical one. Without the "a delimiter row must itself contain a `|`" clause, `---`
+    // strips to the single cell `["---"]`, matches `-+`, qualifies — and the horizontal rule
+    // SILENTLY DISAPPEARS into a one-column table. (The plan called that header "a shredded code
+    // span"; that was Rev 1's raw-pipe splitter. Under the shipped backtick-aware `splitTableCells`
+    // the span survives intact and there is exactly one cell — measured against a guard-removed
+    // mutant. The disappearing rule, which is the point, is unaffected.) The same shape swallows
+    // YAML front matter. This parse must be byte-identical to what HEAD produced.
+    let source = "Use the `a | b` syntax.\n---\nNext section."
+    check(
+        MarkdownBlockParser.parse(source) == [
+            .paragraph(text: "Use the `a | b` syntax.", line: 0),
+            .rule(line: 1),
+            .paragraph(text: "Next section.", line: 2),
+        ],
+        "criterion 5: pipe-bearing prose + `---` + prose stays paragraph / RULE / paragraph — the rule does not vanish"
+    )
+    let (output, anchors) = MarkdownRenderer.render(source)
+    check(anchors.map { $0.sourceLine } == [0, 1, 2], "criterion 5: three anchors, one per line — unchanged from HEAD")
+    check(tableCells(output).isEmpty, "criterion 5: NOTHING in that document renders as a table cell")
+    check(
+        (output.string as NSString).contains(String(repeating: "─", count: 32)),
+        "criterion 5: the rule's 32 glyphs are still in the rendered output"
+    )
+    // The YAML front-matter shape the same defect swallowed.
+    check(
+        MarkdownBlockParser.parse("---\ntitle: A | B\n---\nbody") == [
+            .rule(line: 0),
+            .paragraph(text: "title: A | B", line: 1),
+            .rule(line: 2),
+            .paragraph(text: "body", line: 3),
+        ],
+        "criterion 5: YAML front matter (`---` / `title: A | B` / `---`) keeps BOTH rules"
+    )
+}
+
+section("(preview-tables) criterion 6: a pipe inside backticks does not split a cell")
+check(
+    MarkdownBlockParser.parse("| `a | b` | c |\n| --- | --- |") == [.table(
+        header: ["`a | b`", "c"],
+        rows: [],
+        alignments: [.leading, .leading],
+        line: 0
+    )],
+    "criterion 6: `` `a | b` `` is ONE cell — the code span is not shredded"
+)
+do {
+    let (output, _) = MarkdownRenderer.render("| x | y |\n| --- | --- |\n| `a | b` | c |")
+    let cells = tableCells(output)
+    check(cells.count == 4, "criterion 6: the backticked cell renders as one cell (4 total, not 5)")
+    check(
+        (output.string as NSString).range(of: "a | b").location != NSNotFound,
+        "criterion 6: the span's text survives with its interior pipe"
+    )
+    if cells.count == 4 {
+        check(
+            attribute(output, .font, at: cells[2].range.location) as? NSFont == Theme.codeFont,
+            "criterion 6: and it renders as a real code span (codeFont), so the split agrees with MarkdownInlineParser"
+        )
+    }
+}
+// The counterpart that keeps the splitter honest with `MarkdownInlineParser`: an UNCLOSED backtick
+// is literal to that parser, so it must not protect the rest of the row here either — or the split
+// and the render disagree about where a code span is.
+//
+// **The unclosed backtick must come BEFORE a pipe for this to discriminate**, and getting that
+// wrong is how the first version of this assertion shipped vacuous: `| a | b\` c |` puts the lone
+// backtick AFTER the only interior pipe, so a naive `insideCodeSpan.toggle()` on every backtick
+// splits it identically and the mutant passes (measured: it did). `| a\` b | c |` puts the backtick
+// first, so the naive toggle protects the pipe and yields ONE cell where the correct rule yields
+// two. Both forms are kept, the discriminating one first.
+check(
+    MarkdownBlockParser.parse("| a` b | c |\n| --- | --- |") == [.table(
+        header: ["a` b", "c"],
+        rows: [],
+        alignments: [.leading, .leading],
+        line: 0
+    )],
+    "criterion 6: an UNCLOSED backtick AHEAD of a pipe protects nothing — the row still splits into 2 cells"
+)
+check(
+    MarkdownBlockParser.parse("| a | b` c |\n| --- | --- |") == [.table(
+        header: ["a", "b` c"],
+        rows: [],
+        alignments: [.leading, .leading],
+        line: 0
+    )],
+    "criterion 6: a trailing unclosed backtick is ordinary cell text"
+)
+check(
+    // …and the splitter's answer matches `MarkdownInlineParser`'s, which is the actual invariant:
+    // the parser treats the unpaired backtick as literal, so the cell it renders is exactly the
+    // cell the splitter produced.
+    MarkdownInlineParser.parse("a` b") == [.text("a` b")],
+    "criterion 6: MarkdownInlineParser agrees — an unpaired backtick is literal text, not a code span"
+)
+
+section("(preview-tables) criteria 7-9: the rendered grid")
+do {
+    // Criterion 7: a 3x3 grid — header + delimiter + two body rows — must expose exactly nine
+    // `NSTextTableBlock`s at the expected coordinates, IN ORDER.
+    let (output, _) = MarkdownRenderer.render("| a | b | c |\n| --- | --- | --- |\n| d | e | f |\n| g | h | i |")
+    let cells = tableCells(output)
+    check(cells.count == 9, "criterion 7: a 3x3 table exposes exactly 9 table blocks (got \(cells.count))")
+    check(
+        cells.map { [$0.row, $0.column] } == [
+            [0, 0], [0, 1], [0, 2],
+            [1, 0], [1, 1], [1, 2],
+            [2, 0], [2, 1], [2, 2],
+        ],
+        "criterion 7: their (startingRow, startingColumn) are row-major and in document order"
+    )
+    check(
+        cells.allSatisfy { $0.style.textBlocks.count == 1 },
+        "criterion 7: each cell paragraph carries exactly ONE text block (no leaked nesting)"
+    )
+    check(
+        Set(cells.compactMap { ($0.style.textBlocks.first as? NSTextTableBlock)?.table }.map { ObjectIdentifier($0) }).count == 1,
+        "criterion 7: all nine blocks belong to the SAME NSTextTable instance"
+    )
+
+    // Criterion 9: nine cells for a FOUR-line source is already the proof that the delimiter row
+    // rendered nothing; this makes it explicit against the output text.
+    check(
+        !(output.string as NSString).contains("---"),
+        "criterion 9: the delimiter row's `---` glyphs appear nowhere in the rendered output"
+    )
+
+    // Criterion 8: the header row is bold and body rows are not. Every slice below is behind the
+    // `cells.count == 9` guard — a regression that produced fewer cells must FAIL here, not trap.
+    if cells.count == 9 {
+        let headerFont = attribute(output, .font, at: cells[0].range.location) as? NSFont
+        check(headerFont != nil && headerFont != Theme.bodyFont, "criterion 8: a header cell renders in a face other than the plain body font")
+        check(headerFont?.fontDescriptor.symbolicTraits.contains(.bold) == true, "criterion 8: that face carries the .bold symbolic trait")
+        check(
+            cells[0...2].allSatisfy { (attribute(output, .font, at: $0.range.location) as? NSFont)?.fontDescriptor.symbolicTraits.contains(.bold) == true },
+            "criterion 8: ALL THREE header cells are bold, not just the first"
+        )
+        check(
+            cells[3...8].allSatisfy { attribute(output, .font, at: $0.range.location) as? NSFont == Theme.bodyFont },
+            "criterion 8: every one of the six body cells is plain Theme.bodyFont"
+        )
+    } else {
+        check(false, "criterion 8: cannot inspect header/body fonts — the 3x3 table did not render 9 cells")
+    }
+
+    // Inline spans work inside cells, and the cell's paragraph style survives them — the style is
+    // what carries the text block, so a run that dropped it would silently fall out of the grid.
+    let (spanned, _) = MarkdownRenderer.render("| h |\n| --- |\n| **b** and [x](https://a.b) |")
+    let spannedCells = tableCells(spanned)
+    check(spannedCells.count == 2, "inline spans inside a cell do not break the cell into pieces (2 cells)")
+    // Located by searching the rendered text rather than by indexing `spannedCells`, so this check
+    // survives (and reports) a regression in the cell count instead of trapping on it.
+    let bodyRange = (spanned.string as NSString).range(of: "b and x")
+    check(bodyRange.location != NSNotFound, "…and their delimiters are consumed: the body cell reads `b and x`")
+    if bodyRange.location != NSNotFound {
+        check(
+            attribute(spanned, .link, at: bodyRange.location + 6) is URL,
+            "a link inside a cell keeps its .link attribute"
+        )
+        check(
+            (attribute(spanned, .paragraphStyle, at: bodyRange.location) as? NSParagraphStyle)?.textBlocks.first is NSTextTableBlock,
+            "…and the run carrying it is still inside the grid (its paragraph style keeps the cell's text block)"
+        )
+    }
+}
+
+section("(preview-tables) criteria 12-15: what is NOT a table")
+check(
+    MarkdownBlockParser.parse("| a | b |") == [.paragraph(text: "| a | b |", line: 0)],
+    "criterion 12: a `|` line with NO delimiter row after it is still a paragraph — byte-identical to HEAD"
+)
+check(
+    MarkdownBlockParser.parse("| a | b |\n| c | d |") == [.paragraph(text: "| a | b | | c | d |", line: 0)],
+    "criterion 12: two `|` lines with no delimiter row still merge into one paragraph, exactly as before"
+)
+check(
+    MarkdownBlockParser.parse("| h |\n| --- |\n| x |\n\n| z |") == [
+        .table(header: ["h"], rows: [["x"]], alignments: [.leading], line: 0),
+        .paragraph(text: "| z |", line: 4),
+    ],
+    "criterion 13: a BLANK line ends the table; the pipe line after it is a fresh (non-table) paragraph"
+)
+check(
+    MarkdownBlockParser.parse("| h1 | h2 |\n| --- | --- |\n| a | b |\n> Note: `|` is the pipe character.") == [
+        .table(header: ["h1", "h2"], rows: [["a", "b"]], alignments: [.leading, .leading], line: 0),
+        .blockquote(text: "Note: `|` is the pipe character.", line: 3),
+    ],
+    "criterion 13: a BLOCK-STARTER line that contains a pipe ends the table and is reclassified as a blockquote"
+)
+do {
+    // The other four block starters. Each must terminate the table AND be classified as itself.
+    //
+    // (adv-review-behavior finding 2) The first THREE carry a pipe, so `continuesTable`'s
+    // `contains("|")` guard passes and only the `startsBlock` half can stop consumption — those
+    // three are genuinely discriminating. The RULE is different and the original comment here
+    // claimed otherwise: `--- ` has no pipe, so `continuesTable` returns false at its `contains`
+    // guard and `startsBlock`'s `isRule` branch is never reached. That is not a fixable gap in the
+    // test — it is a fact about the grammar. `isRule` requires every non-trailing-whitespace
+    // character to be `-` or `*`, so **no rule line can ever contain a pipe**, which makes
+    // `isRule` unreachable from `continuesTable` by construction. The rule case is kept because a
+    // rule must still terminate a table (it does, via the pipe guard), but it is documented here as
+    // testing that outcome rather than the `startsBlock` path, so nobody later "strengthens" it by
+    // trying to give a rule a pipe.
+    let starters: [(line: String, describes: String)] = [
+        ("# H | x", "heading"),
+        ("- item | x", "list item"),
+        ("```swift | x", "fence open"),
+        ("--- ", "rule"),
+    ]
+    var offenders: [String] = []
+    for starter in starters {
+        let blocks = MarkdownBlockParser.parse("| h |\n| --- |\n| a |\n" + starter.line)
+        guard blocks.count == 2, case .table = blocks[0], blocks[1].line == 3 else {
+            offenders.append(starter.describes)
+            continue
+        }
+        if case .table = blocks[1] { offenders.append(starter.describes) }
+    }
+    check(offenders.isEmpty, "criterion 13: heading / list item / fence open / rule all end a table and become their own block (offenders: \(offenders))")
+}
+check(
+    MarkdownBlockParser.parse("```\n| a | b |\n| --- | --- |\n| c | d |\n```") == [
+        .codeBlock(code: "| a | b |\n| --- | --- |\n| c | d |", line: 0),
+    ],
+    "criterion 14: a table INSIDE a fenced code block is verbatim code, not a table"
+)
+check(
+    MarkdownBlockParser.parse("```a|b\n| --- | --- |\ncode\n```") == [
+        .codeBlock(code: "| --- | --- |\ncode", line: 0),
+    ],
+    "criterion 14: a fence-open line containing a `|` is a fence, not a table header (step 2 runs before step 7.5)"
+)
+check(
+    MarkdownBlockParser.parse("| a | b |\n| --- | --- |\n| x | y |") == [.table(
+        header: ["a", "b"],
+        rows: [["x", "y"]],
+        alignments: [.leading, .leading],
+        line: 0
+    )],
+    "criterion 15: a table open at EOF with NO trailing newline is emitted whole"
+)
+check(
+    MarkdownBlockParser.parse("| a | b |\n| --- | --- |") == [.table(
+        header: ["a", "b"],
+        rows: [],
+        alignments: [.leading, .leading],
+        line: 0
+    )],
+    "criterion 15: a header + delimiter row at EOF with no body rows is a legal, empty-bodied table"
+)
+do {
+    let (output, anchors) = MarkdownRenderer.render("| a | b |\n| --- | --- |\n| x | y |")
+    check(anchors.count == 1 && tableCells(output).count == 4, "criterion 15: …and it RENDERS (4 cells, 1 anchor) rather than being dropped at EOF")
+}
+
+section("(preview-tables) criteria 16-17: anchors and the flush protocol")
+do {
+    // Criterion 16. A four-line table (header, delimiter, two body rows) inside a mixed document
+    // emits exactly ONE anchor, at its header line.
+    let document = "# H\n\npara\n\n| a | b |\n| --- | --- |\n| c | d |\n| e | f |\n\n> after"
+    let (_, anchors) = MarkdownRenderer.render(document)
+    check(anchors.map { $0.sourceLine } == [0, 2, 4, 9], "criterion 16: a mixed document emits 4 anchors — heading@0, paragraph@2, TABLE@4 (its header line), quote@9")
+    // Count-guarded before forming the range: a regression down to zero anchors would make
+    // `1..<0` trap rather than FAIL (adv-review-behavior finding 5), and it would also make the
+    // ordering check below vacuously true.
+    check(anchors.count == 4, "criterion 16: sanity — four anchors exist before the ordering check reads them")
+    var ascending = anchors.count == 4
+    if anchors.count > 1 {
+        for index in 1..<anchors.count {
+            if !(anchors[index].sourceLine > anchors[index - 1].sourceLine) { ascending = false }
+            if !(anchors[index].location > anchors[index - 1].location) { ascending = false }
+        }
+    }
+    check(ascending, "criterion 16: those anchors are strictly ascending in BOTH sourceLine and location")
+    // Stated as the negative too, because "exactly one anchor" is precisely the claim that lines
+    // 5-7 get none. A per-row anchor would give sourceLines [0, 2, 4, 6, 7, 9] and still be
+    // strictly ascending, so the ordering check above cannot catch it — this can.
+    check(
+        !anchors.contains { [5, 6, 7].contains($0.sourceLine) },
+        "criterion 16: neither the delimiter row (line 5) nor either body row (6, 7) gets an anchor of its own"
+    )
+    // …and it does not creep back at scale. This is the SPEC §8.3 trade the item records: a 20-row
+    // table is ONE anchor, so scrolling through it moves the preview zero pixels — the same trade
+    // fenced code blocks already make.
+    let long = (["| a | b |", "| --- | --- |"] + (0..<20).map { "| r\($0) | v\($0) |" }).joined(separator: "\n")
+    let (longOutput, longAnchors) = MarkdownRenderer.render(long)
+    check(longAnchors == [MarkdownAnchor(sourceLine: 0, location: 0)], "criterion 16: a 20-row table emits exactly ONE anchor, at line 0")
+    check(tableCells(longOutput).count == 42, "criterion 16: …while still rendering all 21 rows x 2 columns = 42 cells")
+}
+do {
+    // **Criterion 17 — the flush-protocol guard, and the re-proof `adv-review-edge` demanded.**
+    //
+    // That review proved the "at most one accumulator is ever active" invariant for the FOUR
+    // accumulators that existed, and said explicitly that (preview-tables) adding a fifth would
+    // require re-proving it rather than assuming it. **The re-proof is that this item adds no fifth
+    // accumulator at all**: step 7.5 reads a table's whole extent forward inside a single loop
+    // iteration and appends the `.table` INLINE (`skipUntilIndex` only suppresses re-classifying
+    // lines already consumed — it holds no content and emits nothing), so the accumulator set is
+    // still exactly {paragraph, quote, list item, fence} and the earlier proof carries over
+    // unchanged.
+    //
+    // What step 7.5 DOES inherit is the obligation every inline-appending step already has: flush
+    // the three line-oriented accumulators BEFORE appending. Drop `flushListItem()` and `- a`
+    // followed by a table yields `[.table(line: 1), .listItem(line: 0)]` — out of source order,
+    // which trips `assertStrictlyAscending` in debug and, because `assert` compiles out, silently
+    // corrupts §8.3's binary search in release. The block-level `.line` check runs FIRST below, on
+    // purpose: `render` would TRAP on out-of-order blocks and a trapped harness reports nothing.
+    //
+    // Each input below leaves a DIFFERENT accumulator pending across the table, which is what makes
+    // this non-vacuous for all three flushes rather than just the one that happens to be commonest.
+    // Verified by mutation: removing any single flush from step 7.5 makes this section FAIL.
+    let pending: [(source: String, describes: String)] = [
+        ("- a\n| x | y |\n| --- | --- |", "an open LIST ITEM"),
+        ("- a\n  cont\n| x | y |\n| --- | --- |", "a CONTINUED list item"),
+        ("para\n| x | y |\n| --- | --- |", "an open PARAGRAPH"),
+        ("> q\n| x | y |\n| --- | --- |", "an open BLOCKQUOTE"),
+    ]
+    var blockOrderOffenders: [String] = []
+    var anchorOffenders: [String] = []
+    for case_ in pending {
+        let blocks = MarkdownBlockParser.parse(case_.source)
+        guard blocks.count >= 2 else {
+            blockOrderOffenders.append(case_.describes)
+            continue
+        }
+        for index in 1..<blocks.count where !(blocks[index].line > blocks[index - 1].line) {
+            blockOrderOffenders.append(case_.describes)
+        }
+        // The table must be LAST, i.e. the pending block was flushed ahead of it.
+        if case .table = blocks[blocks.count - 1] {} else { blockOrderOffenders.append(case_.describes) }
+    }
+    check(
+        blockOrderOffenders.isEmpty,
+        "criterion 17: step 7.5 flushes every pending accumulator BEFORE appending its table, so blocks stay in source order (offenders: \(Set(blockOrderOffenders).sorted()))"
+    )
+    // Only once the block order is known good is it safe to render (out-of-order blocks trap).
+    if blockOrderOffenders.isEmpty {
+        for case_ in pending {
+            let (_, anchors) = MarkdownRenderer.render(case_.source)
+            guard anchors.count > 1 else {
+                anchorOffenders.append(case_.describes)
+                continue
+            }
+            for index in 1..<anchors.count
+            where !(anchors[index].sourceLine > anchors[index - 1].sourceLine)
+                || !(anchors[index].location > anchors[index - 1].location) {
+                anchorOffenders.append(case_.describes)
+            }
+        }
+    }
+    check(
+        anchorOffenders.isEmpty,
+        "criterion 17: and the rendered anchors stay strictly ascending in sourceLine AND location for all four (offenders: \(Set(anchorOffenders).sorted()))"
+    )
+    // The exact array the criterion names, so the property checks above cannot pass on a
+    // structurally different-but-still-ordered parse.
+    check(
+        MarkdownBlockParser.parse("- a\n| x | y |\n| --- | --- |") == [
+            .listItem(marker: "•", text: "a", line: 0),
+            .table(header: ["x", "y"], rows: [], alignments: [.leading, .leading], line: 1),
+        ],
+        "criterion 17: `- a` immediately followed by a table emits [.listItem(line: 0), .table(line: 1)] — in that order"
+    )
+    // A table is also unreachable while a fence is open, which is why step 7.5 needs no fence
+    // flush. Stated as an assertion rather than left to the step-1 `continue`.
+    check(
+        MarkdownBlockParser.parse("```\n| x | y |\n| --- | --- |") == [
+            .codeBlock(code: "| x | y |\n| --- | --- |", line: 0),
+        ],
+        "criterion 17: step 7.5 is unreachable with a fence open, so it needs no fence flush"
+    )
+}
+
+// MARK: - (preview-tables, adv-review-edge finding 1) the cell budget
+//
+// The quadratic blow-up this bounds, restated because the numbers are the argument: the header
+// alone fixes the column count and a body row as short as a single `|` is padded to full width, so
+// cells grow as `columns x (rows + 1)` from `O(columns + rows)` bytes of source. Measured before
+// the budget existed: 1001 columns over 1000 single-`|` rows is a **3,009-byte** document that
+// produced 1,001,000 cells, 2.66 s of render and **944.6 MB** peak RSS — and one more octave, a
+// 12 KB file, extrapolated to roughly 15 GB. Over budget the construct is not a table at all and
+// falls through to paragraph, which is exactly what HEAD did with it.
+section("(preview-tables) the cell budget bounds the quadratic blow-up")
+do {
+    // Well under the cap: an ordinary table is completely unaffected.
+    let smallColumns = 10
+    let smallRows = 100 // 10 * 101 = 1,010 cells
+    var small = "|" + String(repeating: " h |", count: smallColumns) + "\n"
+    small += "|" + String(repeating: " --- |", count: smallColumns) + "\n"
+    small += String(repeating: "|" + String(repeating: " c |", count: smallColumns) + "\n", count: smallRows)
+    let smallBlocks = MarkdownBlockParser.parse(small)
+    check(
+        smallBlocks.count == 1 && { if case .table = smallBlocks[0] { return true } else { return false } }(),
+        "a 10x100 table (1,010 cells) is far under the budget and parses as one table"
+    )
+
+    // The exact pathological shape from the review, scaled down so the test stays fast: a wide
+    // header multiplied against rows carrying almost no text. Without the budget this is where the
+    // cell count explodes; with it, the construct must NOT become a table.
+    let wideColumns = 400
+    let wideRows = 400 // 400 * 401 = 160,400 cells — over the 50,000 budget
+    var wide = String(repeating: "|", count: wideColumns + 1) + "\n"
+    wide += "| --- |\n"
+    wide += String(repeating: "|\n", count: wideRows)
+    let wideBlocks = MarkdownBlockParser.parse(wide)
+    var producedTable = false
+    for block in wideBlocks where { if case .table = block { return true } else { return false } }() {
+        producedTable = true
+    }
+    check(
+        !producedTable,
+        "a 400-column header over 400 single-pipe rows (160,400 cells) exceeds the budget and is NOT a table"
+    )
+
+    // And the degradation is the RIGHT one: it renders, bounded, exactly as it did before tables
+    // existed — not an error, not an empty block, not a hang.
+    let started = Date()
+    let (wideOutput, wideAnchors) = MarkdownRenderer.render(wide)
+    let elapsed = Date().timeIntervalSince(started)
+    check(wideOutput.length > 0, "the over-budget document still renders as ordinary paragraph text")
+    check(!wideAnchors.isEmpty, "the over-budget document still emits anchors")
+    check(elapsed < 1.0, "the over-budget document renders in under 1s (advisory; got \(elapsed)s)")
+
+    // The boundary itself, computed from the constant rather than hard-coded, so changing the
+    // budget cannot silently invalidate this pair. One column means `rows + 1` cells exactly.
+    let atCap = "|a|\n| --- |\n" + String(repeating: "|x|\n", count: MarkdownBlockParser.tableCellLimit - 1)
+    let atCapBlocks = MarkdownBlockParser.parse(atCap)
+    check(
+        atCapBlocks.count == 1 && { if case .table = atCapBlocks[0] { return true } else { return false } }(),
+        "a single-column table of exactly tableCellLimit cells is admitted (the boundary is inclusive)"
+    )
+    let overCap = "|a|\n| --- |\n" + String(repeating: "|x|\n", count: MarkdownBlockParser.tableCellLimit)
+    let overCapBlocks = MarkdownBlockParser.parse(overCap)
+    var overProducedTable = false
+    for block in overCapBlocks where { if case .table = block { return true } else { return false } }() {
+        overProducedTable = true
+    }
+    check(!overProducedTable, "one cell past tableCellLimit is rejected — the boundary is exact, not approximate")
 }
 
 // MARK: - md-link-scan-quadratic: differential fuzz
@@ -1335,6 +2025,18 @@ enum ReferenceRenderer {
                 string: String(repeating: "─", count: ruleGlyphCount),
                 attributes: ruleAttributes
             ))
+
+        case let .table(header, rows, alignments, _):
+            // (preview-tables) This `switch` is exhaustive with NO `default`, so a seventh
+            // `MarkdownBlock` case is a compile error here — which is why `MarkdownRenderer.emitTable`
+            // is internal rather than private. Delegating to the production emitter (rather than
+            // copying it, as every case above does) makes the differential oracle **vacuous for
+            // tables**: the two renderers cannot disagree about a construct they share code for.
+            // That is accepted and costs nothing, because neither fuzz alphabet below contains a
+            // `|` or a newline, so no fuzz input can ever produce a `.table` at all. The oracle
+            // that DOES cover this item is the standalone HEAD-vs-working-tree differ described in
+            // the (preview-tables) sections above, which generates real multi-line documents.
+            MarkdownRenderer.emitTable(header: header, rows: rows, alignments: alignments, into: output)
         }
     }
 

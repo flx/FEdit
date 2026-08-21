@@ -39,11 +39,32 @@ struct MarkdownAnchor: Equatable {
 
 // MARK: - Block model (Tier 1)
 
+/// Per-column horizontal alignment declared by a GFM table's delimiter row ((preview-tables)):
+/// `---` / `:---` → `.leading`, `---:` → `.trailing`, `:---:` → `.center`. Deliberately NOT
+/// `NSTextAlignment`: the block model is pure `Foundation`-shaped data with no AppKit in it, so the
+/// mapping to a paragraph style's `alignment` lives in the Tier-3 emitter (`textAlignment(for:)`).
+enum MarkdownTableAlignment: Equatable {
+    case leading
+    case center
+    case trailing
+}
+
 /// The internal block model produced by `MarkdownBlockParser`. Every case carries `line` — the
 /// 0-based source line of the block's first line — which becomes the emitted anchor's `sourceLine`
 /// unchanged. `marker` on `.listItem` is the *rendered* prefix glyph run (`•`, or `"3."` for
 /// ordered items): baking the glyph into the parser is an accepted v1 simplification (a future
 /// glyph change touches the parser + tests, not just the emitter).
+///
+/// `.table` ((preview-tables)) carries the header row's cells, the body rows, and one alignment per
+/// column. Its `line` is the **header row's** source line — a table emits exactly ONE anchor no
+/// matter how many rows it has (SPEC §8.3), so `line` is neither the delimiter row's nor any body
+/// row's. Three invariants hold for every `.table` the parser produces, and the emitter depends on
+/// all three: `header.count >= 1`, `alignments.count == header.count` (the delimiter row is
+/// normalized to the header's column count at parse time — an un-normalized short delimiter row
+/// would index out of range in the emitter and trap on the background render queue), and every
+/// element of `rows` has exactly `header.count` cells (short rows padded, long rows' surplus
+/// re-joined into the last cell — never truncated). The delimiter row itself is consumed and is not
+/// represented here at all.
 enum MarkdownBlock: Equatable {
     case heading(level: Int, text: String, line: Int)
     case paragraph(text: String, line: Int)
@@ -51,6 +72,7 @@ enum MarkdownBlock: Equatable {
     case blockquote(text: String, line: Int)
     case codeBlock(code: String, line: Int)
     case rule(line: Int)
+    case table(header: [String], rows: [[String]], alignments: [MarkdownTableAlignment], line: Int)
 
     /// The 0-based source line of this block's first line (its anchor's `sourceLine`).
     var line: Int {
@@ -61,6 +83,7 @@ enum MarkdownBlock: Equatable {
         case let .blockquote(_, line): return line
         case let .codeBlock(_, line): return line
         case let .rule(line): return line
+        case let .table(_, _, _, line): return line
         }
     }
 }
@@ -69,8 +92,8 @@ enum MarkdownBlock: Equatable {
 /// `\r` per line is stripped, so CRLF input parses identically), runs a fence state machine, and
 /// classifies each line in the fixed precedence order of the plan's criterion 8:
 ///
-///   inside-fence state → fence open → blank → heading → horizontal rule → blockquote → list item
-///   → list-item continuation → paragraph continuation
+///   already-consumed table row → inside-fence state → fence open → blank → heading → horizontal
+///   rule → blockquote → list item → pipe table → list-item continuation → paragraph continuation
 ///
 /// Paragraphs merge consecutive non-blank lines with a single space; blockquotes merge consecutive
 /// `>` lines joined with `\n`. A list item merges the *indented* lines that follow it — see
@@ -78,6 +101,13 @@ enum MarkdownBlock: Equatable {
 /// is (preview-bold-spans) cause 1: before it, a wrapped item's second line started a new block and
 /// split any `**…**` span across two blocks, so each half held an unpaired `**`. Pure
 /// `Foundation`-only code — no AppKit, no shared mutable state.
+///
+/// The pipe-table step ((preview-tables)) sits at **7.5** — after the list item, ahead of the
+/// list-item continuation. That position is a deliberate interaction with (preview-bold-spans), not
+/// an accident of ordering: it means an *indented* table directly under a bullet (this repo's own
+/// `SPEC.md:123-128`, six rows indented two spaces under `- Token classes and light-theme colors:`)
+/// becomes a **table** rather than being merged into the bullet's text. Running it after the list
+/// item, in turn, keeps `- a | b` a list item.
 enum MarkdownBlockParser {
     static func parse(_ source: String) -> [MarkdownBlock] {
         // Split on `\n` only (project-wide logical-line convention, see `LogicalLine`), stripping a
@@ -110,8 +140,10 @@ enum MarkdownBlockParser {
         // flush this one emits blocks OUT OF SOURCE ORDER — `- a` followed by `> q` with step 6 not
         // flushing yields `[.blockquote(line: 1), .listItem(line: 0)]`. That trips
         // `MarkdownRenderer.assertStrictlyAscending` in debug and, because `assert` compiles out,
-        // silently breaks §8.3 scroll sync in release. Steps 2-7, step 9 and the EOF flush must each
-        // call `flushListItem()`; step 1 need not, because opening a fence (step 2) already did.
+        // silently breaks §8.3 scroll sync in release. Steps 2-7, **step 7.5** ((preview-tables), the
+        // newest one to inherit the obligation), step 9 and the EOF flush must each call
+        // `flushListItem()`; steps 0 and 1 need not — step 0 emits nothing at all, and opening a
+        // fence (step 2) already flushed before step 1 could be reached.
         var listItemLines: [String] = []
         var listItemMarker = ""
         var listItemStart = 0
@@ -122,6 +154,24 @@ enum MarkdownBlockParser {
         var fenceLines: [String] = []
         var fenceStart = 0
         var inFence = false
+
+        // (preview-tables) Index of the first line NOT yet consumed by a table. `enumerated()`
+        // cannot skip, so step 7.5 — which reads a table's whole extent forward in ONE iteration —
+        // records where it stopped here and step 0 below drops every line up to it.
+        //
+        // **This is NOT a fifth accumulator, and that is the whole of this item's answer to the
+        // flush-order obligation `adv-review-edge` left open.** It holds no content, emits nothing,
+        // and is never "pending": step 7.5 appends its `.table` INLINE, exactly as steps 4/5 append
+        // their heading/rule. So the accumulator set is unchanged at four (paragraph, quote, list
+        // item, fence), at most one is still ever active, and the existing proof carries over
+        // verbatim rather than needing a new one. What step 7.5 DOES inherit is the obligation every
+        // inline-appending step already carries: flush the three line-oriented accumulators BEFORE
+        // appending, or a table starting at line 5 lands in `blocks` ahead of the list item that
+        // started at line 4, `MarkdownRenderer.assertStrictlyAscending` trips in debug, and — since
+        // `assert` compiles out — §8.3's binary search silently reads a non-monotonic array in
+        // release. The fence accumulator needs no flush here because step 1 `continue`s while
+        // `inFence`, so step 7.5 is unreachable with a fence open.
+        var skipUntilIndex = 0
 
         func flushParagraph() {
             guard inParagraph else { return }
@@ -174,6 +224,15 @@ enum MarkdownBlockParser {
         }
 
         for (index, line) in lines.enumerated() {
+            // 0. (preview-tables) A line already consumed as a table row. Placed ahead of the fence
+            //    state deliberately, and it is safe there: a table is only ever recognized while
+            //    `inFence` is false, and step 7.5's consumption stops at any line that opens a fence
+            //    (a `|`-leading line cannot be a fence open, since `isFenceOpen` counts backticks at
+            //    column 0), so skipped lines can never carry fence state past this point.
+            if index < skipUntilIndex {
+                continue
+            }
+
             // 1. Inside a fence: only a closing fence line ends it; everything else is verbatim.
             if inFence {
                 if isFenceClose(line) {
@@ -260,6 +319,78 @@ enum MarkdownBlockParser {
                 continue
             }
 
+            // 7.5. (preview-tables) A GFM pipe table: this line contains a `|` AND the next line is
+            //      a delimiter row. The delimiter row's own `|` requirement is enforced inside
+            //      `tableDelimiterAlignments` and is load-bearing — without it a bare `---` splits
+            //      into the single cell `["---"]`, matches `-+`, qualifies, and a horizontal rule
+            //      following any line that happens to contain a pipe silently disappears into a
+            //      one-column table.
+            //
+            //      The whole table is read forward HERE, in one iteration, and appended inline —
+            //      see `skipUntilIndex` above for why that is what keeps this item from adding a
+            //      fifth accumulator. The three flushes below are what keep `blocks` in source
+            //      order; dropping any one of them puts this table ahead of a block that started on
+            //      an earlier line.
+            if line.contains("|"),
+               index + 1 < lines.count,
+               let delimiterAlignments = tableDelimiterAlignments(lines[index + 1]),
+               // (preview-tables, adv-review-edge finding 1) THE CELL BUDGET, and it is a
+               // correctness guard, not a nicety. The header alone fixes the column count, and a
+               // body row as short as a single `|` is padded to full width — so the produced cell
+               // count is `columns x (rows + 1)` while the SOURCE is only `O(columns + rows)`
+               // bytes. The emitter allocates an `NSTextTableBlock` and an
+               // `NSMutableParagraphStyle` per cell, so the blow-up is quadratic in both memory
+               // and time. Measured: 1001 columns over 1000 single-`|` rows is a **3,009-byte**
+               // document that produces 1,001,000 cells, 2.66 s of render and **944.6 MB** peak
+               // RSS; one more octave (a 12 KB file) extrapolates to ~15 GB, i.e. an OOM kill.
+               // Nothing stops such a file being opened — SPEC §7's cap is 100 MB — and it need
+               // not be adversarial: a CSV export with a wide header and trailing empty fields
+               // dropped has exactly this shape. Over budget the construct is simply NOT a table
+               // and falls through to paragraph continuation, which is byte-for-byte what HEAD did
+               // with it, so the worst case is "no better than before", never a hang. The budget is
+               // checked BEFORE any row is split, so the guard itself allocates nothing per cell.
+               tableFitsCellBudget(lines: lines, headerIndex: index) {
+                flushParagraph()
+                flushQuote()
+                flushListItem()
+
+                // The HEADER fixes the column count — the only honest source for it, since widening
+                // to the widest row would invent columns the document never declared. It always
+                // yields at least one cell (`splitTableCells` never returns an empty array), so
+                // `columnCount >= 1` and the emitter's per-column indexing is total.
+                let header = splitTableCells(line).map { $0.trimmingCharacters(in: .whitespaces) }
+                let columnCount = header.count
+
+                // Normalized to the header's column count in BOTH directions. Padding is the
+                // critical half — a short delimiter row (`| a | b | c |` over `| --- |`) is
+                // deliberately accepted, and leaving `alignments` short would index out of range in
+                // the emitter, i.e. a trap on `MarkdownPreviewView`'s background render queue rather
+                // than a glitch. Truncation of a LONG delimiter row loses no document text (an
+                // alignment is not content), so unlike a long body row it is simply dropped.
+                var alignments = delimiterAlignments
+                if alignments.count > columnCount {
+                    alignments.removeLast(alignments.count - columnCount)
+                } else if alignments.count < columnCount {
+                    alignments.append(
+                        contentsOf: repeatElement(.leading, count: columnCount - alignments.count)
+                    )
+                }
+
+                var rows: [[String]] = []
+                var rowIndex = index + 2 // the first line after the delimiter row
+                while rowIndex < lines.count, continuesTable(lines[rowIndex]) {
+                    rows.append(normalizedTableRow(splitTableCells(lines[rowIndex]), columnCount: columnCount))
+                    rowIndex += 1
+                }
+
+                blocks.append(.table(header: header, rows: rows, alignments: alignments, line: index))
+                // Header, delimiter row and every consumed body row are now spoken for. `rowIndex`
+                // is always >= index + 2, so this always advances past at least the delimiter row
+                // and the loop can never re-enter step 7.5 on the same header.
+                skipUntilIndex = rowIndex
+                continue
+            }
+
             // 8. Continuation of an open list item — an indented line whose trimmed form starts no
             //    block of its own. Placed after step 7 so an UNINDENTED sibling item still starts a
             //    new item, and before step 9 so a wrapped item's tail no longer becomes a paragraph.
@@ -282,7 +413,9 @@ enum MarkdownBlockParser {
         // EOF: flush whatever is pending. At most one accumulator is active, but flushing all four
         // unconditionally is safe. Flushing the list item here is what makes the commonest real case
         // — a file whose last line is a wrapped bullet — come out as one item (criterion 8). An
-        // unterminated fence renders its collected content.
+        // unterminated fence renders its collected content. There is deliberately nothing to flush
+        // for (preview-tables): a table open at EOF was already appended by step 7.5 in the
+        // iteration that read its header, so this sequence stays exactly four calls long.
         flushParagraph()
         flushQuote()
         flushListItem()
@@ -409,13 +542,227 @@ enum MarkdownBlockParser {
         return ("\(number).", String(characters[index...]))
     }
 
+    // MARK: - GFM pipe tables ((preview-tables))
+
+    /// The per-column alignments a GFM delimiter row declares, or nil if `line` is not one.
+    ///
+    /// **The `contains("|")` guard is the single most load-bearing line in this item**, and its
+    /// absence was a critical finding against the plan's first revision. Without it a bare `---`
+    /// strips to the one cell `["---"]`, matches `-+`, and qualifies as a delimiter row — so
+    ///
+    ///     Use the `a | b` syntax.
+    ///     ---
+    ///     Next section.
+    ///
+    /// becomes a **one-column** table and **the horizontal rule silently disappears**. (Rev 1 of the
+    /// plan described this as "a two-column table with a shredded code span" — that was true when
+    /// cells split on raw `|`, and is stale now that `splitTableCells` ignores pipes inside backtick
+    /// pairs: the code span survives whole and yields a single cell. Measured against a
+    /// guard-removed mutant. The rule-vanishing half, which is the part that matters, is unchanged.)
+    /// The same shape swallows YAML front matter (`---` / `title: A | B` / `---`).
+    /// With the guard, `---` has no pipe, is rejected here, reaches step 5, and stays a `.rule`.
+    ///
+    /// Every cell must match `:?-+:?` after trimming (see `delimiterCellAlignment`), so an empty
+    /// cell — `| --- | | --- |` — disqualifies the whole row, matching GFM. Cell splitting goes
+    /// through `splitTableCells` so the delimiter row is counted with exactly the same rule as the
+    /// header; its backtick handling is inert here, because a cell containing a backtick cannot
+    /// match `:?-+:?` anyway.
+    private static func tableDelimiterAlignments(_ line: String) -> [MarkdownTableAlignment]? {
+        guard line.contains("|") else { return nil }
+        var alignments: [MarkdownTableAlignment] = []
+        for cell in splitTableCells(line) {
+            guard let alignment = delimiterCellAlignment(cell) else { return nil }
+            alignments.append(alignment)
+        }
+        // `splitTableCells` never returns an empty array, so this is non-empty whenever every cell
+        // matched — but a table with zero columns must be unrepresentable, so it is checked, not
+        // assumed.
+        return alignments.isEmpty ? nil : alignments
+    }
+
+    /// One delimiter cell: `:?-+:?` with surrounding whitespace allowed. `:---` → `.leading`,
+    /// `---:` → `.trailing`, `:---:` → `.center`, plain `---` → `.leading` (GFM's default). At
+    /// least one `-` is required, so `:`, `::` and `""` are all rejected. A single `-` is accepted
+    /// (GFM proper wants three); that is the plan's stated `:?-+:?` and it is deliberately looser.
+    private static func delimiterCellAlignment(_ cell: String) -> MarkdownTableAlignment? {
+        var body = cell.trimmingCharacters(in: .whitespaces)[...]
+        let hasLeadingColon = body.first == ":"
+        if hasLeadingColon { body = body.dropFirst() }
+        let hasTrailingColon = body.last == ":"
+        if hasTrailingColon { body = body.dropLast() }
+        guard !body.isEmpty, body.allSatisfy({ $0 == "-" }) else { return nil }
+        switch (hasLeadingColon, hasTrailingColon) {
+        case (true, true): return .center
+        case (false, true): return .trailing
+        case (true, false), (false, false): return .leading
+        }
+    }
+
+    /// Splits a table row into its **raw, untrimmed** cell segments: outer whitespace and one
+    /// optional leading and trailing `|` are removed, then the remainder is split on every `|` that
+    /// lies **outside a backtick pair**. Always returns at least one segment (a row of `"|"` alone
+    /// yields `[""]`), which is what makes `header.count >= 1` — and therefore the emitter's
+    /// per-column indexing — total.
+    ///
+    /// **Untrimmed on purpose.** `normalizedTableRow` re-joins a long row's surplus segments with
+    /// `|` before trimming, so the surplus comes back byte-for-byte including its interior spacing;
+    /// trimming here first would silently reformat text the item promises never to lose.
+    ///
+    /// **Backtick pairing, and why it is not a naive toggle.** Splitting on raw `|` shreds
+    /// `` `a | b` ``, the commonest cell in developer docs. But an *unclosed* backtick must not
+    /// protect the rest of the row either, because `MarkdownInlineParser` — which renders the cell —
+    /// treats an unclosed backtick as a literal character. The two must agree or the split and the
+    /// render disagree about where a code span is. That parser pairs backticks 1-2, 3-4, … and
+    /// leaves a final odd one literal, so this counts the backticks in one pass and skips the toggle
+    /// on the last one when the count is odd. Equivalent to the parser's rule, O(n), and it needs no
+    /// auxiliary index array — which is a modest allocation saving in the spirit of SPEC §1, not a
+    /// rule §1 imposes. (§1 states a memory-footprint goal; it does not forbid a data structure. The
+    /// earlier wording here claimed it did.)
+    ///
+    /// This is a deliberate divergence from GFM proper, which splits cells before any inline
+    /// parsing and therefore *does* let a pipe inside backticks break a cell; `\|` remains the only
+    /// escape GFM offers and this subset supports neither it nor GFM's behaviour here.
+    private static func splitTableCells(_ line: String) -> [String] {
+        let characters = Array(line.trimmingCharacters(in: .whitespaces))
+        var start = 0
+        var end = characters.count
+        if start < end, characters[start] == "|" { start += 1 }
+        if end > start, characters[end - 1] == "|" { end -= 1 }
+
+        var backtickCount = 0
+        var index = start
+        while index < end {
+            if characters[index] == "`" { backtickCount += 1 }
+            index += 1
+        }
+        let lastBacktickIsLiteral = backtickCount % 2 == 1
+
+        // Cells are cut as SLICES of `characters` rather than accumulated into a second character
+        // buffer. `cells` itself is of course allocated; what is avoided is a second line-sized
+        // *character* array alongside it. Same instinct as `flushListItem`'s `.lazy`, whose comment
+        // records that a redundant per-row allocation there measured +55 MB peak RSS — a reason to
+        // prefer this shape, not a constraint SPEC §1 imposes.
+        var cells: [String] = []
+        var cellStart = start
+        var seenBacktickCount = 0
+        var insideCodeSpan = false
+        index = start
+        while index < end {
+            let character = characters[index]
+            if character == "`" {
+                seenBacktickCount += 1
+                if !(lastBacktickIsLiteral && seenBacktickCount == backtickCount) {
+                    insideCodeSpan.toggle()
+                }
+            } else if character == "|", !insideCodeSpan {
+                cells.append(String(characters[cellStart..<index]))
+                cellStart = index + 1
+            }
+            index += 1
+        }
+        cells.append(String(characters[cellStart..<end]))
+        return cells
+    }
+
+    /// Fits a body row's raw segments to the header's column count, then trims each cell.
+    ///
+    /// **Short rows are padded; long rows are NEVER truncated.** The plan's first revision said
+    /// "padded or truncated", which is real data loss on real input: this repo's own
+    /// `plans/syntax-highlighting.plan.md:52` is a four-column row carrying 70 pipes — 68 of them
+    /// interior, of which **65 are inside the regex cell** and 3 are the structural separators
+    /// (counted, after review flagged the earlier wording as attributing all 68 to the cell) —
+    /// giving 69 raw segments, and truncating to four cells would have deleted the Swift keyword list
+    /// from the preview — strictly worse than the run-on paragraph this item exists to fix. (With
+    /// `splitTableCells`' backtick rule that particular line now yields exactly 4 segments and never
+    /// reaches the surplus path at all, but the guarantee has to hold for the unbackticked case too.)
+    /// A long row's surplus segments are re-joined into the LAST cell with their `|` separators
+    /// restored, **before** trimming, so the rejoined text is byte-identical to the source's
+    /// remainder rather than a re-spaced approximation of it.
+    private static func normalizedTableRow(_ segments: [String], columnCount: Int) -> [String] {
+        var cells = segments
+        if cells.count > columnCount {
+            // `columnCount >= 1` (the header always yields at least one cell) and
+            // `cells.count > columnCount`, so this range is non-empty and in bounds.
+            let surplus = cells[(columnCount - 1)...].joined(separator: "|")
+            cells.removeSubrange((columnCount - 1)...)
+            cells.append(surplus)
+        } else if cells.count < columnCount {
+            cells.append(contentsOf: repeatElement("", count: columnCount - cells.count))
+        }
+        return cells.map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    /// Does `line` continue an already-open table? Two tests: it contains a `|`, and it does not
+    /// start a block of a **different** kind. (The plan states the rule in three parts — non-blank,
+    /// contains a pipe, not a block starter — but a blank line contains no pipe, so `contains`
+    /// subsumes the first and it is deliberately not spelled separately.)
+    ///
+    /// **The `|` exception to `startsBlock` is deliberate, and it is the seam where this item meets
+    /// the guard (preview-bold-spans) left behind.** `startsBlock` reports a `|`-leading line as a
+    /// block starter, and that clause is KEPT (see its doc comment for why removing it would
+    /// regress non-qualifying pipe lines back into the bullet above them). But asking it unmodified
+    /// here would make every ordinary `| a | b |` row "start a block" and stop consumption dead: a
+    /// table would never be more than its header and delimiter row, and every body row would fall
+    /// through to a paragraph — the reported bug, one line later. So a `|`-leading line is answered
+    /// here directly as "this is my own next row", and `startsBlock` is consulted only for the rest.
+    /// That is exactly the plan's five-way test (fence open / heading / rule / `>` / list item)
+    /// without duplicating the predicate, and it is why `> Note: \`|\` is the pipe character.` ends
+    /// a table and is reclassified as a blockquote while a row whose first cell happens to hold a
+    /// triple backtick stays a table row (a `|`-leading line is not a fence open).
+    ///
+    /// The argument handed to `startsBlock` has its leading whitespace stripped and its trailing
+    /// whitespace preserved, which both of those functions' doc comments record as load-bearing.
+    /// (preview-tables, adv-review-edge finding 1) The most cells one table may produce.
+    ///
+    /// 50,000 — deliberately the **same number SPEC §5.2 already declares** for a scanned root's
+    /// tree, because this project's convention is to bound a derived structure and say so rather
+    /// than let it grow with the input. It is a budget on `columns x (rows + 1)`, which is the
+    /// quantity that actually drives allocation: one `NSTextTableBlock` plus one
+    /// `NSMutableParagraphStyle` per cell, measured at ~371 bytes of retained RSS each.
+    ///
+    /// What it costs, and what it buys. At the cap a table is ~18 MB of retained storage — real,
+    /// but bounded, against the 80-190 MB band SPEC §1 says to add nothing to. It comfortably
+    /// admits every table anyone actually writes: 10 columns x 5,000 rows, or 5 x 10,000, or
+    /// 100 x 500. What it rejects is the degenerate shape where a wide header multiplies against
+    /// rows that carry almost no text — the 3 KB / 1,001,000-cell / 945 MB case in
+    /// `MarkdownBlockParser.parse`'s step 7.5.
+    static let tableCellLimit = 50_000
+
+    /// Would the table starting at `headerIndex` stay inside `tableCellLimit`?
+    ///
+    /// Counts the rows it *would* consume by walking `continuesTable` forward — line tests only, no
+    /// cell splitting, no allocation per cell — then compares against the budget. Splitting first
+    /// and measuring afterwards would already have paid the cost the budget exists to avoid.
+    ///
+    /// The comparison is written as a division rather than `columnCount * (rowCount + 1)` so it
+    /// cannot itself overflow on a pathological document: both factors are bounded by the line
+    /// count, and their product is not.
+    private static func tableFitsCellBudget(lines: [String], headerIndex: Int) -> Bool {
+        let columnCount = splitTableCells(lines[headerIndex]).count
+        guard columnCount > 0 else { return true }
+
+        var rowIndex = headerIndex + 2
+        while rowIndex < lines.count, continuesTable(lines[rowIndex]) {
+            rowIndex += 1
+        }
+        let rowCount = rowIndex - (headerIndex + 2)
+        return rowCount + 1 <= tableCellLimit / columnCount
+    }
+
+    private static func continuesTable(_ line: String) -> Bool {
+        guard line.contains("|") else { return false }
+        let stripped = leadingWhitespaceStripped(line)
+        if stripped.first == "|" { return true }
+        return !startsBlock(stripped)
+    }
+
     /// Does this **leading-whitespace-stripped** line open a block in its own right — a fence, an
     /// ATX heading, a horizontal rule, a blockquote, or a list item?
     ///
     /// A named helper rather than a test inlined into `isListItemContinuation`, so that
     /// `(preview-tables)`'s table-row continuation test can call it too rather than growing a second
-    /// copy of this predicate. **Today it has exactly one caller** — the continuation test below;
-    /// the second arrives with that item.
+    /// copy of this predicate. It now has **two** callers: `isListItemContinuation` below and
+    /// `continuesTable` above.
     ///
     /// **The argument must have its LEADING whitespace stripped, and its TRAILING whitespace left
     /// alone.** Both halves are load-bearing, and the second was a real shipped bug caught in
@@ -433,16 +780,22 @@ enum MarkdownBlockParser {
     /// See `leadingWhitespaceStripped` for why the caller's notion of whitespace must match
     /// `flushListItem`'s exactly.
     ///
-    /// **A `|`-leading line counts as starting a block, even though this parser has no table block
-    /// yet.** That looks anomalous and is deliberate: without it, `SPEC.md:122-128`'s own
-    /// six-row table — indented two spaces under `- Token classes and light-theme colors:` — would
-    /// be absorbed into that bullet, turning a table that today renders as (ugly but complete)
-    /// paragraph text into a run-on glued onto a list item. Measured across this repo: `SPEC.md`
-    /// would drop 183 to 182 blocks, `plans/cli-open.plan.md` 297 to 212. Reporting `|` as a block
-    /// starter keeps every such line exactly where HEAD puts it — its own paragraph — so this item
-    /// introduces no table regression at all. `(preview-tables)` replaces this line with real
-    /// recognition (its step 7.5 runs ahead of the continuation branch); until then it is a
-    /// hold-the-line guard, not a claim that `|` is a block.
+    /// **A `|`-leading line counts as starting a block.** (preview-bold-spans) added this as a
+    /// hold-the-line guard: without it, `SPEC.md:123-128`'s own six-row table — indented two spaces
+    /// under `- Token classes and light-theme colors:` — would be absorbed into that bullet, turning
+    /// a table that then rendered as (ugly but complete) paragraph text into a run-on glued onto a
+    /// list item. Measured across this repo at that time: `SPEC.md` would drop 183 to 182 blocks,
+    /// `plans/cli-open.plan.md` 297 to 212.
+    ///
+    /// **(preview-tables) deliberately KEPT it rather than replacing it, reversing the intent this
+    /// comment used to record.** Once step 7.5 runs ahead of the continuation branch, a *qualifying*
+    /// table — one with a delimiter row under its header — is consumed as a `.table` before this
+    /// predicate is ever consulted, so the clause no longer governs those lines at all. What it
+    /// still governs is a `|` line that does **not** qualify, and for exactly those the item's
+    /// contract is "keeps rendering as it does today". Deleting the clause would send a
+    /// non-qualifying pipe line into the bullet above it — a regression this item is not entitled
+    /// to ship. The one caller for which the clause is wrong is `continuesTable`, which answers a
+    /// `|`-leading line itself before asking; see its doc comment.
     ///
     /// A blank line is deliberately NOT reported as a block starter (`""` opens nothing). That is
     /// only safe because the blank-line step runs ahead of every continuation test and has already
@@ -453,8 +806,9 @@ enum MarkdownBlockParser {
         if isRule(trimmed) { return true }
         if trimmed.first == ">" { return true }
         if parseListItem(trimmed) != nil { return true }
-        // (preview-tables) hold-the-line — see the doc comment above. Not a block yet; this keeps a
-        // pipe row out of the parent bullet so it renders exactly as it does at HEAD.
+        // (preview-tables) kept this clause — see the doc comment above. A qualifying table never
+        // reaches here (step 7.5 consumed it); this keeps a NON-qualifying pipe row out of the
+        // parent bullet so it renders exactly as it did before tables existed.
         if trimmed.first == "|" { return true }
         return false
     }
@@ -732,6 +1086,17 @@ private enum PreviewStyle {
     /// preview view may still visually stretch it.
     static let ruleGlyphCount = 32
 
+    /// Table cell border width, in points ((preview-tables)). A table is the one block whose
+    /// geometry the renderer does NOT compute: `NSTextTable.automaticLayoutAlgorithm` derives the
+    /// column widths from the container, which is what lets a wide table fit the preview's narrow
+    /// (~332pt) column by wrapping *inside* a cell instead of overflowing a scroller the preview
+    /// does not have (`MarkdownPreviewView` sets `hasHorizontalScroller = false`,
+    /// `isHorizontallyResizable = false`, `widthTracksTextView = true`).
+    static let tableBorderWidth: CGFloat = 1
+
+    /// Gap between a table cell's border and its text, in points.
+    static let tableCellPadding: CGFloat = 4
+
     static let bodyParagraph: NSParagraphStyle = {
         let style = NSMutableParagraphStyle()
         style.paragraphSpacing = blockSpacing
@@ -885,6 +1250,123 @@ enum MarkdownRenderer {
                 string: String(repeating: "─", count: PreviewStyle.ruleGlyphCount),
                 attributes: PreviewStyle.ruleAttributes
             ))
+
+        case let .table(header, rows, alignments, _):
+            emitTable(header: header, rows: rows, alignments: alignments, into: output)
+        }
+    }
+
+    // MARK: - Table emission ((preview-tables))
+
+    /// Emits one `.table` block as a real `NSTextTable` grid: one `NSTextTableBlock` per cell,
+    /// carried on that cell's paragraph style, with the header row bold.
+    ///
+    /// **Internal rather than `private` for exactly one reason**: the assertion harness's
+    /// `ReferenceRenderer.emit` is an exhaustive `switch` over `MarkdownBlock` with no `default`, so
+    /// adding a case here is a compile error there. It delegates `.table` to this function instead
+    /// of growing a second copy. The consequence, stated rather than discovered: the differential
+    /// fuzz oracle is **vacuous for tables**. That costs nothing, because both fuzz alphabets are
+    /// `["[", "]", "(", ")", "a", "*", "`", " "]` and `["a", "*", " "]` — neither contains a `|` or
+    /// a newline, so a table was never inside that oracle's reach in the first place.
+    ///
+    /// One cell is one paragraph: the cell's inline content followed by a `\n` that carries the same
+    /// paragraph style, so an EMPTY cell is still a real cell (a lone styled `\n`) rather than a
+    /// missing column. Every cell terminating in `\n` is also what keeps the table self-contained —
+    /// the block separator `render` appends after it lands in its own, block-less paragraph and can
+    /// never be pulled inside the grid.
+    static func emitTable(
+        header: [String],
+        rows: [[String]],
+        alignments: [MarkdownTableAlignment],
+        into output: NSMutableAttributedString
+    ) {
+        let table = NSTextTable()
+        table.numberOfColumns = header.count
+        table.layoutAlgorithm = .automaticLayoutAlgorithm
+        table.hidesEmptyCells = false
+        table.collapsesBorders = true
+
+        emitTableRow(header, rowIndex: 0, isHeader: true, table: table, alignments: alignments, into: output)
+        for (offset, row) in rows.enumerated() {
+            emitTableRow(row, rowIndex: offset + 1, isHeader: false, table: table, alignments: alignments, into: output)
+        }
+    }
+
+    private static func emitTableRow(
+        _ cells: [String],
+        rowIndex: Int,
+        isHeader: Bool,
+        table: NSTextTable,
+        alignments: [MarkdownTableAlignment],
+        into output: NSMutableAttributedString
+    ) {
+        // The header row is BOLD, and that is what makes it distinguishable — the repro's stated
+        // expectation. Passing it as `boldFont` too means a `**span**` inside a header cell stays
+        // bold rather than silently un-bolding, mirroring how `headingStyle` handles the same case.
+        let font = isHeader ? PreviewFont.bodyBold : Theme.bodyFont
+
+        for (column, cell) in cells.enumerated() {
+            // `MarkdownBlockParser` guarantees `cells.count == alignments.count` for every row of
+            // every `.table` it produces (see the `MarkdownBlock.table` doc comment). The assert is
+            // the loud half; the `.leading` fallback exists ONLY so that a hand-built block with
+            // mismatched arrays — reachable from a future test, not from the parser — degrades to a
+            // left-aligned cell instead of trapping on `MarkdownPreviewView`'s background render
+            // queue, which is where an index-out-of-range here would land.
+            assert(
+                column < alignments.count,
+                "a .table row must have exactly as many cells as the block has alignments"
+            )
+            let alignment = column < alignments.count ? alignments[column] : .leading
+
+            // (adv-review-edge finding 5) `startingColumn` was the one per-column index with no
+            // guard: the `.leading` fallback above covers `alignments` only, and
+            // `NSTextTableBlock` is not bounded by `table.numberOfColumns`. Unreachable from the
+            // parser — which guarantees `cells.count == alignments.count == header.count` — but
+            // `emitTable` is `internal` rather than `private` so `ReferenceRenderer` can delegate
+            // to it, and a hand-built block whose row is longer than its header would otherwise
+            // place a cell outside the declared grid. Clamped for the same reason the alignment is:
+            // degrade the layout, never hand AppKit an out-of-grid coordinate on the background
+            // render queue.
+            let safeColumn = min(column, max(table.numberOfColumns - 1, 0))
+            let block = NSTextTableBlock(
+                table: table,
+                startingRow: rowIndex,
+                rowSpan: 1,
+                startingColumn: safeColumn,
+                columnSpan: 1
+            )
+            block.setBorderColor(Theme.mutedText)
+            block.setWidth(PreviewStyle.tableBorderWidth, type: .absoluteValueType, for: .border)
+            block.setWidth(PreviewStyle.tableCellPadding, type: .absoluteValueType, for: .padding)
+
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.textBlocks = [block]
+            paragraph.alignment = textAlignment(for: alignment)
+
+            let style = InlineStyle(
+                font: font,
+                boldFont: PreviewFont.bodyBold,
+                italicFont: PreviewFont.bodyItalic,
+                color: Theme.text,
+                paragraphStyle: paragraph
+            )
+            emitInline(MarkdownInlineParser.parse(cell), style: style, into: output)
+            output.append(NSAttributedString(string: "\n", attributes: [
+                .font: font,
+                .foregroundColor: Theme.text,
+                .paragraphStyle: paragraph,
+            ]))
+        }
+    }
+
+    /// The model → AppKit half of the alignment mapping, kept here so `MarkdownTableAlignment`
+    /// itself stays free of AppKit (the block model is pure data; only Tier 3 knows about
+    /// `NSTextAlignment`).
+    private static func textAlignment(for alignment: MarkdownTableAlignment) -> NSTextAlignment {
+        switch alignment {
+        case .leading: return .left
+        case .center: return .center
+        case .trailing: return .right
         }
     }
 

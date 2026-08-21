@@ -132,6 +132,17 @@ The sidebar is bounded to match: **each scanned root's tree is capped at ~50,000
 ### 6.4 Scroll reporting
 - The editor reports its first visible logical line (throttled) — input for preview scroll sync (§8.3) .
 
+### 6.5 Find
+- **Cmd+F** opens a find bar between the editor column's header strip (§4) and the text, scoped to the **editable** text view only. The compiled-Markdown preview column (§8) is **never** searched, even while it is showing — it has its own text stack that the find code holds no reference to.
+- **Literal substring matching only:** no regex, no whole-word, and no replace (replace stays a non-goal, §12). A visible **Case sensitive** checkbox is **unchecked by default**, so the default search is case-insensitive. Comparison is literal, so canonical equivalence is not folded: `resume` does not match `résumé`.
+- Matches are **non-overlapping** — the scan resumes at a match's end, so `aa` in `aaaa` is two matches, not three.
+- Every match is highlighted and the **current** one is drawn in a distinct color and scrolled into view. Highlights are `NSLayoutManager` **temporary attributes** (display-only, owned by the layout manager), so §6.3's debounced pass — which opens by rewriting every attribute in the text storage — cannot wipe them, and they never contend with the Markdown code-span rules that own `.backgroundColor` in the storage.
+- **Find Next** — Return in the query field, or **Cmd+G** — steps to the next match and wraps past the last one back to the first. There is no Find Previous. A step scrolls but does **not** move the caret; **closing** the bar (Esc, or Done) places the caret at the current match once and removes every highlight. Esc closes the bar whether focus is in the query field or in the editor text.
+- The count reads `3 of 17`, `Not found` when a non-empty query matches nothing, and nothing at all while the query is empty. Enumeration is capped at **20,000 matches** per pass; past the cap the count says so (`3 of 20000+`), matching the sidebar's declared node budget (§5.2) rather than truncating silently.
+- Re-enumeration against edited text rides §6.3's ~150 ms debounce, so typing in the editor adds no per-keystroke scan; between a keystroke and that debounce the highlights are up to 150 ms stale.
+- Find state — bar visibility, query text, case flag — is **per window** (§3) and survives switching files: the bar stays open and re-runs the same query against the new file. It is **not** persisted across relaunch (§9).
+- Cmd+F reaches the editor even while the sidebar filter field (§5.4) has focus: the two searches are separate, and the filter text is untouched.
+
 ## 7. Open / save / autosave
 
 - **Opening:** any file readable as text (UTF-8, fallback Latin-1). Files containing NUL bytes are treated as binary and refused with an alert. Read errors are alerted.
@@ -188,8 +199,10 @@ The sidebar is bounded to match: **each scanned root's tree is capped at ~50,000
 | File → Open Folder… | Cmd+O | opens a new window and prompts for a folder (its sole root); Cancel leaves an empty window |
 | File → Add Folder to Window… | Cmd+Shift+O | add top-level folder(s) to the focused window |
 | File → Save | Cmd+S | save open file (disabled when none/clean; autosave is unconditional, §7) |
+| Edit → Find | Cmd+F | open the find bar over the editor text (§6.5); disabled when no file is open |
+| Edit → Find Next | Cmd+G | step to the next match, wrapping at the end (§6.5); disabled when no file is open |
 
-Commands act on the focused window's state (`focusedSceneObject`), except **Open Folder… (Cmd+O)**, which is app-level — it creates a new window and is not focused-window-scoped. **New… (Cmd+N)** is focused-window-scoped: it presents its sheet in the key window and creates in that window's target directory only.
+Commands act on the focused window's state (`focusedSceneObject`), except **Open Folder… (Cmd+O)**, which is app-level — it creates a new window and is not focused-window-scoped. **New… (Cmd+N)** is focused-window-scoped: it presents its sheet in the key window and creates in that window's target directory only. **Find / Find Next (§6.5)** are focused-window-scoped as well, and being menu key equivalents is what lets Cmd+F reach the editor's find bar even while the sidebar filter field has focus.
 
 ## 11. Error handling & edge cases
 
@@ -201,7 +214,7 @@ Commands act on the focused window's state (`focusedSceneObject`), except **Open
 
 ## 12. Non-goals (v1)
 
-Tabs, split editors, find/replace, file **rename/delete** and sidebar-driven file create (file **create** is supported via File → New… (§7) — creating from a sidebar context menu, and rename/delete, remain non-goals), git integration **beyond the single read-only "(changed)" file-status badge of §5.6** (no branch/ahead-behind/staging UI, no diff, no commit — the §5.6 badge is the one sanctioned exception to this non-goal), LSP/completion, themes/dark mode, printing, preview→editor scroll sync, encodings beyond UTF-8/Latin-1 fallback. (File-system watching of the open file and sidebar roots is now in v1 — see §5.2 — and no longer a non-goal.)
+Tabs, split editors, **replace** (in-editor **find** is in v1 — see §6.5; only replace remains out), file **rename/delete** and sidebar-driven file create (file **create** is supported via File → New… (§7) — creating from a sidebar context menu, and rename/delete, remain non-goals), git integration **beyond the single read-only "(changed)" file-status badge of §5.6** (no branch/ahead-behind/staging UI, no diff, no commit — the §5.6 badge is the one sanctioned exception to this non-goal), LSP/completion, themes/dark mode, printing, preview→editor scroll sync, encodings beyond UTF-8/Latin-1 fallback. (File-system watching of the open file and sidebar roots is now in v1 — see §5.2 — and no longer a non-goal.)
 
 ## 13. Project structure
 
@@ -238,7 +251,10 @@ FEdit/
   Views/ColumnHeaderBar.swift    fixed-height column header strip (§4)
   Views/SplitDivider.swift      draggable divider (hit area, cursor, persistence hookup)
   Views/NewFileSheet.swift      File → New… filename sheet (§7)
+  Views/FindBar.swift           find bar: query field, Case sensitive checkbox, count, Done (§6.5)
   Editor/CodeEditorView.swift   NSTextView wrapper (representable + coordinator)
+  Editor/FindMatcher.swift      literal non-overlapping match enumeration + the match cap (§6.5)
+  Editor/FindSession.swift      find state machine: seat, step/wrap, clamp, count label (§6.5)
   Editor/LineNumberRulerView.swift
   Editor/LogicalLine.swift      logical-line counting/lookup shared by the ruler and cursor restore
   Editor/SyntaxHighlighter.swift  languages, rules, light theme colors
@@ -249,11 +265,12 @@ scripts/
   install.sh                    Release build + install of FEdit.app and the fedit shim (§15.3)
   fedit                         /bin/sh command-line shim around `open -a` (§3 external opens,
                                 §15.1 arguments and exit codes), plus the --wait marker protocol (§15.2)
-  FileNodeTests, FilterQueryTests, FilterRowCacheTests, GitStatusTests,
-  LogicalLineTests, MarkdownRendererTests, OpenRequestTests, RootScanTests,
-  SnapshotTests, TreeSkipGateTests
+  FileNodeTests, FilterQueryTests, FilterRowCacheTests, FindMatchTests,
+  GitStatusTests, LogicalLineTests, MarkdownRendererTests, OpenRequestTests,
+  RootScanTests, SnapshotTests, TreeSkipGateTests
                                 standalone swiftc-run regression harnesses (no XCTest target);
-                                OpenRequestTests compiles OpenRequest.swift + WaitMarkers.swift
+                                OpenRequestTests compiles OpenRequest.swift + WaitMarkers.swift,
+                                FindMatchTests compiles FindMatcher.swift + FindSession.swift
   FeditShimTests                shell harness for scripts/fedit (stub `open`/`pgrep`, no GUI), including
                                 the --wait cases (it plays the app's part on the spool by hand)
 ```
@@ -271,8 +288,9 @@ All items below have shipped, in this order (see [DONE.md](DONE.md) for the deta
 7. Font-size zoom, column header bars, the Cmd+O-opens-a-new-window rework, file-system watching, always-on autosave, the git "(changed)" badge, the Cmd+N/Cmd+O shortcut swap, File → New…, filter-query anchors, and sidebar row wrapping.
 8. Distribution and the command line (§15): `scripts/install.sh`, then `fedit <path>` external opens (§3), then `fedit --wait` so FEdit can be git's `core.editor`.
 9. A round of correctness and cost work on already-shipped code, all of it spec-visible: the root scan moved off the main thread and then consolidated behind one per-root scheduler; filter mode's flat rows cached instead of re-walked per render; the FSEvents skip gate aligned with the scanner's own recorded verdicts; path containment fixed for a `/` root; `CLIOpenToken` given a tolerant decode; the installer's shim skipped for non-default destinations; the zero-window relaunch net; and the ~50,000-node per-root tree budget (§1, §5.2).
+10. In-editor find (§6.5) — Cmd+F / Cmd+G, a visible case-sensitivity checkbox, layout-manager highlights, which **reversed** the `find/replace` non-goal of §12 down to replace only.
 
-Each item folded its own spec updates into the sections above. `TODO.md` is currently **empty** — every planned item has shipped. New work is added there as a slug, planned under `plans/`, and folded back into these sections when it lands.
+Each item folded its own spec updates into the sections above. `TODO.md` is **not** empty — it holds the currently open items (shipped ones are recorded in [DONE.md](DONE.md) instead). New work is added there as a slug, planned under `plans/`, and folded back into these sections when it lands.
 
 ## 15. Command line & installer
 

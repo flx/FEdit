@@ -64,6 +64,40 @@ struct CodeEditorView: NSViewRepresentable {
     /// re-highlight, ruler, gutter) with caret and top line preserved.
     var fontSize: CGFloat = 13
 
+    // MARK: - (editor-find) Find inputs and outputs (SPEC §6.5)
+    //
+    // Four inputs and two outputs, all defaulted so every other call site stays source-compatible.
+    // They are plain values read out of `WorkspaceModel` at the `ContentView` call site rather than
+    // a binding to the model, because the editor is a *consumer* of find state: it never decides
+    // what is searched, only where the matches are. Find state cannot live on the `Coordinator` —
+    // it is destroyed and rebuilt whenever `workspace.isMarkdown` flips (D3).
+
+    /// The literal search text (`WorkspaceModel.findQuery`). An empty query enumerates nothing and
+    /// reports an empty count label.
+    var findQuery: String = ""
+
+    /// The bar's **Case sensitive** checkbox (`WorkspaceModel.findCaseSensitive`); `false` (the
+    /// default) means a case-insensitive search.
+    var findCaseSensitive: Bool = false
+
+    /// Whether the find bar is showing (`WorkspaceModel.isFindBarVisible`). Going `false` is what
+    /// removes every highlight and — once — leaves the caret at the current match (D9).
+    var findIsActive: Bool = false
+
+    /// Find Next's monotonically increasing tick (`WorkspaceModel.findNextTick`), bumped by Return
+    /// and Cmd+G. Consumed against `Coordinator.lastConsumedFindTick`, which `makeNSView` seeds from
+    /// this very value so a rebuilt editor cannot replay the previous editor's steps (criterion 22).
+    var findNextTick: Int = 0
+
+    /// Fires with the find bar's count readout (`3 of 17` / `Not found` / `3 of 20000+` / `""`)
+    /// whenever it changes. The count flows editor → model → bar, one direction only.
+    var onFindCountChange: ((String) -> Void)? = nil
+
+    /// Fires when Esc is pressed **while focus is in the editor text** — the half of criterion 18
+    /// that a SwiftUI `.keyboardShortcut(.cancelAction)` on the bar's Done button cannot reach,
+    /// because the bar does not have focus then. `ContentView` routes it to `closeFindBar()`.
+    var onFindClose: (() -> Void)? = nil
+
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
     }
@@ -95,7 +129,11 @@ struct CodeEditorView: NSViewRepresentable {
         textContainer.widthTracksTextView = true
         layoutManager.addTextContainer(textContainer)
 
-        let textView = NSTextView(frame: .zero, textContainer: textContainer)
+        // (editor-find) A `FindableTextView`, not a plain `NSTextView`, for exactly one reason: Esc
+        // must close the find bar when focus is in the TEXT rather than in the bar's query field
+        // (criterion 18). Everything else about the view is unchanged, and the TextKit 1 stack is
+        // still hand-built here — the subclass adds one override and one closure, no storage.
+        let textView = FindableTextView(frame: .zero, textContainer: textContainer)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
@@ -125,6 +163,18 @@ struct CodeEditorView: NSViewRepresentable {
 
         textView.delegate = coordinator
 
+        // (editor-find) Esc with focus in the editor text. Returns `false` — i.e. "not handled,
+        // fall through to AppKit's own Esc behavior" — unless a find bar is actually open, so this
+        // changes nothing about the editor when find is not in use. Runs from a key event, never
+        // inside a SwiftUI update pass, so writing model state from here needs no deferral.
+        // `[weak coordinator]`, matching `ruler.onThicknessChange` below: this closure is stored on
+        // a view the coordinator (indirectly) owns, so a strong capture would be a retain cycle.
+        textView.onEscape = { [weak coordinator] in
+            guard let coordinator, coordinator.parent.findIsActive else { return false }
+            coordinator.parent.onFindClose?()
+            return true
+        }
+
         scrollView.documentView = textView
 
         let ruler = LineNumberRulerView(textView: textView, scrollView: scrollView)
@@ -153,6 +203,15 @@ struct CodeEditorView: NSViewRepresentable {
         // restore-scroll. `currentFontSize` is the value `highlightNow` reads on that first pass.
         coordinator.currentFontSize = fontSize
         coordinator.appliedFontSize = fontSize
+        // (editor-find) Seeded here for exactly the same reason `appliedFontSize` is, and it is the
+        // whole of criterion 22: `findNextTick` lives on `WorkspaceModel` and keeps counting for the
+        // life of the WINDOW, while this coordinator is destroyed and rebuilt on every
+        // Markdown↔non-Markdown file switch. A fresh coordinator that started this at 0 would see
+        // the window's accumulated tick (seven Cmd+G presses in the previous file) as a brand-new
+        // step and jump the just-opened file to a match on load. Seeding it to the incoming value
+        // means a rebuilt editor starts already up to date — this is the house one-shot convention
+        // (`hasConsumedCursorRestore`, `pendingNewWindowPicks`, the `CLIOpenToken` issued-id guard).
+        coordinator.lastConsumedFindTick = findNextTick
         coordinator.observeClipViewBounds(scrollView.contentView)
 
         return scrollView
@@ -186,6 +245,14 @@ struct CodeEditorView: NSViewRepresentable {
             // the top of the document.
             coordinator.isProgrammaticUpdate = true
             textView.string = text
+            // (editor-find, finding 3) A character mutation that bypasses `textDidChange` (see the
+            // ruler-invalidation comment below), so `textEditGeneration` needs its own explicit bump
+            // here — otherwise `isFindSessionCurrent` would keep reporting the PREVIOUS document's
+            // session as current until `refreshFind` happens to re-run later in this same pass.
+            coordinator.textEditGeneration += 1
+            // (editor-find, findings 3 and 6) Marks this pass as a document change for the trailing
+            // find block to read once and clear (see `documentChangedThisPass`'s doc comment).
+            coordinator.documentChangedThisPass = true
             // Clears the *window's* shared `NSUndoManager` — not just this view's own actions —
             // so switching files also wipes any other undoable state in the window. Accepted
             // explicitly for v1 (criterion 6: switching files must never resurrect the previous
@@ -248,6 +315,13 @@ struct CodeEditorView: NSViewRepresentable {
             let anchorChar = coordinator.firstVisibleCharIndex(textView)
             coordinator.isProgrammaticUpdate = true
             textView.string = text
+            // (editor-find, finding 3) Same reasoning as the file-switch branch above: this is a
+            // character mutation `textDidChange` never sees, so `textEditGeneration` needs the
+            // explicit bump.
+            coordinator.textEditGeneration += 1
+            // (editor-find, findings 3 and 6) Same flag the file-switch branch sets, and the same
+            // reason — this branch replaces the document's content just as fully.
+            coordinator.documentChangedThisPass = true
             let newLength = (text as NSString).length
             let clamped = min(oldLocation, newLength)
             textView.setSelectedRange(NSRange(location: clamped, length: 0))
@@ -288,6 +362,17 @@ struct CodeEditorView: NSViewRepresentable {
             //    logical line is re-pinned to the viewport top after relayout).
             let ranges = textView.selectedRanges
             let anchorChar = coordinator.firstVisibleCharIndex(textView)
+            // (editor-find, criterion 23) The third anchor, captured here with the other two and
+            // for the same reason — step 3 below runs a highlight pass, which counts as a settle
+            // point, so `isFindSessionCurrent` read *after* it would always be false. What this
+            // asks is "does the find session describe the text as it stands right now", which is
+            // false when a file switch or an external reload ran earlier in this same pass (both
+            // are independent `if`s above): the session then still describes the previous document,
+            // and re-scrolling to one of its matches would silently override the caret/top position
+            // that branch just established with a plausible-looking wrong offset.
+            let findAnchorIsValid = findIsActive
+                && coordinator.isFindSessionCurrent
+                && coordinator.findSession.currentRange != nil
 
             // 2. New typing/caret font. Deliberately NOT `textView.font = …`: the `font` setter
             //    routes through `shouldChangeText`/`didChangeText`, which registers an undo action
@@ -312,11 +397,60 @@ struct CodeEditorView: NSViewRepresentable {
             //    resized layout exists (deferred one runloop pass if layout is not yet complete —
             //    the same pattern as the file-switch cursor-restore scroll).
             textView.selectedRanges = ranges
-            coordinator.scrollCharToTop(textView, characterIndex: anchorChar)
+            // (editor-find, criterion 23) While a find session is running, the anchor the user
+            // cares about is the CURRENT MATCH, not the first visible line: zooming with `7 of 17`
+            // showing must leave that match on screen, and the count must not change. A zoom
+            // re-applies attributes and never changes a character, so the session's ranges are
+            // still exactly right; the validity captured in step 1 is what rules out the
+            // simultaneous file-switch case. Otherwise this falls back to the ordinary top-line
+            // anchor, which was captured after any swap and is correct there.
+            if findAnchorIsValid {
+                coordinator.scrollToCurrentFindMatch(textView)
+            } else {
+                coordinator.scrollCharToTop(textView, characterIndex: anchorChar)
+            }
 
             coordinator.appliedFontSize = fontSize
             coordinator.isProgrammaticUpdate = false
         }
+
+        // ===== (editor-find) THE ORDERING INVARIANT =====
+        //
+        // Every line of find work in `updateNSView` lives HERE, after the file-switch branch, the
+        // external-reload branch and the font-zoom block have all finished. That placement is not
+        // tidiness — it is the fix for the `NSRangeException` class of defect this feature invites.
+        // A find range is enumerated against one snapshot of the text and consumed (highlighted,
+        // scrolled to, selected) against another; if any of that ran BEFORE the branches above
+        // replaced the text, it would hand `addTemporaryAttributes`/`scrollRangeToVisible` a range
+        // past the end of the storage, which raises and takes the app down.
+        //
+        // Two independent guarantees, deliberately belt-and-braces:
+        //  1. Position — this block is last, and `highlightNow`'s own find hook is suppressed while
+        //     `isProgrammaticUpdate` is set (which is exactly "inside one of those branches").
+        //  2. Content — `refreshFind` runs `FindSession.clamp(toLength:)` before it reads, draws or
+        //     scrolls to anything, and every range is intersected with the storage's full range at
+        //     the point of use. So even a caller that got the order wrong cannot raise.
+        coordinator.refreshFind(textView)
+
+        // Find Next (Return / Cmd+G), consumed exactly once per tick. The tick is consumed
+        // UNCONDITIONALLY — even with the bar closed, where it does nothing — so a Cmd+G pressed
+        // while find was inactive can never be replayed as a surprise jump when the bar next opens.
+        // `lastConsumedFindTick` is seeded in `makeNSView`, which is what keeps a *rebuilt*
+        // coordinator from replaying the previous editor's ticks (criterion 22).
+        if coordinator.lastConsumedFindTick != findNextTick {
+            coordinator.lastConsumedFindTick = findNextTick
+            if findIsActive {
+                coordinator.stepFindNext(textView)
+            }
+        }
+    }
+
+    /// (editor-find, finding 19) Deterministic teardown: SwiftUI calls this when the representable
+    /// is removed (a file switch across the Markdown boundary destroys this editor), so pending
+    /// debounced work is cancelled at that moment rather than whenever the coordinator happens to be
+    /// released. `Coordinator.deinit` still cancels — this is the earlier, deterministic half.
+    static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
+        coordinator.cancelPendingWork()
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -358,6 +492,102 @@ struct CodeEditorView: NSViewRepresentable {
         private var lastReportedFirstVisibleLine: Int?
         private var firstVisibleLineWorkItem: DispatchWorkItem?
 
+        /// (editor-find, findings 3 and 6) Set by the file-switch and external-reload branches in
+        /// `updateNSView` — never anywhere else — and consumed (read once, then cleared) by the
+        /// very next `refreshFind`, which the ordering invariant guarantees runs at the end of that
+        /// same pass. Two independent readers rely on it meaning exactly "the document itself
+        /// changed earlier in the CURRENT `updateNSView` pass": closing the bar must not recompute a
+        /// leftover query against a document it was never searching (finding 3) or drop the caret at
+        /// a stale-but-in-bounds match belonging to the file that just closed, and the trailing
+        /// `scrollToCurrentFindMatch` on a NEW search must not fight the top-of-file/restored-cursor
+        /// scroll that branch just set (finding 6).
+        var documentChangedThisPass = false
+
+        // MARK: - (editor-find) Derived find state (SPEC §6.5)
+
+        /// The find state machine for this editor. **Derived, never authoritative:** the query, the
+        /// case flag and the bar's visibility live on `WorkspaceModel` (D3) and are mirrored in here
+        /// on each `refreshFind`, because this coordinator is destroyed and rebuilt whenever
+        /// `workspace.isMarkdown` flips — which is exactly the `main.swift` → `notes.md` case find
+        /// has to survive (criterion 20). Everything a rebuild loses is recomputed from the model.
+        var findSession = FindSession()
+
+        /// The last `findNextTick` this editor acted on. **Seeded in `makeNSView`** from the
+        /// incoming tick, exactly as `appliedFontSize` is seeded — so a coordinator rebuilt mid-life
+        /// never replays the window's accumulated Find Next presses (criterion 22). `nil` would mean
+        /// "never seeded", which `makeNSView` makes unreachable.
+        var lastConsumedFindTick: Int?
+
+        /// Counts the points at which the editor's text has *settled*: bumped once per
+        /// `highlightNow`, i.e. by the debounced pass and by the three synchronous passes (file
+        /// switch, external reload, font zoom). See `highlightNow` for why the bump lives there and
+        /// not at those call sites, and for why a plain keystroke deliberately does not bump it.
+        /// This is a **perf gate only** — it decides when `refreshFind` pays for a re-enumeration,
+        /// not whether the session is safe to act on right now; `isFindSessionCurrent` below is the
+        /// correctness gate and deliberately does NOT read this counter (editor-find, finding 3).
+        ///
+        /// Between a keystroke and its debounce the session's ranges are therefore up to 150 ms
+        /// stale — safe to keep *displayed* by construction (every range is clamped and intersected
+        /// before use) but NOT safe to act on as if current (placing a caret, scrolling): that is
+        /// exactly the gap `textEditGeneration` closes.
+        var settledTextGeneration = 0
+
+        /// The `settledTextGeneration` the session was last enumerated against; `nil` before the
+        /// first enumeration. Comparing the two is what lets `refreshFind` run on every
+        /// `updateNSView` — it must, to stay correct — while *paying* for an enumeration only when
+        /// the text has settled somewhere new or the query/case flag changed.
+        private var findEnumeratedGeneration: Int?
+
+        /// (editor-find, finding 3) Counts every actual CHARACTER mutation of the storage — bumped
+        /// in `textDidChange` (every keystroke, not just settle points) and at the two other places
+        /// characters change outside that delegate callback: the file-switch and external-reload
+        /// `textView.string = text` assignments in `updateNSView` (a programmatic `string =` never
+        /// posts `NSText.didChangeNotification`, so `textDidChange` is never called for it — see the
+        /// ruler-invalidation comment at those call sites for the same fact). Deliberately NOT
+        /// bumped by attribute-only passes (`highlightNow`'s `SyntaxHighlighter` call, the font-zoom
+        /// block): those never move a character, so a range enumerated before one is still exactly
+        /// right after it. Not `private`: `updateNSView`'s file-switch and external-reload branches
+        /// bump it directly, the same way they already write `isProgrammaticUpdate` and
+        /// `pendingHighlight` from outside the type.
+        var textEditGeneration = 0
+
+        /// The `textEditGeneration` the session was last enumerated against; `nil` before the first
+        /// enumeration. This is what `isFindSessionCurrent` actually compares — see there.
+        private var findEnumeratedTextEditGeneration: Int?
+
+        /// The last count label handed out, so an unchanged label never crosses back into the model
+        /// (mirrors `lastReportedFirstVisibleLine`). `nil` (not `""`) so the first report always
+        /// goes out, including the empty one.
+        private var lastReportedFindCountLabel: String?
+
+        /// Whether the session's ranges were enumerated against the text that is in the storage
+        /// *now* — literally: has `textEditGeneration` moved since the last enumeration. False in
+        /// two overlapping windows: (1) after a settle point (a file switch or an external reload
+        /// earlier in this same `updateNSView` pass) and before `refreshFind` has re-run, and (2)
+        /// **for the whole ~150 ms debounce window after any keystroke**, because a keystroke bumps
+        /// `textEditGeneration` immediately even though re-enumeration waits for the debounce
+        /// (finding 3 — an earlier version of this predicate compared `settledTextGeneration`
+        /// instead, which is bumped only at settle points, so it stayed `true` through that whole
+        /// window and let a stale range be acted on as if current).
+        ///
+        /// Two call sites in `updateNSView`/`refreshFind` read it, and both are about a
+        /// *stale-but-in-bounds* range doing something plausible-looking and wrong rather than
+        /// crashing — the failure mode the clamp and the intersections cannot catch, because the
+        /// range is perfectly valid, just for text that no longer exists. The font-zoom block must
+        /// not re-scroll to a match belonging to the file (or the pre-edit text) that was current a
+        /// moment ago, and closing the bar must not drop the caret at one — see `refreshFind`, which
+        /// recomputes once before placing the caret when this is false, rather than skipping the
+        /// placement outright.
+        var isFindSessionCurrent: Bool {
+            findEnumeratedTextEditGeneration == textEditGeneration
+        }
+
+        /// (editor-find, finding 1) The `settledTextGeneration` as of the last `applyFindHighlights`
+        /// call from `refreshFind`'s active branch; `nil` before the first one. See the redraw guard
+        /// there for why this — not just `findSession != sessionBefore` — decides whether a repaint
+        /// is due.
+        private var lastAppliedFindGeneration: Int?
+
         init(parent: CodeEditorView) {
             self.parent = parent
         }
@@ -368,8 +598,23 @@ struct CodeEditorView: NSViewRepresentable {
             NotificationCenter.default.removeObserver(self)
         }
 
+        /// (editor-find, finding 19) Cancels this coordinator's pending debounced work. Called from
+        /// `dismantleNSView` — deterministic teardown, ahead of `deinit` — and kept here rather than
+        /// reaching into private members from the representable.
+        func cancelPendingWork() {
+            firstVisibleLineWorkItem?.cancel()
+            firstVisibleLineWorkItem = nil
+            pendingHighlight?.cancel()
+            pendingHighlight = nil
+        }
+
         func textDidChange(_ notification: Notification) {
             guard !isProgrammaticUpdate, let textView else { return }
+            // (editor-find, finding 3) Every keystroke is a character mutation, so this bumps
+            // `textEditGeneration` unconditionally and immediately — unlike `settledTextGeneration`,
+            // which deliberately waits for the debounce (see that property's doc comment for why
+            // the two must NOT be the same counter).
+            textEditGeneration += 1
             parent.text = textView.string
             scheduleHighlight(for: textView)
         }
@@ -396,7 +641,330 @@ struct CodeEditorView: NSViewRepresentable {
         /// restore here.
         func highlightNow(_ textView: NSTextView) {
             guard let textStorage = textView.textStorage else { return }
+
+            // (editor-find, D8) A settle point, and the counter's exact meaning: "a full pass has
+            // just run over whatever is in the storage now". All four callers qualify — the
+            // debounced pass, the file-switch branch, the external-reload branch, and the font-zoom
+            // block — and putting the bump HERE rather than at those call sites is what closes the
+            // gap where one of them *cancels* a pending debounce and runs a pass of its own: a
+            // keystroke followed within 150 ms by a zoom would otherwise leave the session
+            // enumerated against pre-keystroke text with nothing left to ever re-run it.
+            //
+            // A plain keystroke deliberately does NOT come through here (it only reschedules the
+            // debounce), which is what keeps typing off the enumeration path: an edit publishes
+            // through the text binding and lands back in `updateNSView` within the same runloop
+            // turn, so bumping per keystroke would mean a full document scan, and up to
+            // `FindMetrics.matchLimit` temporary-attribute writes, on every character.
+            settledTextGeneration += 1
+
             SyntaxHighlighter.highlight(textStorage, language: currentLanguage, fontSize: currentFontSize)
+
+            // (editor-find, D8) The find re-enumeration rides this existing debounce — and this is
+            // also the seam that makes the named hazard a non-event: the pass above opens with
+            // `textStorage.setAttributes(…, range: fullRange)`, which wipes every text-storage
+            // attribute, but find highlights are `NSLayoutManager` TEMPORARY attributes and are not
+            // in the text storage at all, so they survive it by construction. Re-applying them here
+            // is about the text having *changed* (a character edit shifts and truncates them), not
+            // about the highlighter having eaten them.
+            //
+            // Guarded on `!isProgrammaticUpdate`, which is exactly "not inside one of
+            // `updateNSView`'s text-mutating branches": the file-switch branch, the external-reload
+            // branch and the font-zoom block all call this synchronously with that flag set, and all
+            // three are followed by the find block at the end of `updateNSView`, which does this
+            // work once, in the right order (see THE ORDERING INVARIANT there). Without the guard,
+            // find would run mid-branch — before the caret and document identity for the new file
+            // have even been set — which is the ordering the invariant forbids.
+            if !isProgrammaticUpdate {
+                refreshFind(textView)
+            }
+        }
+
+        // MARK: - (editor-find) Find (SPEC §6.5)
+
+        /// The single find entry point: clamp, then (only when it must) re-enumerate, then re-draw,
+        /// then report the count out. Called from the find block at the end of `updateNSView` and
+        /// from the debounced `highlightNow` — never from inside a text-mutating branch.
+        ///
+        /// **`clamp(toLength:)` runs first, before anything touches a range.** The session may be
+        /// holding ranges enumerated against text that no longer exists (a keystroke inside the
+        /// debounce window, a file switch, an external reload), and an out-of-range range handed to
+        /// `addTemporaryAttributes`/`scrollRangeToVisible`/`setSelectedRange` raises
+        /// `NSRangeException` — an app crash, not a glitch. This ordering is the whole reason
+        /// `clamp` is a first-class operation on `FindSession` (criteria 9 and 11 pin it headlessly).
+        func refreshFind(_ textView: NSTextView) {
+            // (editor-find, findings 3 and 6, finding 4 second round) Consumed exactly once per
+            // pass, on EVERY return path — including the `textStorage == nil` guard right below —
+            // so a document change is never visible to a LATER `updateNSView` pass (e.g. the
+            // debounced `highlightNow` firing after this one runs with the flag already stale-true).
+            // Placed above the guard rather than after it for exactly that reason: a `defer` below a
+            // `return` never runs for that path, which would leak the flag on the one return this
+            // function has ahead of the `defer` line.
+            defer { documentChangedThisPass = false }
+            guard let textStorage = textView.textStorage else { return }
+            let length = textStorage.length
+            // Compared at the end to decide whether the drawn state is stale. `FindSession` is a
+            // value type, so this is a cheap retain of the match array, not a copy of it.
+            let sessionBefore = findSession
+
+            // (editor-find, finding 9) Unconditional, on every `updateNSView` pass — including the
+            // genuinely idle ones (a caret move, a scroll report, a divider drag) the comment below
+            // calls out as paying nothing. That claim depends on `clamp`'s OWN early-out: on an
+            // idle pass nothing is out of bounds, so it leaves `matches` as the same array instance
+            // rather than allocating a fresh, filtered one — which is also what keeps `sessionBefore`
+            // and `findSession` cheaply comparable by `Array`'s identity fast path just below,
+            // instead of an up-to-`FindMetrics.matchLimit`-element walk on every single pass.
+            findSession.clamp(toLength: length)
+
+            guard parent.findIsActive else {
+                // Closing the bar (D9). Stepping deliberately does NOT move the caret — each step
+                // would otherwise fire `textViewDidChangeSelection` → `noteCursorMoved` → a
+                // `@Published` write → a `JSONEncoder` + `@SceneStorage` snapshot write, per Find
+                // Next press. Instead the caret is placed ONCE, here, at the match the user stopped
+                // on, which is what "Esc leaves the caret at the match" actually wants.
+                //
+                // One-shot without a flag of its own: `clear()` empties the session immediately
+                // below, so `currentRange` is `nil` on every subsequent inactive pass.
+                //
+                // `isFindSessionCurrent` is the guard against what the clamp cannot catch: a range
+                // that is perfectly valid but describes the wrong text. Two distinct causes,
+                // deliberately handled differently:
+                //  - Stale by DOCUMENT (`documentChangedThisPass`, finding 6's flag reused here): a
+                //    file switch or an external reload ran earlier in this same pass. Nothing worth
+                //    recovering — the leftover query describes whatever was being searched for in
+                //    the PREVIOUS document, so re-enumerating it against the new one would place the
+                //    caret at a coincidental, meaningless match. Skip outright, exactly as before
+                //    this finding: dropping the caret there would also silently override the caret
+                //    that branch just set (a restored cursor, or the top of the file), and the
+                //    user's place in a document that is no longer open is not a place.
+                //  - Stale by EDIT only (finding 3): Esc pressed inside the ~150 ms debounce window
+                //    after a keystroke, same document throughout. One re-enumeration away from being
+                //    exactly right, so it is worth the one-time cost rather than dropping a caret
+                //    placement the user is actively expecting.
+                if isFindSessionCurrent {
+                    if let current = findSession.currentRange {
+                        placeCaretAtFindMatch(textView, range: current)
+                    }
+                } else if !documentChangedThisPass {
+                    reenumerateFindSession(textView, textStorage: textStorage, seatOnNearest: true)
+                    if let current = findSession.currentRange {
+                        placeCaretAtFindMatch(textView, range: current)
+                    }
+                }
+                findSession.clear()
+                if findSession != sessionBefore {
+                    // Removes every temporary background over the whole storage (criterion 18). The
+                    // guard matters: with the bar closed this method still runs on every keystroke,
+                    // and an unconditional `removeTemporaryAttribute` would invalidate display for
+                    // the entire document each time.
+                    applyFindHighlights(textView)
+                }
+                reportFindCount(findSession.countLabel)
+                return
+            }
+
+            let inputsChanged = findSession.query != parent.findQuery
+                || findSession.caseSensitive != parent.findCaseSensitive
+            findSession.query = parent.findQuery
+            findSession.caseSensitive = parent.findCaseSensitive
+
+            // Enumerate only when something actually changed — the query/case flag, or the text at a
+            // settle point (D8). Every other `updateNSView` pass (a caret move, a scroll report, a
+            // divider drag, a keystroke inside the debounce window) reaches here and pays nothing.
+            //
+            // (editor-find, finding 1, second round) `documentChangedThisPass` gates the seat mode
+            // here too, not only the scroll below: a file switch that keeps this coordinator (two
+            // files of the same Markdown-ness) leaves `inputsChanged` false, so without this the seat
+            // would default to `recomputeNearest(near: <the PREVIOUS document's offset>)` — an
+            // offset that names nothing in the file that just opened. A new document must always
+            // seat from the caret, never from a location that meant something in a different file.
+            if inputsChanged || findEnumeratedGeneration != settledTextGeneration {
+                reenumerateFindSession(
+                    textView, textStorage: textStorage,
+                    seatOnNearest: !inputsChanged && !documentChangedThisPass
+                )
+            }
+
+            // Re-drawn exactly when the drawn state COULD be stale (editor-find, finding 1) — not
+            // only when `findSession != sessionBefore`. The two are different questions: the drawn
+            // state lives in the layout manager's TEMPORARY attributes, and those are destroyed by a
+            // character replacement regardless of whether the resulting `matches` array happens to
+            // compare equal to what it was before (probed directly: `textView.string = "…"` wipes a
+            // previously-set temporary attribute; an attribute-only `setAttributes` pass does not).
+            // Failing case this fixes: switch from a file with one `hello` match to a different file
+            // that also has exactly one `hello` match at the same offset — `findSession` recomputes
+            // to the identical value, the old guard skipped the repaint, and the count read `1 of 1`
+            // with nothing actually highlighted.
+            //
+            // `lastAppliedFindGeneration != settledTextGeneration` is the belt: a settle point means
+            // "a full pass just ran over whatever is in the storage now" (`highlightNow`'s doc
+            // comment), which is true for every character-mutating branch (file switch, external
+            // reload) as well as the debounced pass — repainting on any of them is what keeps this
+            // correct even for a future settle-point source doing the same wipe. It is cheap because
+            // settle points are throttled to ~150 ms or a handful of explicit synchronous passes,
+            // never per keystroke — the genuinely idle passes (a caret move, a scroll report, a
+            // divider drag) bump neither `settledTextGeneration` nor change `findSession`, so this
+            // still skips the full-range temporary-attribute removal and its display invalidation on
+            // exactly those passes, which is what keeps the "pays nothing" property.
+            if findSession != sessionBefore || lastAppliedFindGeneration != settledTextGeneration {
+                applyFindHighlights(textView)
+                lastAppliedFindGeneration = settledTextGeneration
+            }
+            // Scroll only for a NEW search — never on a debounced re-enumeration, which would yank
+            // the viewport away from the line the user is typing on. (editor-find, finding 6) NOR
+            // when the document itself changed earlier in this same pass: opening a file across the
+            // Markdown boundary rebuilds this coordinator, so the fresh `FindSession` has
+            // `query == ""` and the very next `updateNSView` reporting the real query makes
+            // `inputsChanged` true — which, without this guard, would yank the just-opened file's
+            // viewport to a match and override the top-of-file/restored-cursor scroll the file-switch
+            // branch just set. Switching between two files that keep the same coordinator hits the
+            // opposite bug (no rebuild, so `inputsChanged` stays false and never scrolls at all) —
+            // this makes both paths behave identically: opening a file never yanks the viewport,
+            // typing a query still does.
+            if inputsChanged && !documentChangedThisPass {
+                scrollToCurrentFindMatch(textView)
+            }
+            reportFindCount(findSession.countLabel)
+        }
+
+        /// (editor-find, findings 2 and 3) Re-enumerates `findSession` with the seat mode the caller
+        /// needs, and records both generations the enumeration ran against — `findEnumeratedGeneration`
+        /// (the perf gate) and `findEnumeratedTextEditGeneration` (`isFindSessionCurrent`'s
+        /// correctness gate). One shared implementation for both callers: the active-session
+        /// re-enumeration in `refreshFind` and finding 3's stale-on-close recompute, which both need
+        /// exactly the same seat-mode rule (nearest-to-the-previous-match for a re-run, first-at-or-
+        /// after-the-caret otherwise).
+        private func reenumerateFindSession(_ textView: NSTextView, textStorage: NSTextStorage, seatOnNearest: Bool) {
+            if seatOnNearest, let current = findSession.currentRange {
+                findSession.recomputeNearest(text: textStorage.string as NSString, near: current.location)
+            } else {
+                let caret = textView.selectedRange().location
+                findSession.recompute(text: textStorage.string as NSString, caretLocation: caret)
+            }
+            findEnumeratedGeneration = settledTextGeneration
+            findEnumeratedTextEditGeneration = textEditGeneration
+        }
+
+        /// Find Next (Return / Cmd+G): advance the seat, redraw, scroll the new current match into
+        /// view, report the new count. Never touches the selection (D9).
+        func stepFindNext(_ textView: NSTextView) {
+            // (editor-find, finding 3, second round) `isFindSessionCurrent`'s doc comment calls the
+            // ranges NOT safe to act on as if current while stale-by-edit — and scrolling to the
+            // stepped-to match is exactly that. Failing case without this: paste text above the
+            // current match, then press Cmd+G inside the ~150 ms debounce window before the pasted
+            // characters have been re-enumerated — `refreshFind` already ran this same
+            // `updateNSView` pass and skipped re-enumeration (its perf gate compares
+            // `settledTextGeneration`, which a keystroke/paste does not bump), so stepping and
+            // scrolling here would act on ranges describing the pre-paste text. Re-enumerating
+            // nearest-to-the-current-match first (same seat rule `refreshFind`'s stale-on-close path
+            // uses) puts the step on current ranges. `documentChangedThisPass` is never true by the
+            // time this runs — `refreshFind`'s `defer` already cleared it, and its active branch
+            // re-enumerates against any settle point a document change causes — so staleness here is
+            // always the edit case, never the document one.
+            if !isFindSessionCurrent, let textStorage = textView.textStorage {
+                reenumerateFindSession(textView, textStorage: textStorage, seatOnNearest: true)
+            }
+            // With nothing to step to, `stepNext()` is a no-op — returning early additionally skips
+            // a pointless full-range attribute removal and the redraw it would invalidate.
+            guard !findSession.matches.isEmpty else { return }
+            let previousRange = findSession.currentRange
+            findSession.stepNext()
+            // (editor-find, finding 8) Recolor only the two ranges that actually changed color — the
+            // match that WAS current (back to the ordinary match color) and the match that IS now
+            // current (to the distinct color) — rather than `applyFindHighlights`'s full
+            // remove-over-everything-then-add-per-match pass. Every OTHER match's temporary
+            // attribute is untouched and still exactly right, because nothing between here and the
+            // last full repaint mutated a character (`stepFindNext` never does). Holding Cmd+G on a
+            // capped 20,000-match search would otherwise repeat a full-range
+            // `removeTemporaryAttribute` plus up to 20,000 `addTemporaryAttributes` calls per press.
+            recolorFindMatch(textView, range: previousRange, color: Theme.findMatchBackground)
+            recolorFindMatch(textView, range: findSession.currentRange, color: Theme.findCurrentMatchBackground)
+            scrollToCurrentFindMatch(textView)
+            reportFindCount(findSession.countLabel)
+        }
+
+        /// (editor-find, finding 8) Sets exactly one match's temporary background color — the
+        /// building block `stepFindNext` uses instead of a full `applyFindHighlights` repaint.
+        /// `range` is `nil` only when there is nothing to recolor (defensive; `stepFindNext`'s
+        /// non-empty-matches guard makes both ranges it passes non-nil in practice, by the same
+        /// invariant `FindSession.currentRange` documents). Intersected with the storage's full
+        /// range for the same reason `applyFindHighlights` is.
+        private func recolorFindMatch(_ textView: NSTextView, range: NSRange?, color: NSColor) {
+            guard let range,
+                  let layoutManager = textView.layoutManager,
+                  let textStorage = textView.textStorage
+            else { return }
+            let drawable = NSIntersectionRange(range, NSRange(location: 0, length: textStorage.length))
+            guard drawable.length > 0 else { return }
+            layoutManager.addTemporaryAttributes([.backgroundColor: color], forCharacterRange: drawable)
+        }
+
+        /// Paints the match highlights as `NSLayoutManager` **temporary attributes** (D2) — display
+        /// -only, owned by the layout manager, and therefore untouched by the highlighter's
+        /// `textStorage.setAttributes` reset pass and never in contention with the Markdown
+        /// code-span rules that own `.backgroundColor` in the text storage. A temporary attribute
+        /// *replaces* the storage's value for its key while drawing rather than compositing with it,
+        /// which is exactly why a match inside a code span reads as a match.
+        ///
+        /// Remove-over-the-full-range then add-per-match, deliberately: it is what makes "no orphan
+        /// highlight ever survives" structural rather than a bookkeeping promise — a shrinking match
+        /// set, a closed bar and a changed query all land in the same one line.
+        func applyFindHighlights(_ textView: NSTextView) {
+            guard let layoutManager = textView.layoutManager,
+                  let textStorage = textView.textStorage
+            else { return }
+
+            let fullRange = NSRange(location: 0, length: textStorage.length)
+            layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: fullRange)
+
+            for (index, match) in findSession.matches.enumerated() {
+                // Intersected even though `refreshFind` has already clamped: this method is reachable
+                // from three call sites, and the cost of being wrong here is an `NSRangeException`.
+                let drawable = NSIntersectionRange(match, fullRange)
+                guard drawable.length > 0 else { continue }
+                let color = index == findSession.currentIndex
+                    ? Theme.findCurrentMatchBackground
+                    : Theme.findMatchBackground
+                layoutManager.addTemporaryAttributes([.backgroundColor: color], forCharacterRange: drawable)
+            }
+        }
+
+        /// Scrolls the current match into view, if there is one. Intersected with the storage's full
+        /// range for the same reason as the highlights above.
+        func scrollToCurrentFindMatch(_ textView: NSTextView) {
+            guard let textStorage = textView.textStorage,
+                  let current = findSession.currentRange
+            else { return }
+            let visible = NSIntersectionRange(current, NSRange(location: 0, length: textStorage.length))
+            guard visible.length > 0 else { return }
+            textView.scrollRangeToVisible(visible)
+        }
+
+        /// (D9) Places a collapsed caret at `range`'s start when the find bar closes — the one
+        /// selection write a whole find session costs. Wrapped in `isProgrammaticUpdate` so the
+        /// synchronous `textViewDidChangeSelection` report is suppressed (it would write
+        /// `@Published` model state from inside a SwiftUI update pass), and the report is re-issued
+        /// deferred instead — the same pattern the file-switch and external-reload branches use.
+        private func placeCaretAtFindMatch(_ textView: NSTextView, range: NSRange) {
+            guard let textStorage = textView.textStorage else { return }
+            let location = min(max(range.location, 0), textStorage.length)
+            isProgrammaticUpdate = true
+            textView.setSelectedRange(NSRange(location: location, length: 0))
+            isProgrammaticUpdate = false
+            DispatchQueue.main.async { [weak self] in
+                self?.parent.onCursorChange?(location)
+            }
+        }
+
+        /// Hands the count label out to the model, only when it changed (mirrors
+        /// `reportFirstVisibleLineIfChanged`). Deferred one runloop pass because the sink writes
+        /// `@Published` state and this can run inside SwiftUI's update pass; `parent` is read at fire
+        /// time so the callback is never a stale struct copy's.
+        private func reportFindCount(_ label: String) {
+            guard label != lastReportedFindCountLabel else { return }
+            lastReportedFindCountLabel = label
+            DispatchQueue.main.async { [weak self] in
+                self?.parent.onFindCountChange?(label)
+            }
         }
 
         /// (editor-font-zoom) The UTF-16 index of the first character whose glyph is visible —
@@ -497,5 +1065,31 @@ struct CodeEditorView: NSViewRepresentable {
             lastReportedFirstVisibleLine = line
             parent.onFirstVisibleLineChange?(line)
         }
+    }
+}
+
+/// (editor-find) The editor's `NSTextView`, subclassed for exactly one behavior: Esc closes the
+/// find bar when focus is in the **text** rather than in the bar's query field (criterion 18).
+///
+/// SwiftUI's `.keyboardShortcut(.cancelAction)` on the bar's Done button only fires while the
+/// SwiftUI side owns the key window's focus; once the user clicks into the editor to read around a
+/// match, Esc goes down the AppKit responder chain instead and would otherwise do nothing at all.
+/// `cancelOperation(_:)` is the responder-chain hook Esc is bound to, so this is the one place that
+/// key can be caught without installing a global event monitor.
+///
+/// It claims Esc **only** when the closure says a find bar is actually open; otherwise it falls
+/// through to `super`, so the editor's Esc behavior is unchanged whenever find is not in use.
+final class FindableTextView: NSTextView {
+    /// Invoked on Esc; returns `true` if it consumed the key. Set once in
+    /// `CodeEditorView.makeNSView`, capturing the coordinator weakly.
+    var onEscape: (() -> Bool)?
+
+    override func cancelOperation(_ sender: Any?) {
+        // (editor-find, finding 6, second round) During IME marked-text composition (e.g. Japanese/
+        // Chinese), Esc's job is to cancel the composition, not close the find bar — falling through
+        // to `super` unconditionally here would otherwise let the find bar steal that Esc every time
+        // the bar happens to be open while the user is mid-composition.
+        if !hasMarkedText(), onEscape?() == true { return }
+        super.cancelOperation(sender)
     }
 }

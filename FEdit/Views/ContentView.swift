@@ -56,6 +56,13 @@ struct ContentView: View {
     // One per window (SPEC §3) — holds the open folders and selection for this window.
     @StateObject private var workspace = WorkspaceModel()
 
+    // (editor-find) Focus for the find bar's query field. Owned HERE rather than inside `FindBar`
+    // because Cmd+F must be able to move focus into the field from outside the bar — including
+    // while the bar is already open and focus sits in the editor text (criterion 17) — and because
+    // `@FocusState` only reaches views inside the scope that declares it. Driven by the
+    // `workspace.findFocusTick` handler in `body`.
+    @FocusState private var isFindFieldFocused: Bool
+
     // (cli-open) Handed to `LaunchCoordinator` on appear so an external open (`fedit`, `open -a`)
     // can create its own window — it always gets a new one, never an existing window.
     @Environment(\.openWindow) private var openWindow
@@ -162,6 +169,32 @@ struct ContentView: View {
             workspace.openPendingNewFileIfNeeded()
         }) {
             NewFileSheet(workspace: workspace)
+        }
+        // (editor-find) Cmd+F's focus half (criterion 13, criterion 17). A *tick*, not the
+        // visibility flag, so pressing Cmd+F again while the bar is already open — with focus in
+        // the sidebar filter field or in the editor text — still publishes a change and still pulls
+        // focus back into the query field. `FindBar` selects the field's contents itself on that
+        // refocus (the "and selects its contents" half) — see its `querySelection` — rather than
+        // this relying on an unverified assumption about AppKit's implicit first-responder behavior.
+        //
+        // Deferred one runloop pass, deliberately: on the FIRST Cmd+F the bar's `TextField` does
+        // not exist yet when this handler runs (`isFindBarVisible` and the tick are published in
+        // the same mutation), and a `@FocusState` write aimed at a view that is not in the window
+        // hierarchy yet is simply dropped. The same reason the file-switch cursor-restore scroll
+        // and the gutter-width report hop a turn.
+        //
+        // (editor-find, finding 7) Two-step, deliberately: `@FocusState` is a `Bool`, and a `Bool`
+        // write that lands on the value it already holds publishes nothing — `findFocusTick` exists
+        // precisely to dodge that one level up (on `isFindBarVisible`, which a second Cmd+F while
+        // already open never changes), and a direct `isFindFieldFocused = true` here reintroduces
+        // the exact same bug one level down: with focus already in the query field, a second Cmd+F
+        // would write `true` over `true` and do nothing. Forcing it through `false` first makes the
+        // final write an unconditional true transition every time.
+        .onChange(of: workspace.findFocusTick) {
+            isFindFieldFocused = false
+            DispatchQueue.main.async {
+                isFindFieldFocused = true
+            }
         }
         // (markdown-preview) High defect #1: without this, `editorFirstVisibleLine` would keep
         // holding the *previous* file's line for ~100–200 ms after a switch (until the editor's
@@ -335,6 +368,13 @@ struct ContentView: View {
                 // separator — not on it (the old gutter-width-exact inset) and not over the gutter.
                 ColumnHeaderBar(title: name, leadingInset: editorGutterWidth)
             }
+            // (editor-find) The find bar sits between the header strip and the editor, inside the
+            // editor column only — the Markdown preview column is a different subtree with its own
+            // TextKit stack and is never searched (SPEC §6.5). Gated on the model's flag, so Esc /
+            // Done / a menu Find all agree about whether it is showing.
+            if workspace.isFindBarVisible {
+                FindBar(workspace: workspace, isQueryFieldFocused: $isFindFieldFocused)
+            }
             if workspace.openFile != nil {
                 CodeEditorView(
                     text: $workspace.editorText,
@@ -360,7 +400,25 @@ struct ContentView: View {
                     // (editor-font-zoom): the live global editor font size, clamped at this read
                     // site (mirrors `clampSidebar`/`clampFraction`) so a bogus persisted value
                     // renders bounded, not at its raw magnitude.
-                    fontSize: CGFloat(clampFontSize(editorFontSize))
+                    fontSize: CGFloat(clampFontSize(editorFontSize)),
+                    // (editor-find): the find inputs, read straight off this window's model (D3 —
+                    // they must outlive the editor coordinator, which is destroyed whenever
+                    // `isMarkdown` flips and this column's `_ConditionalContent` branch changes).
+                    // The editor is a consumer of find state, never its owner.
+                    findQuery: workspace.findQuery,
+                    findCaseSensitive: workspace.findCaseSensitive,
+                    findIsActive: workspace.isFindBarVisible,
+                    findNextTick: workspace.findNextTick,
+                    // The count flows editor → model → bar, one direction only; the model's setter
+                    // drops a repeat of the label it already holds.
+                    onFindCountChange: { label in
+                        workspace.noteFindCountLabel(label)
+                    },
+                    // Esc pressed with focus in the editor TEXT (the bar's own Done button covers
+                    // Esc while the query field has focus) — criterion 18's second half.
+                    onFindClose: {
+                        workspace.closeFindBar()
+                    }
                 )
             } else {
                 Color.white

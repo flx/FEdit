@@ -108,9 +108,18 @@ land in the right menu.
 
 **D5 — Non-overlapping matches, `.literal` comparison.** `"aaaa"` / `"aa"` → 2
 matches: the scan resumes at a match's end. `.literal` (plus `.caseInsensitive`
-when the box is unchecked) so canonical-equivalence folding can never return a
-range whose length differs from the query's. Diacritics are **not** folded:
-`resume` does not match `résumé`.
+when the box is unchecked). Diacritics are **not** folded: `resume` does not
+match `résumé` (probed — no match).
+
+*Corrected in Rev 3:* Rev 2 justified `.literal` by claiming it means folding
+"can never return a range whose length differs from the query's". **That is
+false**, and a reviewer was right to doubt it. Probed: `straße`~`STRASSE` →
+length 6 for a 7-unit query; `ﬁle`~`file` → 3 for 4; `ß`~`ss` → 1 for 2.
+`.literal` suppresses *canonical decomposition*, not *case folding*, and
+case folding can expand or contract. Nothing downstream breaks — the highlighted
+range is whatever actually matched, and the scan advances by `found.length` —
+but the guarantee never existed, so criterion 4 and the code comment asserting
+it are corrected rather than defended.
 
 **D6 — Find Next only; no Find Previous.** The item enumerates Return and Cmd+G
 and nothing else. Probe 2 additionally shows Cmd+Shift+G is unclaimed, so the
@@ -159,8 +168,14 @@ behavioural, each naming the exact observation that discharges it.
    `caseSensitive == false`; `"foo"` → exactly 1 with `caseSensitive == true`.
 3. Matches are non-overlapping and strictly ascending: `"aaaa"` / `"aa"` →
    `[(0,2), (2,2)]`.
-4. Every returned range is a valid UTF-16 subrange and has
-   `length == (query as NSString).length`.
+4. Every returned range is a valid, non-empty UTF-16 subrange of the haystack,
+   and ranges are strictly ascending and non-overlapping. **Corrected in Rev 3
+   (see Decisions):** this criterion originally also asserted
+   `length == (query as NSString).length`, which is **false** — probed:
+   `("straße" as NSString).range(of: "STRASSE", options: [.literal,
+   .caseInsensitive])` returns length **6** against a 7-unit query, and `ß`~`ss`
+   returns 1 against 2. `.literal` does not prevent full case folding. The
+   harness pins the `ß`/`ss` and `ﬁ`/`fi` pairs to the real behavior.
 5. Multi-byte content: a haystack with an emoji (surrogate pair) before the
    match reports the correct UTF-16 offset, and an emoji query matches.
 6. `matches` stops at `FindMetrics.matchLimit` and reports truncation; a
@@ -207,8 +222,15 @@ behavioural, each naming the exact observation that discharges it.
 21. Two windows have independent find state: opening the bar and typing in
     window A leaves window B's bar closed and its query empty.
 22. **Cmd+G on a freshly rebuilt editor does not fire a stale step.** Press
-    Cmd+G seven times in `a.swift`, then open `notes.md`: the new editor does
-    **not** jump to a match on load.
+    Cmd+G seven times in `a.swift`, then open `notes.md`: the count reads
+    **`1 of N`**, not `2 of N`. **Reworded in Rev 3:** the original observable
+    ("the new editor does not jump to a match on load") discharged nothing — it
+    fails when the code is correct (a rebuilt coordinator re-runs the query, and
+    criterion 20 requires it to) and passes vacuously when the new file has no
+    match. The count is the observable that actually distinguishes a seeded
+    tick from an unseeded one. Separately, Rev 3 makes opening a file never
+    auto-scroll to a match, so the two file-switch paths (rebuilt vs not)
+    behave identically.
 23. **Font zoom keeps the current match visible.** With `7 of 17` showing and
     the match on screen, Cmd-+ leaves that match on screen and the count
     unchanged.
@@ -457,3 +479,116 @@ accepted, 2 refuted by probe.*
 - **Tension 3 held and the prose fixed**: tiers are a build order, not a ship
   order, and Tier 4 is the first usable point. Rev 1's "each tier independently
   revertible" oversold that.
+
+## Decisions taken — Rev 3 (code review)
+
+*2026-08-21. Two adversarial code reviewers ran blind and in parallel on the
+frozen diff. 9 + 9 findings; 10 accepted and fixed, 2 refuted by probe, 2
+deferred with reasons. Where the two reviewers disagreed, I settled it by
+measurement rather than by picking one.*
+
+**Refuted by probe (do not re-open without new evidence):**
+
+- *"A duplicate system ⌘F/⌘G already lives in the Edit menu; `.textEditing`
+  contains the Find submenu and Select All lives in `.pasteboard`."* One
+  reviewer asserted this from SDK doc comments. I dumped the real
+  `NSApp.mainMenu` of a bare SwiftUI app on this OS: **no Find submenu exists at
+  all** (Edit = Undo, Redo, ─, Cut, Copy, Paste, Delete, Select All, ─, Writing
+  Tools, AutoFill, Dictation, Emoji), zero ⌘F and zero ⌘G hits; and with these
+  commands registered there is exactly one of each, directly after Select All.
+  `TextEditingCommands` is opt-in and this app never requests it, so the
+  placement group is empty. The other reviewer read this correctly. The doc
+  comment now records *why* it lands where it does.
+- *"Temporary attributes may not survive `SyntaxHighlighter`'s pass."* Probed:
+  after a full-range `textStorage.setAttributes` in exactly the highlighter's
+  shape, the temporary attribute is still set and still paints (1851/2016
+  sampled pixels). D2 holds.
+
+**Confirmed by probe, and fixed:**
+
+- *A character replacement DOES wipe temporary attributes.* `textView.string =
+  …` → the attribute reads back `nil`; attribute-only `setAttributes` → it
+  survives. This is the distinction the redraw guard failed to model, and it
+  made highlights vanish silently on a file switch or external reload whenever
+  the recomputed match set happened to be identical. The single most valuable
+  finding of the review, found independently by both reviewers.
+- *`.literal` does not imply length-preserving matching.* `straße`~`STRASSE` →
+  length 6 vs query 7; `ﬁle`~`file` → 3 vs 4; `ß`~`ss` → 1 vs 2. Criterion 4 was
+  wrong, the code comment asserting it was wrong, and the
+  `queryLength <= haystack.length` early-out wrongly rejected expanding matches.
+
+**Also accepted and fixed:** the deletion-above re-seat bug (the current match
+silently advanced); `isFindSessionCurrent` catching only settle-point desync and
+not edit desync (stale caret on Esc within the debounce window); `clamp` never
+clearing `didTruncate` (a fabricated `+` in the count); the rebuilt-vs-
+non-rebuilt file-switch scroll inconsistency; the `@FocusState` no-op write; a
+full-set repaint per Find Next step; `clamp`'s unconditional array reallocation
+on idle passes; and a harness `1..<0` that would trap instead of failing.
+
+**Accepted but deferred, recorded rather than fixed:**
+
+- Focus is not re-asserted into the query field when the Markdown flip rebuilds
+  the bar — the bar stays open and usable, but the caret is nowhere in it.
+  Fixing it means re-asserting focus on every rebuild, which would steal focus
+  from the editor in the common case where the user was typing there. Not worth
+  that trade for this item.
+- Closing the bar may scroll the preview when the document is scrolled to its
+  very bottom (AppKit clamps the origin as the viewport grows). SUSPECTED, needs
+  a run; criterion 24's stated observation (open, then close, mid-document) is
+  unaffected.
+
+## Decisions taken — Rev 4 (re-review of the fixes)
+
+*2026-08-21. The first fix round changed control flow and guard predicates, so
+per the materiality rule the diff was re-reviewed. The re-review found the fixes
+substantially correct but caught two real remaining bugs, one of which
+falsifies a claim I wrote in Rev 3.*
+
+**Correction to Rev 3.** Rev 3 recorded that suppressing the find auto-scroll on
+a file switch "makes the two file-switch paths (rebuilt vs not) behave
+identically". **That was false**, and I am recording it rather than quietly
+fixing it: only the *scroll* was equalised. The seat was not. On a switch
+between two files of the same Markdown-ness the coordinator survives, so the
+re-run path re-seated the current match using the **previous document's** offset
+— `a.swift` at offset 3400 → `b.swift` seats on its match at 3350, showing
+`6 of 12` with the current-match highlight painted off-screen and the viewport at
+the top. Fixed by consulting `documentChangedThisPass` in the seat mode as well,
+which is what makes the Rev 3 sentence true.
+
+**The nearest-match seat moved a threshold rather than removing one.** Rev 3
+replaced first-at-or-after seating with nearest-by-distance to stop deletions
+above the current match from advancing it. The re-review showed that only holds
+while the edit is smaller than half the inter-match gap: with matches at
+100/200/300 seated on 200, deleting a 60-character line above still lands on the
+wrong match. Replaced with the rule that actually characterises the situation —
+**when the match count is unchanged, keep the ordinal index**, because an edit
+that neither adds nor removes a match cannot change which match the user was on.
+Nearest-by-distance survives only as the fallback for when the count did change.
+
+**Also fixed:** `stepFindNext` scrolled using a session its own invariant
+declares stale inside the debounce window; a `defer` sat below a guard so the
+document flag could leak into the next pass; select-all fired on *any* focus
+gain, so clicking into the middle of the query field to fix a typo selected
+everything instead of placing the caret; and Esc stole the key during IME
+marked-text composition.
+
+**Known coverage gap, recorded rather than papered over.** The three new
+coordinator-level mechanisms — `textEditGeneration`, `documentChangedThisPass`,
+`lastAppliedFindGeneration` — have **no automated coverage**;
+`scripts/FindMatchTests` reaches only the pure `FindMatcher`/`FindSession` layer.
+In particular the review's single most valuable finding (highlights vanishing
+after a file switch when the recomputed match set is value-identical) is pinned
+by no test, because reproducing it needs two files with an identical match at an
+identical offset — which no existing criterion produces. A headless oracle *is*
+possible in principle: the pixel-sampling technique used to probe temporary
+attributes for this plan (render through `drawBackground(forGlyphRange:at:)` into
+an `NSBitmapImageRep` and sample) would work, but wiring a full editor stack into
+the harness is its own item, not a line in this one. Filed as the manual check
+below rather than claimed as covered.
+
+**Manual check owed (exact path, one observation):** create two files with the
+same extension, each containing the word `hello` exactly once at the same byte
+offset (e.g. both files are literally `hello world`). Open the first, Cmd+F,
+type `hello` — the match highlights. Click the second file in the sidebar.
+**Expected: `hello` is still highlighted in the new file.** Before the fix the
+count read `1 of 1` with nothing highlighted.

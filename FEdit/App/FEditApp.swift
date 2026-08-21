@@ -60,6 +60,7 @@ struct FEditApp: App {
             // App-global, not scene-specific: one attachment builds the whole menu bar, and the
             // commands below resolve their target through `@FocusedObject`/`openWindow` anyway.
             FileCommands()
+            EditCommands()
             ViewCommands()
         }
 
@@ -74,6 +75,57 @@ struct FEditApp: App {
                 .frame(minWidth: 700, minHeight: 400)
         }
         .defaultSize(width: CGFloat(LayoutMetrics.defaultWindowWidth), height: 700)
+    }
+}
+
+/// Edit menu additions (editor-find): Find (Cmd+F) and Find Next (Cmd+G), SPEC §6.5/§10.
+///
+/// **Why menu commands rather than a key handler in the editor (D4):** a menu key equivalent is
+/// dispatched before ordinary in-field text editing, so Cmd+F reaches the editor's find bar even
+/// while the *sidebar filter field* has focus — which is exactly the item's "the two searches stay
+/// separate" requirement (criterion 13). Focused-window-scoped through the same
+/// `@FocusedObject`/`.focusedSceneObject(workspace)` route File → New…/Save already use, so two
+/// windows keep independent find state (criterion 21).
+///
+/// `CommandGroup(after: .textEditing)` places both items in AppKit's auto-installed **Edit** menu,
+/// in their own separated group directly after Select All — the conventional location. A
+/// `CommandMenu("Edit")` would create a duplicate Edit menu, the same trap `ViewCommands` records.
+///
+/// **Why "after Select All" and not "inside a pre-existing Find submenu":** SwiftUI's SDK doc
+/// comments describe `.textEditing` as already containing a Find submenu (⌘F/⌘G/⇧⌘G) plus Select
+/// All in `.pasteboard` — but that population is opt-in, via the separate `TextEditingCommands()`
+/// commands builder, which this app never requests (`.commands` below lists only `FileCommands`,
+/// `EditCommands`, `ViewCommands`). Without it, `.textEditing` is an empty placement group in this
+/// app, Select All lives in the plain default Edit menu, and this `CommandGroup` is the only thing
+/// that ever lands there — probed directly on this OS: a bare version of this app's menu bar has no
+/// Find submenu, zero ⌘F/⌘G hits, and with these commands registered there is exactly one of each,
+/// directly after Select All. Anyone tempted to "fix" this placement from the SDK docs alone should
+/// check the actual menu bar first.
+///
+/// There is deliberately **no Find Previous / Cmd+Shift+G** (the item enumerates Return and Cmd+G
+/// and nothing else); the chord is unclaimed, so pressing it does nothing rather than invoking some
+/// system behavior. Replace stays a SPEC §12 non-goal.
+struct EditCommands: Commands {
+    @FocusedObject private var workspace: WorkspaceModel?
+
+    var body: some Commands {
+        CommandGroup(after: .textEditing) {
+            Button("Find") {
+                workspace?.presentFindBar()
+            }
+            .keyboardShortcut("f", modifiers: [.command])
+            .disabled(workspace?.openFile == nil)
+
+            // Find Next has no separate model method on purpose: it is a pure "one more step"
+            // signal, and the editor — the only thing that knows where the matches are — decides
+            // what it means. A tick pressed while the bar is closed is consumed (not queued) by the
+            // editor, so it can never fire late.
+            Button("Find Next") {
+                workspace?.findNextTick += 1
+            }
+            .keyboardShortcut("g", modifiers: [.command])
+            .disabled(workspace?.openFile == nil)
+        }
     }
 }
 

@@ -197,6 +197,55 @@ final class WorkspaceModel: ObservableObject {
     /// callback, which fires `noteCursorMoved` and clears this).
     private(set) var pendingCursorRestore: Int?
 
+    // MARK: - (editor-find) Find bar state (SPEC §6.5)
+    //
+    // All six of these live HERE, on the per-window model, rather than on the editor's
+    // `Coordinator` — and that placement is the single most load-bearing decision of (editor-find)
+    // (its D3). `ContentView` puts `editorColumn` inside a `_ConditionalContent` on
+    // `workspace.isMarkdown`, so opening `notes.md` from `main.swift` **destroys and rebuilds** the
+    // coordinator; find state parked there would be silently wiped by exactly the file switch it
+    // has to survive. `WorkspaceModel` is a per-scene `@StateObject`, so it is genuinely
+    // per-window (SPEC §3: two windows have independent find state) and outlives every editor
+    // rebuild.
+    //
+    // None of these joins `WorkspaceSnapshot`: find state is deliberately **not** persisted across
+    // relaunch, so SPEC §9's table is unchanged.
+
+    /// Whether this window's find bar is showing. Drives `ContentView.editorColumn`'s bar and the
+    /// editor's `findIsActive` input; flipping it to `false` is what removes every highlight.
+    @Published var isFindBarVisible = false
+
+    /// The literal search text, two-way bound to the bar's `TextField`. Survives a file switch and
+    /// re-runs against the new file (criterion 20), and survives closing the bar so re-opening
+    /// restores it (criterion 19).
+    @Published var findQuery = ""
+
+    /// The bar's visible **Case sensitive** checkbox, unchecked by default (SPEC §6.5).
+    @Published var findCaseSensitive = false
+
+    /// Bumped by Cmd+F **every** time, including while the bar is already open — which is the case
+    /// a plain `Bool` cannot express (criterion 17: Cmd+F with focus in the editor text must pull
+    /// focus back into the query field). `ContentView` moves `@FocusState` on each change.
+    @Published var findFocusTick = 0
+
+    /// Bumped by Return in the query field and by Cmd+G: one Find Next step. A counter rather than
+    /// a flag for the same reason as `findFocusTick` — a repeated `Bool` write of the same value
+    /// publishes nothing, so a plain flag could not signal a second press at all.
+    ///
+    /// (editor-find, finding 7, second round) That said, this is consumed as a LEVEL, not a delta:
+    /// the editor's `lastConsumedFindTick != findNextTick` check (`CodeEditorView.updateNSView`)
+    /// steps exactly once per `updateNSView` pass in which the value differs, however far it moved.
+    /// Two presses landing between two such passes therefore step ONCE, not twice — the level form
+    /// is the right trade here (a delta/replay-count loop would reintroduce the exact replay hazard
+    /// criterion 22 exists to avoid on a rebuilt editor), but it means "step twice" is not a
+    /// guarantee this counter makes.
+    @Published var findNextTick = 0
+
+    /// The bar's count readout (`3 of 17` / `Not found` / `3 of 20000+` / `""`). Written **only**
+    /// by the editor through `noteFindCountLabel(_:)` and read only by the bar: the count flows
+    /// editor → model → bar, one direction, so there is no bar↔editor cycle to reason about.
+    @Published private(set) var findCountLabel = ""
+
     /// The in-flight debounced autosave write, cancel-and-rescheduled on every edit (mirrors
     /// `CodeEditorView`'s `pendingHighlight` idiom). Nil when nothing is pending. Cancelled by
     /// `cancelPendingAutosave()` on a file switch / explicit save, and its work item re-checks
@@ -1188,6 +1237,39 @@ final class WorkspaceModel: ObservableObject {
         guard let marker = waitMarkerURL else { return }
         waitMarkerURL = nil
         try? FileManager.default.removeItem(at: marker)
+    }
+
+    // MARK: - (editor-find) Find bar (SPEC §6.5)
+
+    /// Cmd+F. Opens this (the focused) window's find bar and asks `ContentView` to put focus in the
+    /// query field — **both**, every time, which is why the focus half is a counter and not the
+    /// visibility flag: pressing Cmd+F while the bar is already open (focus in the editor text)
+    /// must pull focus back into the field and select its contents (criterion 17), and a `Bool`
+    /// that is already `true` publishes nothing.
+    ///
+    /// The query is deliberately left as it is, so re-opening restores the previous search and
+    /// re-runs it (criterion 19).
+    func presentFindBar() {
+        isFindBarVisible = true
+        findFocusTick += 1
+    }
+
+    /// Esc / the bar's Done button. Hiding the bar drives `findIsActive` false in the editor, which
+    /// removes every temporary highlight and — once — places the caret at the current match (the
+    /// find plan's D9: stepping scrolls, closing moves the caret, so a session of N Find Next
+    /// presses costs one snapshot write instead of N).
+    func closeFindBar() {
+        isFindBarVisible = false
+    }
+
+    /// Sink for `CodeEditorView`'s `onFindCountChange` callback — the editor is the only writer of
+    /// the count, because it is the only place that knows how many matches there are. Guarded on
+    /// inequality (mirroring `scheduleGitRefresh`'s empty-set guard): this is `@Published`, and an
+    /// unconditional assignment would fire `objectWillChange` — re-rendering the whole window —
+    /// every time a rebuilt coordinator re-reported a label the bar is already showing.
+    func noteFindCountLabel(_ label: String) {
+        guard findCountLabel != label else { return }
+        findCountLabel = label
     }
 
     // MARK: - New file creation (SPEC §7, §10)

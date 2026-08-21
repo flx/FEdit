@@ -9,6 +9,7 @@ The motivation: editing a couple of kB of text should not cost a gigabyte of RAM
 - **Three-column window** — folder sidebar, editor, and a Markdown preview column that appears only while a Markdown file is open. Draggable, persisted splits (1/3 · 1/3 · 1/3 by default), each column topped by a fixed header strip (folder name(s), open file name, "Preview"). Windows are independent: each has its own folders, filter, open file and cursor.
 - **Folder sidebar** — open multiple top-level folders (each its own section, `~`-abbreviated header, Remove/Refresh menu); expandable tree view, or a flat filtered list driven by a boolean query language (`.py OR .swift`, `AND` binds tighter than `OR`, space = union, `^`/`$` anchor a term to the start/end of the path). Scanning runs off the main thread — the window is usable while a big root fills in behind a `Scanning…` placeholder — and each root's tree is capped at ~50,000 entries, filled breadth-first, with a notice in that section when the cap is hit. Sidebar roots and the open file are watched (FSEvents / vnode) so external adds, removes and edits are reflected automatically. Files whose working-tree content differs from `HEAD` show a read-only "(changed)" badge when the root is a git repo.
 - **Editor** — line numbers, soft wrapping, lightweight regex-based syntax highlighting for Swift, Python and Markdown; opens any UTF-8 (Latin-1 fallback) text file; font size zoom (Cmd-+ / Cmd-− / Cmd-0), app-wide and persisted.
+- **Find in the editor text** — Cmd+F opens a find bar over the editor (never the preview): literal matching with a visible **Case sensitive** checkbox (off by default), every match highlighted with the current one distinguished, Return / Cmd+G to step and wrap, a `3 of 17` count, Esc to close. No regex and no replace, by design.
 - **Markdown preview** — rendered natively (no WKWebView), with approximate scroll sync: the preview follows the first line visible in the editor.
 - **Save flow** — explicit save (Cmd+S), plus unconditional, always-on debounced autosave (no toggle) on typing pause, file switch, window close and quit. A clean buffer is reloaded when the file changes underneath you; a dirty one is kept and the window subtitle says "changed on disk" until the next save wins. The only surviving dialog is a minimal "Close Without Saving / Cancel" escape when a close/quit flush fails.
 - **File creation** — File → New… (Cmd+N) creates a file via a filename sheet in the current folder.
@@ -23,11 +24,13 @@ The motivation: editing a couple of kB of text should not cost a gigabyte of RAM
 | Cmd+O | Open Folder… — opens a **new window** and prompts for its sole root |
 | Cmd+Shift+O | Add Folder to Window… — add root(s) to the focused window |
 | Cmd+S | Save (autosave is always on regardless) |
+| Cmd+F | Find — open the find bar over the editor text (Esc closes it) |
+| Cmd+G | Find Next — step to the next match, wrapping at the end |
 | Cmd-+ / Cmd-− / Cmd-0 | Increase / decrease / reset the editor font size |
 
 ## Status
 
-v1 feature-complete: every planned item has shipped (see [DONE.md](DONE.md); [TODO.md](TODO.md) is empty). [SPEC.md](SPEC.md) is the maintained implementation contract — kept in sync with each shipped change, and the place to look for exact behavior. It also absorbed the original one-page pitch, which used to live in `Specification.md`.
+v1 feature-complete: everything in the original plan has shipped (see [DONE.md](DONE.md)); [TODO.md](TODO.md) carries the open work that has been filed since. [SPEC.md](SPEC.md) is the maintained implementation contract — kept in sync with each shipped change, and the place to look for exact behavior. It also absorbed the original one-page pitch, which used to live in `Specification.md`.
 
 ## Requirements
 
@@ -38,7 +41,7 @@ v1 feature-complete: every planned item has shipped (see [DONE.md](DONE.md); [TO
 
 Open `FEdit.xcodeproj` in Xcode and Run. No third-party dependencies.
 
-A handful of pure-logic modules (filter query, filter row caching, markdown renderer, git status parsing, file tree scanning, per-root scan scheduling, watcher skip gating, session snapshots, line counting, command-line path mapping, `--wait` marker claiming) also have standalone `swiftc`-run regression harnesses — ten of them under `scripts/*/main.swift`, used in place of an XCTest target; the `fedit` shim has a shell one at `scripts/FeditShimTests/run.sh`.
+A handful of pure-logic modules (filter query, filter row caching, markdown renderer, git status parsing, file tree scanning, per-root scan scheduling, watcher skip gating, session snapshots, line counting, command-line path mapping, `--wait` marker claiming, find match enumeration and stepping) also have standalone `swiftc`-run regression harnesses — eleven of them under `scripts/*/main.swift`, used in place of an XCTest target; the `fedit` shim has a shell one at `scripts/FeditShimTests/run.sh`.
 
 Each harness's header comment carries the exact command that builds and runs it, e.g.
 

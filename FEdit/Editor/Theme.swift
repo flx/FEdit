@@ -116,6 +116,23 @@ enum Theme {
     /// Inline-code / fenced-code-block background: light gray.
     static let codeBackground = NSColor(srgbRed: 0.94, green: 0.94, blue: 0.94, alpha: 1)
 
+    /// (editor-find) Background behind every find match in the editor (SPEC §6.5): pale yellow,
+    /// chosen light enough that `Theme.text` stays legible on it. Applied as an **`NSLayoutManager`
+    /// temporary attribute**, never a text-storage attribute — so `SyntaxHighlighter.highlight`'s
+    /// opening `textStorage.setAttributes(…, range: fullRange)` cannot wipe it, and it does not
+    /// fight the Markdown code-span rules for the `.backgroundColor` key. A temporary attribute
+    /// *replaces* the storage's value for that key while drawing (it does not composite), which is
+    /// exactly what makes a match inside a code span show the match colour.
+    ///
+    /// Defined with literal components on purpose, like `codeFont`: `Theme` is compiled standalone
+    /// by the `markdown-renderer` harness, so it must not reference any symbol outside itself.
+    static let findMatchBackground = NSColor(srgbRed: 1.0, green: 0.92, blue: 0.35, alpha: 1)
+
+    /// (editor-find) Background behind the **current** match — the one Find Next has stepped to and
+    /// scrolled into view (SPEC §6.5). Deliberately a different hue from `findMatchBackground`, not
+    /// merely a different shade, so "which one am I on" survives at a glance.
+    static let findCurrentMatchBackground = NSColor(srgbRed: 1.0, green: 0.60, blue: 0.20, alpha: 1)
+
     /// Muted/secondary text color — blockquotes and the preview's own gutter-like chrome reuse
     /// this later; not consumed by the editor's own gutter (`LineNumberRulerView` keeps its own
     /// colors per the plan's explicit exclusion).

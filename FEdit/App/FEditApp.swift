@@ -78,7 +78,8 @@ struct FEditApp: App {
     }
 }
 
-/// Edit menu additions (editor-find): Find (Cmd+F) and Find Next (Cmd+G), SPEC §6.5/§10.
+/// Edit menu additions (editor-find): Find (Cmd+F) and Find Next (Cmd+G); (editor-find-previous):
+/// Find Previous (Cmd+Shift+G). SPEC §6.5/§10.
 ///
 /// **Why menu commands rather than a key handler in the editor (D4):** a menu key equivalent is
 /// dispatched before ordinary in-field text editing, so Cmd+F reaches the editor's find bar even
@@ -87,7 +88,7 @@ struct FEditApp: App {
 /// `@FocusedObject`/`.focusedSceneObject(workspace)` route File → New…/Save already use, so two
 /// windows keep independent find state (criterion 21).
 ///
-/// `CommandGroup(after: .textEditing)` places both items in AppKit's auto-installed **Edit** menu,
+/// `CommandGroup(after: .textEditing)` places all three items in AppKit's auto-installed **Edit** menu,
 /// in their own separated group directly after Select All — the conventional location. A
 /// `CommandMenu("Edit")` would create a duplicate Edit menu, the same trap `ViewCommands` records.
 ///
@@ -102,9 +103,20 @@ struct FEditApp: App {
 /// directly after Select All. Anyone tempted to "fix" this placement from the SDK docs alone should
 /// check the actual menu bar first.
 ///
-/// There is deliberately **no Find Previous / Cmd+Shift+G** (the item enumerates Return and Cmd+G
-/// and nothing else); the chord is unclaimed, so pressing it does nothing rather than invoking some
-/// system behavior. Replace stays a SPEC §12 non-goal.
+/// **Find Previous / Cmd+Shift+G was added by (editor-find-previous)** — (editor-find) shipped
+/// without it only because that item enumerated Return and Cmd+G and nothing else.
+///
+/// **Be careful what the probe above does and does not establish.** It measured that this app
+/// installs no Find submenu and that a bare menu bar has zero ⌘F/⌘G hits; it did **not** record a
+/// ⇧⌘G result. `plans/editor-find.plan.md:125` asserted "Probe 2 additionally shows Cmd+Shift+G is
+/// unclaimed", but Probe 2's own recorded text (`:36-39`) says only Cmd+F and Cmd+G — so that
+/// sentence, and the TODO item that repeated it, were an inference wearing a measurement's clothes.
+/// It is not repeated here. What IS established: `TextEditingCommands()` is never requested, so
+/// `.textEditing` is an empty placement group and AppKit installs no Find submenu for anything to
+/// hide in; and — verified by grepping every `keyboardShortcut` in this target — no other FEdit
+/// command binds ⇧⌘G (⇧⌘O is Add Folder to Window). A *system*-level ⇧⌘G claim outside this app's
+/// own menu bar remains reasoned, not measured; the cost if that reasoning is wrong is a duplicate
+/// key equivalent, not a crash. Replace stays a SPEC §12 non-goal.
 struct EditCommands: Commands {
     @FocusedObject private var workspace: WorkspaceModel?
 
@@ -124,6 +136,17 @@ struct EditCommands: Commands {
                 workspace?.findNextTick += 1
             }
             .keyboardShortcut("g", modifiers: [.command])
+            .disabled(workspace?.openFile == nil)
+
+            // (editor-find-previous) The backwards twin, on its own tick rather than a direction
+            // flag beside `findNextTick` (D1: the ticks are consumed as levels, and a companion
+            // flag is not covered by that comparison). Same "pure one-more-step signal" contract as
+            // Find Next above — the editor decides what it means, and consumes a press made while
+            // the bar is closed rather than queueing it.
+            Button("Find Previous") {
+                workspace?.findPreviousTick += 1
+            }
+            .keyboardShortcut("g", modifiers: [.command, .shift])
             .disabled(workspace?.openFile == nil)
         }
     }

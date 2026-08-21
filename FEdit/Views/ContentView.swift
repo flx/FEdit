@@ -409,6 +409,7 @@ struct ContentView: View {
                     findCaseSensitive: workspace.findCaseSensitive,
                     findIsActive: workspace.isFindBarVisible,
                     findNextTick: workspace.findNextTick,
+                    findPreviousTick: workspace.findPreviousTick,
                     // The count flows editor → model → bar, one direction only; the model's setter
                     // drops a repeat of the label it already holds.
                     onFindCountChange: { label in

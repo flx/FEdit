@@ -148,6 +148,27 @@ struct FindSession: Equatable {
         currentIndex = ((currentIndex ?? -1) + 1) % matches.count
     }
 
+    /// (editor-find-previous) Find Previous (Cmd+Shift+G): retreat to the previous match, wrapping
+    /// past the first one back to the last (SPEC §6.5) — the exact mirror of `stepNext` above, and a
+    /// no-op with no matches for the same reason (criterion 3: it must not invent a seat, which is
+    /// what a `nil` `currentIndex` means).
+    ///
+    /// **`+ matches.count - 1` rather than `- 1` is load-bearing, not stylistic.** Swift's `%` is a
+    /// remainder, not a modulus: it takes the sign of its LEFT operand, so at index 0 the naive
+    /// `(0 - 1) % count` is `-1`, not `count - 1`. That is not a wrap — it is an invalid index, and
+    /// the very next `currentRange`/`matches[currentIndex]` read would be an out-of-bounds trap
+    /// rather than the first-to-last jump the user asked for. Adding `matches.count` first keeps the
+    /// left operand non-negative for every reachable input, so the `%` genuinely wraps.
+    ///
+    /// **`?? 0` mirrors `stepNext`'s `?? -1`** (D3): both mean "step from just outside the array, in
+    /// the direction of travel". Unseated-but-non-empty is unreachable while the type's invariant
+    /// holds, but if it were ever reached, stepping backwards from `0` lands on `count - 1` — the
+    /// last match — exactly as `stepNext`'s `-1` lands on the first.
+    mutating func stepPrevious() {
+        guard !matches.isEmpty else { return }
+        currentIndex = ((currentIndex ?? 0) + matches.count - 1) % matches.count
+    }
+
     /// **The anti-`NSRangeException` operation.** Drops every match that does not fit entirely
     /// inside a text of `length` UTF-16 units and re-seats `currentIndex` into what survives.
     ///

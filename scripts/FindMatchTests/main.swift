@@ -423,6 +423,112 @@ do {
     check(session.matches.isEmpty, "stepNext on an empty match array invents no matches")
 }
 
+// MARK: - (editor-find-previous) stepPrevious retreats and wraps
+
+section("(editor-find-previous) stepPrevious")
+do {
+    // The same 17-match text criterion 8 steps forward through, so the wrap under test is 0 -> 16.
+    let text = String(repeating: "q.", count: 17) as NSString
+    var session = FindSession()
+    session.query = "q"
+    session.recompute(text: text, caretLocation: 0)
+    check(session.matches.count == 17, "sanity: 17 matches")
+    check(session.currentIndex == 0, "sanity: seated on the first")
+
+    // Walk forward to the end first, so the retreat below starts from a seat that was reached the
+    // ordinary way rather than one poked in by hand.
+    for _ in 1...16 { session.stepNext() }
+    check(session.currentIndex == 16, "sanity: 16 stepNext calls seat on the last match")
+
+    for expected in stride(from: 15, through: 0, by: -1) {
+        session.stepPrevious()
+        check(session.currentIndex == expected, "stepPrevious retreats to \(expected)")
+    }
+    session.stepPrevious()
+    check(session.currentIndex == 16, "stepPrevious at the FIRST match (1 of 17) wraps to 16")
+    check(session.currentRange == r(32, 1), "after the wrap, currentRange is the last match")
+}
+do {
+    // Criterion 3: the mirror of criterion 8's empty-array case, built exactly the same way — a
+    // query that matches nothing at all, so `recompute` leaves the session unseated and empty.
+    var session = FindSession()
+    session.query = "zzz"
+    session.recompute(text: "aaa" as NSString, caretLocation: 0)
+    session.stepPrevious()
+    check(session.currentIndex == nil, "stepPrevious on an empty match array is a no-op (currentIndex stays nil)")
+    check(session.matches.isEmpty, "stepPrevious on an empty match array invents no matches")
+}
+do {
+    // Criterion 4: the unseated-but-NON-empty branch (`currentIndex == nil` with matches present).
+    // No sequence of `recompute`/`stepNext`/`stepPrevious`/`clamp`/`clear` can reach this state —
+    // every mutating member preserves the type's seated-exactly-when-non-empty invariant, and
+    // `currentIndex`/`matches` are `private(set)`, so the technique the empty-array case above uses
+    // cannot build it. It is reachable here only through the SYNTHESIZED memberwise initializer,
+    // which is internal and therefore visible to this harness for the reason the file header gives
+    // (multi-file `swiftc` yields one module). Nothing was added to `FindSession` to reach it. The
+    // case is pinned rather than skipped because `?? 0` is the only line of `stepPrevious` that no
+    // other test covers, and an unreachable branch with no test is a branch that rots into `?? -1`
+    // (which would seat on the FIRST match here, not the last) at the first careless copy-paste.
+    var session = FindSession(
+        query: "q",
+        caseSensitive: false,
+        matches: [r(0, 1), r(2, 1), r(4, 1)],
+        didTruncate: false,
+        currentIndex: nil
+    )
+    check(session.currentIndex == nil, "sanity: the hand-built session is non-empty but unseated")
+    session.stepPrevious()
+    check(session.currentIndex == 2, "stepPrevious on a non-empty UNSEATED session seats on the LAST match")
+    check(session.currentRange == r(4, 1), "... and currentRange is that last match, not an invalid index")
+}
+do {
+    // Criterion 5: stepNext followed by stepPrevious is the identity, from EVERY index — including
+    // both wrap edges (index 0's backwards wrap and the last index's forwards wrap), which is where
+    // an off-by-one or a negative-remainder bug would hide.
+    let text = String(repeating: "q.", count: 9) as NSString
+    var session = FindSession()
+    session.query = "q"
+    session.recompute(text: text, caretLocation: 0)
+    check(session.matches.count == 9, "sanity: 9 matches for the round-trip sweep")
+
+    var roundTripMismatches = 0
+    for index in 0..<9 {
+        // Seat on `index` the ordinary way: recompute at the caret, then step forward `index` times.
+        session.recompute(text: text, caretLocation: 0)
+        for _ in 0..<index { session.stepNext() }
+        check(session.currentIndex == index, "sanity: seated on \(index) for the round trip")
+
+        session.stepNext()
+        session.stepPrevious()
+        if session.currentIndex != index { roundTripMismatches += 1 }
+    }
+    check(roundTripMismatches == 0, "stepNext then stepPrevious returns to the original index, from all 9 indices")
+
+    // And the other order, which crosses the wrap edges the other way round.
+    var reverseMismatches = 0
+    for index in 0..<9 {
+        session.recompute(text: text, caretLocation: 0)
+        for _ in 0..<index { session.stepNext() }
+        session.stepPrevious()
+        session.stepNext()
+        if session.currentIndex != index { reverseMismatches += 1 }
+    }
+    check(reverseMismatches == 0, "stepPrevious then stepNext returns to the original index, from all 9 indices")
+}
+do {
+    // Criterion 6: the count label reads the NEW ordinal after a step back, including the wrap.
+    let text = String(repeating: "q.", count: 17) as NSString
+    var session = FindSession()
+    session.query = "q"
+    session.recompute(text: text, caretLocation: 0)
+    session.stepNext()
+    check(session.countLabel == "2 of 17", "sanity: one step forward -> \"2 of 17\"")
+    session.stepPrevious()
+    check(session.countLabel == "1 of 17", "stepPrevious back to the first -> \"1 of 17\"")
+    session.stepPrevious()
+    check(session.countLabel == "17 of 17", "stepPrevious wrapping off the front -> \"17 of 17\"")
+}
+
 // MARK: - Criterion 9: clamp(toLength:) — the anti-NSRangeException invariant
 
 section("Criterion 9: clamp(toLength:)")
@@ -642,7 +748,7 @@ do {
     var sawNonEmpty = false
 
     for _ in 0..<20_000 {
-        switch rng.nextInt(upperBound: 4) {
+        switch rng.nextInt(upperBound: 5) {
         case 0:
             session.query = queries[rng.nextInt(upperBound: queries.count)]
             session.caseSensitive = rng.nextInt(upperBound: 2) == 0
@@ -650,8 +756,32 @@ do {
             let text = corpus.substring(to: length) as NSString
             session.recompute(text: text, caretLocation: rng.nextInt(upperBound: corpus.length + 5))
             bound = text.length
+        case 4:
+            // (editor-find-previous, adv-review-edge finding 2) `recomputeNearest` was missing from
+            // this op alphabet — a gap inherited from (editor-find), not introduced by this item,
+            // but one that made this item's own load-bearing assumption ("if stepPrevious needs a
+            // change to the other mutating members, the randomized run is what catches it") weaker
+            // than it claimed. It is the ONE mutating member the live Find Previous path actually
+            // invokes that this run never built: `stepFind` calls `reenumerateFindSession(...,
+            // seatOnNearest: true)` when the session is stale-by-edit, which is `recomputeNearest`.
+            // Without this case the run could not construct a single `stepPrevious`-after-
+            // `recomputeNearest` interleaving, which is precisely the sequence a Cmd+Shift+G pressed
+            // inside the ~150 ms debounce window produces.
+            let length = rng.nextInt(upperBound: corpus.length + 1)
+            let text = corpus.substring(to: length) as NSString
+            session.recomputeNearest(text: text, near: rng.nextInt(upperBound: corpus.length + 5))
+            bound = text.length
         case 1:
-            session.stepNext()
+            // (editor-find-previous, criterion 7) Both step directions ride this one op slot,
+            // chosen by the same seeded generator, so the randomized run mixes forwards and
+            // backwards steps against every session shape it builds — a `stepPrevious` that
+            // produced a negative or out-of-bounds `currentIndex` would surface as a seat mismatch
+            // (or, past a clamp, a range violation) in the assertions below, which are unchanged.
+            if rng.nextInt(upperBound: 2) == 0 {
+                session.stepNext()
+            } else {
+                session.stepPrevious()
+            }
         case 2:
             let newLength = rng.nextInt(upperBound: bound + 1)
             let before = session.matches.count

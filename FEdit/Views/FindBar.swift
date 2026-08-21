@@ -38,7 +38,12 @@ import SwiftUI
 /// `isFindBarVisible = false` can never desync a private copy. The one exception is the count
 /// label, which flows one way (editor → `workspace.findCountLabel` → here).
 ///
-/// Deliberately **no Replace UI** (SPEC §12 keeps replace a non-goal) and no Find Previous (D6).
+/// Deliberately **no Replace UI** (SPEC §12 keeps replace a non-goal), and deliberately **no
+/// Find Previous button** (D6) — note that this is now a statement about the BAR's controls only,
+/// not about the feature: (editor-find-previous) added Find Previous as an Edit-menu item on
+/// Cmd+Shift+G, and it needs no surface here for the same reason Find Next does not have a button
+/// either. The bar's controls stay query field / Case sensitive / count / Done. There is also no
+/// Shift+Return route to it, because `.onSubmit` below carries no modifier information.
 struct FindBar: View {
     @ObservedObject var workspace: WorkspaceModel
 

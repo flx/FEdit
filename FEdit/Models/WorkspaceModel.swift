@@ -241,6 +241,26 @@ final class WorkspaceModel: ObservableObject {
     /// guarantee this counter makes.
     @Published var findNextTick = 0
 
+    /// (editor-find-previous) Bumped by Cmd+Shift+G: one Find Previous step. Everything
+    /// `findNextTick`'s comment above says applies verbatim — counter rather than flag, consumed as
+    /// a LEVEL against the editor's `lastConsumedFindPreviousTick`, two presses between two
+    /// `updateNSView` passes step once. It is read in its **own** `if` block in
+    /// `CodeEditorView.updateNSView`, immediately after — not inside — the one that reads
+    /// `findNextTick`; two separate level comparisons is precisely the point of D1 below, and a
+    /// single shared block could not provide it.
+    ///
+    /// **Why a SECOND counter rather than `findNextTick` plus a direction flag (D1).** Precisely
+    /// because the tick is level-compared and not a delta: a `findStepBackwards: Bool` stored beside
+    /// a single `findStepTick` is a second variable that the level comparison does not cover. Press
+    /// Cmd+G then Cmd+Shift+G inside one SwiftUI update pass and the editor would see the flag at
+    /// its LAST value (backwards) with a tick delta of 2, and take one step in the wrong direction —
+    /// the forward press vanishes and the backward one is what runs. Two independent counters have
+    /// no such coupling: each is consumed exactly once against its own last-consumed value, so the
+    /// same double press steps once forwards and once backwards (or, if they land in one pass, once
+    /// each — never one step in a direction nobody pressed last). The cost is one extra `Int` per
+    /// window.
+    @Published var findPreviousTick = 0
+
     /// The bar's count readout (`3 of 17` / `Not found` / `3 of 20000+` / `""`). Written **only**
     /// by the editor through `noteFindCountLabel(_:)` and read only by the bar: the count flows
     /// editor → model → bar, one direction, so there is no bar↔editor cycle to reason about.

@@ -89,6 +89,15 @@ struct CodeEditorView: NSViewRepresentable {
     /// this very value so a rebuilt editor cannot replay the previous editor's steps (criterion 22).
     var findNextTick: Int = 0
 
+    /// (editor-find-previous) Find Previous's monotonically increasing tick
+    /// (`WorkspaceModel.findPreviousTick`), bumped by Cmd+Shift+G — there is no Return-key route to
+    /// this one (SwiftUI's `.onSubmit` carries no modifier information, so the bar's query field
+    /// cannot tell Return from Shift+Return). Consumed against
+    /// `Coordinator.lastConsumedFindPreviousTick`, which `makeNSView` seeds from this very value for
+    /// the same reason it seeds `lastConsumedFindTick`: a rebuilt editor must not replay the
+    /// previous editor's steps (criterion 22 of (editor-find), criterion 9 of this item).
+    var findPreviousTick: Int = 0
+
     /// Fires with the find bar's count readout (`3 of 17` / `Not found` / `3 of 20000+` / `""`)
     /// whenever it changes. The count flows editor → model → bar, one direction only.
     var onFindCountChange: ((String) -> Void)? = nil
@@ -212,6 +221,12 @@ struct CodeEditorView: NSViewRepresentable {
         // means a rebuilt editor starts already up to date — this is the house one-shot convention
         // (`hasConsumedCursorRestore`, `pendingNewWindowPicks`, the `CLIOpenToken` issued-id guard).
         coordinator.lastConsumedFindTick = findNextTick
+        // (editor-find-previous, criterion 9) The identical seeding for the backwards tick, and it
+        // is load-bearing for the identical reason: `findPreviousTick` also lives on
+        // `WorkspaceModel` and also keeps counting for the life of the window, so a fresh
+        // coordinator starting it at 0 would read the window's accumulated Cmd+Shift+G presses as
+        // one brand-new step and jump the just-opened file to a match on load.
+        coordinator.lastConsumedFindPreviousTick = findPreviousTick
         coordinator.observeClipViewBounds(scrollView.contentView)
 
         return scrollView
@@ -443,6 +458,20 @@ struct CodeEditorView: NSViewRepresentable {
                 coordinator.stepFindNext(textView)
             }
         }
+
+        // (editor-find-previous) Find Previous (Cmd+Shift+G), the exact mirror of the block above
+        // and deliberately a SEPARATE tick rather than a direction flag on that one (D1 — the ticks
+        // are consumed as levels, which a companion flag would not be covered by). Same shape
+        // throughout: consumed UNCONDITIONALLY, so a Cmd+Shift+G pressed while the bar was closed
+        // can never be replayed as a surprise jump when it next opens, and stepped only while the
+        // bar is showing. `lastConsumedFindPreviousTick` is seeded in `makeNSView` for the same
+        // rebuilt-coordinator reason (criterion 9).
+        if coordinator.lastConsumedFindPreviousTick != findPreviousTick {
+            coordinator.lastConsumedFindPreviousTick = findPreviousTick
+            if findIsActive {
+                coordinator.stepFindPrevious(textView)
+            }
+        }
     }
 
     /// (editor-find, finding 19) Deterministic teardown: SwiftUI calls this when the representable
@@ -517,6 +546,15 @@ struct CodeEditorView: NSViewRepresentable {
         /// never replays the window's accumulated Find Next presses (criterion 22). `nil` would mean
         /// "never seeded", which `makeNSView` makes unreachable.
         var lastConsumedFindTick: Int?
+
+        /// (editor-find-previous) The last `findPreviousTick` this editor acted on — the backwards
+        /// twin of `lastConsumedFindTick`, with the same seeding rule (**seeded in `makeNSView`**
+        /// from the incoming tick, so a coordinator rebuilt mid-life never replays the window's
+        /// accumulated Find Previous presses) and the same meaning for `nil` ("never seeded", which
+        /// `makeNSView` makes unreachable). Independent of `lastConsumedFindTick` on purpose: each
+        /// tick is level-compared against its own last-consumed value, which is exactly what a
+        /// single tick plus a direction flag could not give (D1).
+        var lastConsumedFindPreviousTick: Int?
 
         /// Counts the points at which the editor's text has *settled*: bumped once per
         /// `highlightNow`, i.e. by the debounced pass and by the three synchronous passes (file
@@ -847,6 +885,30 @@ struct CodeEditorView: NSViewRepresentable {
         /// Find Next (Return / Cmd+G): advance the seat, redraw, scroll the new current match into
         /// view, report the new count. Never touches the selection (D9).
         func stepFindNext(_ textView: NSTextView) {
+            stepFind(textView, backwards: false)
+        }
+
+        /// (editor-find-previous) Find Previous (Cmd+Shift+G): retreat the seat, with the identical
+        /// redraw, scroll, count report and no-selection rule as Find Next above.
+        ///
+        /// **There is no Return-key route, and the reason matters more than the absence.**
+        /// `FindBar`'s `.onSubmit` carries no modifier information, so the query field cannot
+        /// distinguish Shift+Return from Return — which means ⇧↩ in that field is not inert, it is
+        /// an ordinary submit that steps **forward**. A user reaching for the Safari/Xcode ⇧↩
+        /// Find-Previous reflex therefore gets the opposite of what they wanted, silently. That is a
+        /// known, documented limitation (SPEC §6.5 says so explicitly), not an oversight: making ⇧↩
+        /// work needs an `NSViewRepresentable` query field or a key monitor, both out of scope here.
+        func stepFindPrevious(_ textView: NSTextView) {
+            stepFind(textView, backwards: true)
+        }
+
+        /// (editor-find-previous, D2) The whole step path, shared by both directions — the only
+        /// direction-dependent line in it is the `stepPrevious()`/`stepNext()` call. Extracted
+        /// rather than copied because the stale-by-edit re-enumeration guard below is the
+        /// (editor-find) finding-3 fix, and a second copy of a guard that subtle is a live drift
+        /// risk against exactly the defect it exists to prevent; the recolor pair, the scroll and
+        /// the count report are direction-independent for the same reason.
+        private func stepFind(_ textView: NSTextView, backwards: Bool) {
             // (editor-find, finding 3, second round) `isFindSessionCurrent`'s doc comment calls the
             // ranges NOT safe to act on as if current while stale-by-edit — and scrolling to the
             // stepped-to match is exactly that. Failing case without this: paste text above the
@@ -863,18 +925,23 @@ struct CodeEditorView: NSViewRepresentable {
             if !isFindSessionCurrent, let textStorage = textView.textStorage {
                 reenumerateFindSession(textView, textStorage: textStorage, seatOnNearest: true)
             }
-            // With nothing to step to, `stepNext()` is a no-op — returning early additionally skips
-            // a pointless full-range attribute removal and the redraw it would invalidate.
+            // With nothing to step to, `stepNext()`/`stepPrevious()` is a no-op — returning early
+            // additionally skips a pointless full-range attribute removal and the redraw it would
+            // invalidate.
             guard !findSession.matches.isEmpty else { return }
             let previousRange = findSession.currentRange
-            findSession.stepNext()
+            if backwards {
+                findSession.stepPrevious()
+            } else {
+                findSession.stepNext()
+            }
             // (editor-find, finding 8) Recolor only the two ranges that actually changed color — the
             // match that WAS current (back to the ordinary match color) and the match that IS now
             // current (to the distinct color) — rather than `applyFindHighlights`'s full
             // remove-over-everything-then-add-per-match pass. Every OTHER match's temporary
             // attribute is untouched and still exactly right, because nothing between here and the
-            // last full repaint mutated a character (`stepFindNext` never does). Holding Cmd+G on a
-            // capped 20,000-match search would otherwise repeat a full-range
+            // last full repaint mutated a character (a step never does). Holding Cmd+G or
+            // Cmd+Shift+G on a capped 20,000-match search would otherwise repeat a full-range
             // `removeTemporaryAttribute` plus up to 20,000 `addTemporaryAttributes` calls per press.
             recolorFindMatch(textView, range: previousRange, color: Theme.findMatchBackground)
             recolorFindMatch(textView, range: findSession.currentRange, color: Theme.findCurrentMatchBackground)
@@ -883,8 +950,8 @@ struct CodeEditorView: NSViewRepresentable {
         }
 
         /// (editor-find, finding 8) Sets exactly one match's temporary background color — the
-        /// building block `stepFindNext` uses instead of a full `applyFindHighlights` repaint.
-        /// `range` is `nil` only when there is nothing to recolor (defensive; `stepFindNext`'s
+        /// building block `stepFind` uses instead of a full `applyFindHighlights` repaint.
+        /// `range` is `nil` only when there is nothing to recolor (defensive; `stepFind`'s
         /// non-empty-matches guard makes both ranges it passes non-nil in practice, by the same
         /// invariant `FindSession.currentRange` documents). Intersected with the storage's full
         /// range for the same reason `applyFindHighlights` is.

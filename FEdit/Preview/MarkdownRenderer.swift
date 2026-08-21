@@ -70,10 +70,14 @@ enum MarkdownBlock: Equatable {
 /// classifies each line in the fixed precedence order of the plan's criterion 8:
 ///
 ///   inside-fence state → fence open → blank → heading → horizontal rule → blockquote → list item
-///   → paragraph continuation
+///   → list-item continuation → paragraph continuation
 ///
 /// Paragraphs merge consecutive non-blank lines with a single space; blockquotes merge consecutive
-/// `>` lines joined with `\n`. Pure `Foundation`-only code — no AppKit, no shared mutable state.
+/// `>` lines joined with `\n`. A list item merges the *indented* lines that follow it — see
+/// `isListItemContinuation` for the two-part test and `flushListItem` for the joining rule — which
+/// is (preview-bold-spans) cause 1: before it, a wrapped item's second line started a new block and
+/// split any `**…**` span across two blocks, so each half held an unpaired `**`. Pure
+/// `Foundation`-only code — no AppKit, no shared mutable state.
 enum MarkdownBlockParser {
     static func parse(_ source: String) -> [MarkdownBlock] {
         // Split on `\n` only (project-wide logical-line convention, see `LogicalLine`), stripping a
@@ -84,8 +88,9 @@ enum MarkdownBlockParser {
 
         var blocks: [MarkdownBlock] = []
 
-        // Paragraph accumulator (space-joined). Mutually exclusive with the quote accumulator:
-        // starting either flushes the other, so at most one is ever active.
+        // Paragraph accumulator (space-joined). Mutually exclusive with the quote and list-item
+        // accumulators: starting any one of the three flushes the other two, so at most one is ever
+        // active.
         var paragraphLines: [String] = []
         var paragraphStart = 0
         var inParagraph = false
@@ -94,6 +99,23 @@ enum MarkdownBlockParser {
         var quoteLines: [String] = []
         var quoteStart = 0
         var inQuote = false
+
+        // List-item accumulator ((preview-bold-spans) cause 1): the item's own text from
+        // `parseListItem`, followed by the raw text of every indented continuation line. Joined by
+        // `flushListItem`.
+        //
+        // WHY THIS ONE IS DANGEROUS, spelled out because the failure is silent: before this item,
+        // step 7 did `blocks.append` INLINE, so `blocks` was in source order by construction. An
+        // accumulator emits at FLUSH time instead, so any step that starts a block and forgets to
+        // flush this one emits blocks OUT OF SOURCE ORDER — `- a` followed by `> q` with step 6 not
+        // flushing yields `[.blockquote(line: 1), .listItem(line: 0)]`. That trips
+        // `MarkdownRenderer.assertStrictlyAscending` in debug and, because `assert` compiles out,
+        // silently breaks §8.3 scroll sync in release. Steps 2-7, step 9 and the EOF flush must each
+        // call `flushListItem()`; step 1 need not, because opening a fence (step 2) already did.
+        var listItemLines: [String] = []
+        var listItemMarker = ""
+        var listItemStart = 0
+        var inListItem = false
 
         // Fence accumulator (verbatim, `\n`-joined). While active, every line except a closing
         // fence is taken literally.
@@ -115,6 +137,42 @@ enum MarkdownBlockParser {
             inQuote = false
         }
 
+        func flushListItem() {
+            guard inListItem else { return }
+            // (preview-bold-spans) joining rule, criteria 2/3/9. A SINGLE-line item keeps
+            // `parseListItem`'s text byte-for-byte, so `- a ` still yields `"a "`: an item that was
+            // never continued must not silently lose a trailing space it has always kept. A
+            // CONTINUED item trims every segment on both sides, drops the empty ones, and joins with
+            // exactly one space. The trim is what strips the continuation line's leading indent (the
+            // repro's `"  fires]**"`); joining trimmed segments — rather than joining raw ones — is
+            // what stops a segment that already ends in a space from producing a double space (the
+            // repro's `"(shipped   2026-08-21"`); and dropping empties is what makes `- \n  foo`
+            // yield `"foo"` rather than `" foo"`. Paragraph joining above is deliberately unchanged.
+            let text: String
+            if listItemLines.count == 1 {
+                text = listItemLines[0]
+            } else {
+                // `.lazy` is load-bearing for MEMORY, not style (adv-review-edge finding 2). Without
+                // it, `.map` materialises a second N-element `[String]` and `.filter` a third before
+                // `joined` ever runs — three allocations where `flushParagraph` above does one.
+                // Measured with `/usr/bin/time -l` on a pathological but reachable source (one
+                // bullet followed by 400,000 indented lines, ~30 MB): parse-attributable peak RSS
+                // was 145.2 MB eager vs 89.9 MB at HEAD — **1.62x**, +55 MB — and adding `.lazy`
+                // brings it back to 88.5 MB, i.e. HEAD's footprint, with byte-identical output. The
+                // preview renders the whole buffer with no size cap and SPEC §7's open cap is
+                // 100 MB, so the eager form's transient scales to ~185 MB against a documented
+                // steady-state band of 80-190 MB that SPEC §1 says to add nothing to.
+                text = listItemLines
+                    .lazy
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " ")
+            }
+            blocks.append(.listItem(marker: listItemMarker, text: text, line: listItemStart))
+            listItemLines.removeAll()
+            inListItem = false
+        }
+
         for (index, line) in lines.enumerated() {
             // 1. Inside a fence: only a closing fence line ends it; everything else is verbatim.
             if inFence {
@@ -132,15 +190,27 @@ enum MarkdownBlockParser {
             if isFenceOpen(line) {
                 flushParagraph()
                 flushQuote()
+                flushListItem()
                 fenceStart = index
                 inFence = true
                 continue
             }
 
-            // 3. Blank line — terminates a pending paragraph or blockquote; emits nothing itself.
+            // 3. Blank line — terminates a pending paragraph, blockquote or list item; emits nothing
+            //    itself. Running before the continuation step is what keeps a whitespace-only line
+            //    out of `isListItemContinuation` (which would otherwise accept it: it is indented,
+            //    and `""` starts no block) — but only for `isBlank`'s notion of blank, which is
+            //    `CharacterSet.whitespaces`. That set excludes VT (U+000B), FF (U+000C), CR
+            //    (U+000D), NEL (U+0085) and LSEP (U+2028), so a line of space-then-form-feed looks
+            //    blank to a human, is NOT blank here, and is absorbed into an open item with the
+            //    control character carried into its text (adv-review-edge finding 4). Left as-is
+            //    deliberately: matching a human's idea of "blank" would mean changing `isBlank`,
+            //    which every block type consults, for input a Markdown file realistically never
+            //    contains. Recorded rather than fixed so the gap is known and not re-derived.
             if isBlank(line) {
                 flushParagraph()
                 flushQuote()
+                flushListItem()
                 continue
             }
 
@@ -148,6 +218,7 @@ enum MarkdownBlockParser {
             if let heading = parseHeading(line) {
                 flushParagraph()
                 flushQuote()
+                flushListItem()
                 blocks.append(.heading(level: heading.level, text: heading.text, line: index))
                 continue
             }
@@ -157,13 +228,16 @@ enum MarkdownBlockParser {
             if isRule(line) {
                 flushParagraph()
                 flushQuote()
+                flushListItem()
                 blocks.append(.rule(line: index))
                 continue
             }
 
-            // 6. Blockquote — a `>` line ends a paragraph but continues/starts a quote block.
+            // 6. Blockquote — a `>` line ends a paragraph or list item but continues/starts a quote
+            //    block.
             if line.first == ">" {
                 flushParagraph()
+                flushListItem()
                 if !inQuote {
                     inQuote = true
                     quoteStart = index
@@ -172,17 +246,32 @@ enum MarkdownBlockParser {
                 continue
             }
 
-            // 7. List item (unordered `- * +` or ordered `N.`/`N)`).
+            // 7. List item (unordered `- * +` or ordered `N.`/`N)`). Starts the accumulator instead
+            //    of appending directly, so the indented lines step 8 collects can still join it.
+            //    Flushing first is what makes a run of `- a\n- b` two items rather than one.
             if let item = parseListItem(line) {
                 flushParagraph()
                 flushQuote()
-                blocks.append(.listItem(marker: item.marker, text: item.text, line: index))
+                flushListItem()
+                listItemMarker = item.marker
+                listItemStart = index
+                listItemLines = [item.text]
+                inListItem = true
                 continue
             }
 
-            // 8. Paragraph continuation — a non-`>` text line ends a quote and extends/starts a
-            //    paragraph.
+            // 8. Continuation of an open list item — an indented line whose trimmed form starts no
+            //    block of its own. Placed after step 7 so an UNINDENTED sibling item still starts a
+            //    new item, and before step 9 so a wrapped item's tail no longer becomes a paragraph.
+            if inListItem, isListItemContinuation(line) {
+                listItemLines.append(line)
+                continue
+            }
+
+            // 9. Paragraph continuation — a non-`>` text line ends a quote or list item and
+            //    extends/starts a paragraph.
             flushQuote()
+            flushListItem()
             if !inParagraph {
                 inParagraph = true
                 paragraphStart = index
@@ -190,10 +279,13 @@ enum MarkdownBlockParser {
             paragraphLines.append(line)
         }
 
-        // EOF: flush whatever is pending. At most one accumulator is active, but flushing all three
-        // unconditionally is safe. An unterminated fence renders its collected content.
+        // EOF: flush whatever is pending. At most one accumulator is active, but flushing all four
+        // unconditionally is safe. Flushing the list item here is what makes the commonest real case
+        // — a file whose last line is a wrapped bullet — come out as one item (criterion 8). An
+        // unterminated fence renders its collected content.
         flushParagraph()
         flushQuote()
+        flushListItem()
         if inFence {
             blocks.append(.codeBlock(code: fenceLines.joined(separator: "\n"), line: fenceStart))
         }
@@ -315,6 +407,107 @@ enum MarkdownBlockParser {
             index += 1
         }
         return ("\(number).", String(characters[index...]))
+    }
+
+    /// Does this **leading-whitespace-stripped** line open a block in its own right — a fence, an
+    /// ATX heading, a horizontal rule, a blockquote, or a list item?
+    ///
+    /// A named helper rather than a test inlined into `isListItemContinuation`, so that
+    /// `(preview-tables)`'s table-row continuation test can call it too rather than growing a second
+    /// copy of this predicate. **Today it has exactly one caller** — the continuation test below;
+    /// the second arrives with that item.
+    ///
+    /// **The argument must have its LEADING whitespace stripped, and its TRAILING whitespace left
+    /// alone.** Both halves are load-bearing, and the second was a real shipped bug caught in
+    /// review. Leading: every classifier consulted here is anchored at column 0
+    /// (`parseHeading`/`isRule`/`parseListItem` all read `characters.first`; `isFenceOpen` counts
+    /// leading backticks), so a raw indented line answers "starts no block" for `  - b` and the
+    /// caller swallows a nested sub-bullet into its parent — the `SPEC.md:68-70` regression
+    /// criterion 5 pins. Trailing: `parseListItem` and `parseHeading` both require a space or tab
+    /// **after** the marker, so trimming the right-hand end destroys the very character they test
+    /// for — a marker-only line like `"  - "` or `"  # "` becomes `"-"` / `"#"`, fails those
+    /// classifiers, and is absorbed into the parent item. `isRule` strips its own trailing
+    /// whitespace (see its implementation) and `isFenceOpen` only counts leading backticks, so
+    /// neither is affected either way; the hole is exactly the two marker-plus-space classifiers.
+    ///
+    /// See `leadingWhitespaceStripped` for why the caller's notion of whitespace must match
+    /// `flushListItem`'s exactly.
+    ///
+    /// **A `|`-leading line counts as starting a block, even though this parser has no table block
+    /// yet.** That looks anomalous and is deliberate: without it, `SPEC.md:122-128`'s own
+    /// six-row table — indented two spaces under `- Token classes and light-theme colors:` — would
+    /// be absorbed into that bullet, turning a table that today renders as (ugly but complete)
+    /// paragraph text into a run-on glued onto a list item. Measured across this repo: `SPEC.md`
+    /// would drop 183 to 182 blocks, `plans/cli-open.plan.md` 297 to 212. Reporting `|` as a block
+    /// starter keeps every such line exactly where HEAD puts it — its own paragraph — so this item
+    /// introduces no table regression at all. `(preview-tables)` replaces this line with real
+    /// recognition (its step 7.5 runs ahead of the continuation branch); until then it is a
+    /// hold-the-line guard, not a claim that `|` is a block.
+    ///
+    /// A blank line is deliberately NOT reported as a block starter (`""` opens nothing). That is
+    /// only safe because the blank-line step runs ahead of every continuation test and has already
+    /// flushed by the time this is reached.
+    private static func startsBlock(_ trimmed: String) -> Bool {
+        if isFenceOpen(trimmed) { return true }
+        if parseHeading(trimmed) != nil { return true }
+        if isRule(trimmed) { return true }
+        if trimmed.first == ">" { return true }
+        if parseListItem(trimmed) != nil { return true }
+        // (preview-tables) hold-the-line — see the doc comment above. Not a block yet; this keeps a
+        // pipe row out of the parent bullet so it renders exactly as it does at HEAD.
+        if trimmed.first == "|" { return true }
+        return false
+    }
+
+    /// Does `line` continue an already-open list item? BOTH halves are load-bearing, and both are
+    /// deliberate departures from CommonMark recorded in (preview-bold-spans)'s `## Decisions taken`:
+    ///
+    /// 1. **It must be indented.** CommonMark's *lazy* continuation — any non-blank line continues an
+    ///    open item — would turn `- a\nb` from item + paragraph into a single item (criterion 4).
+    ///    Requiring indentation confines this change's whole blast radius to genuinely wrapped items.
+    /// 2. **Its trimmed form must start no block.** Without this, `  - b` under an open `- a` would
+    ///    be swallowed, and `SPEC.md:68-70`'s indented sub-bullets would collapse into one run-on
+    ///    line with literal `-` separators. Nested lists being a SPEC §8.2 non-goal licenses not
+    ///    rendering them specially; it does not license rendering them worse than before
+    ///    (criterion 5).
+    ///
+    /// Any depth of indentation counts — the parser carries no column model, and the item a
+    /// continuation belongs to is simply the one currently open.
+    private static func isListItemContinuation(_ line: String) -> Bool {
+        guard let first = line.first, first == " " || first == "\t" else { return false }
+        return !startsBlock(leadingWhitespaceStripped(line))
+    }
+
+    /// Strips the **leading** run of `CharacterSet.whitespaces` and nothing else — the exact
+    /// operation `startsBlock` requires, and the reason it is a named function rather than a closure
+    /// is that BOTH of its properties were separately gotten wrong and caught in review.
+    ///
+    /// **Leading, because `startsBlock`'s classifiers are anchored at column 0.** Handing them a raw
+    /// indented line answers "starts no block" for `  - b`, and the caller swallows a nested
+    /// sub-bullet into its parent.
+    ///
+    /// **Not trailing, because `parseListItem` and `parseHeading` require a space or tab AFTER the
+    /// marker.** Trimming the right-hand end destroys the very character they test for, so `"  - "`
+    /// becomes `"-"`, fails their `count >= 2` guard, and is absorbed. That was a shipped defect in
+    /// this item's first draft.
+    ///
+    /// **`CharacterSet.whitespaces`, not just space and tab** — this is the subtle one, and the
+    /// naive `{" ", "\t"}` version was the *second* defect, introduced by the fix for the first.
+    /// `flushListItem` trims each segment with `CharacterSet.whitespaces`, which contains 17 further
+    /// space characters (U+00A0 NBSP, U+1680, U+2000-U+200B, U+202F, U+205F, U+3000). If this
+    /// stripper recognised fewer of them than that trim does, `"  \u{00A0}- x"` would keep its NBSP
+    /// here, report "starts no block", be accepted as a continuation — and then the flush would
+    /// delete the NBSP anyway, collapsing a sub-bullet into its parent as `"a - x"`. Exactly the
+    /// regression this predicate exists to prevent, reachable by Option+Space on macOS and by any
+    /// paste from a web page or Word. **The two notions of whitespace must agree; the guard is only
+    /// ever as strong as the weaker one.**
+    private static func leadingWhitespaceStripped(_ line: String) -> String {
+        let scalars = line.unicodeScalars
+        var index = scalars.startIndex
+        while index < scalars.endIndex, CharacterSet.whitespaces.contains(scalars[index]) {
+            index = scalars.index(after: index)
+        }
+        return String(String.UnicodeScalarView(scalars[index...]))
     }
 }
 

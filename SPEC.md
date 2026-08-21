@@ -166,7 +166,7 @@ The sidebar is bounded to match: **each scanned root's tree is capped at ~50,000
 ### 8.2 Supported Markdown subset (v1)
 - ATX headings `#`–`######` (sized/bold styles).
 - Paragraphs (consecutive non-blank lines merged, blank line = paragraph break).
-- Unordered lists (`-`, `*`, `+`) with bullets and indent; ordered lists (`1.`, `1)`).
+- Unordered lists (`-`, `*`, `+`) with bullets and indent; ordered lists (`1.`, `1)`). A list item **continues onto the following lines** for as long as they are non-blank *and* indented *and* do not themselves start another block (fence, heading, rule, `>` quote, or list item), so a wrapped bullet renders as one item. A **blank line ends the item**, including a whitespace-only one — blankness is tested before continuation is, so an indented empty line terminates rather than extends. A line carrying only a marker (`  - `, `  # `) counts as starting a block and therefore ends the item too — once an item *has* been continued, **every** segment including the item's own text is whitespace-trimmed and the non-empty ones are joined with a single space, while an item that was never continued keeps its text byte-for-byte. One consequence of that asymmetry, accepted: a leading or trailing Unicode space (NBSP, zero-width space) survives on an uncontinued item and is trimmed away on a continued one. An **unindented** line ends the item (it is not a lazy continuation), and an indented sub-bullet is not absorbed into its parent — it renders exactly as it did before, since nested lists remain a non-goal below.
 - Blockquotes (`>`) — indented, gray.
 - Fenced code blocks (``` ``` ```) — monospaced on light-gray background, no per-language highlighting inside the preview in v1.
 - Horizontal rules (`---`, `***`).

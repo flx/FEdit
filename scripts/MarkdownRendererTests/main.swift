@@ -640,6 +640,438 @@ check(
     "bold body with unmatched brackets: the per-invocation memo is rebuilt correctly on the recursive slice"
 )
 
+// MARK: - (preview-bold-spans): indented list-item continuation
+//
+// Cause 1 of that item. A wrapped list item's second line used to match none of the classification
+// steps and fall through to paragraph continuation, so it started a NEW block — which split any
+// `**…**` span across two blocks, left an unpaired `**` in each, and turned the orphaned closer into
+// an opener that bolded a long arbitrary run further down the document.
+//
+// The continuation rule is deliberately NOT CommonMark's lazy one. It requires the line to be
+// indented AND its trimmed form to start no block of its own; criteria 4-6 below are the regression
+// guards for exactly those two reversals, and criterion 5 is the one that protects `SPEC.md:68-70`'s
+// indented sub-bullets from being swallowed into their parent bullet.
+
+section("(preview-bold-spans) criterion 1: the reported three-line wrapped list item")
+do {
+    // The reporter's source verbatim (`plans/preview-bold-repro.md`). Written as an array join
+    // rather than a `"""` literal so the two-space indents that make lines 1-2 continuations are
+    // impossible to misread and cannot be silently re-indented by a formatter.
+    let source = [
+        "- [ ] (snapshot-solve-merge) **[hi · TRIGGERED — do not schedule until it",
+        "  fires]** The structural half of `(solve-blocks-main-actor)` (shipped",
+        "  2026-08-21). Direction: snapshot-solve-merge, not a finer lock.",
+    ].joined(separator: "\n")
+    let expectedText = "[ ] (snapshot-solve-merge) **[hi · TRIGGERED — do not schedule until it fires]** The structural half of `(solve-blocks-main-actor)` (shipped 2026-08-21). Direction: snapshot-solve-merge, not a finer lock."
+
+    let blocks = MarkdownBlockParser.parse(source)
+    check(blocks.count == 1, "the reported three-line source parses to exactly ONE block (was 1 item + 2 paragraphs)")
+    var itemText = ""
+    if case let .listItem(marker, text, line)? = blocks.first {
+        itemText = text
+        check(marker == "•" && line == 0, "that block is a `•` list item anchored at source line 0")
+    } else {
+        check(false, "that block is a `•` list item anchored at source line 0")
+    }
+    check(itemText == expectedText, "its text joins all three lines: indents stripped, single-spaced, `(shipped 2026-08-21)` not double-spaced")
+    check(itemText.contains("fires]**"), "its text carries `fires]**` — the closer that used to be stranded in the next block")
+
+    // The whole point of the item: with the span no longer split, the `**…**` pairs with its own
+    // closer. Asserted as a tree so "and nothing after it is bold" is pinned structurally, not by a
+    // spot check — a stray `.bold` anywhere after would change this array.
+    check(
+        MarkdownInlineParser.parse(itemText) == [
+            .text("[ ] (snapshot-solve-merge) "),
+            .bold([.text("[hi · TRIGGERED — do not schedule until it fires]")]),
+            .text(" The structural half of "),
+            .code("(solve-blocks-main-actor)"),
+            .text(" (shipped 2026-08-21). Direction: snapshot-solve-merge, not a finer lock."),
+        ],
+        "the rejoined item inline-parses to exactly one bold span over `[hi · … fires]`, nothing after it bold"
+    )
+
+    // ...and the same claim at the RENDER level, where the bug was actually visible. The bold face
+    // is `PreviewFont.bodyBold` (private), so it is identified by "not `Theme.bodyFont`, and carries
+    // the .bold trait"; asking for the LONGEST effective range is what makes this fail if the bold
+    // run were one character longer or shorter than the intended span.
+    let (output, _) = MarkdownRenderer.render(source)
+    let rendered = output.string as NSString
+    let boldRange = rendered.range(of: "[hi · TRIGGERED — do not schedule until it fires]")
+    check(boldRange.location != NSNotFound, "the rendered output contains the span, with its `**` delimiters consumed")
+    if boldRange.location != NSNotFound {
+        var effective = NSRange(location: 0, length: 0)
+        let font = output.attribute(
+            .font,
+            at: boldRange.location,
+            longestEffectiveRange: &effective,
+            in: NSRange(location: 0, length: output.length)
+        ) as? NSFont
+        check(font != nil && font != Theme.bodyFont, "the span renders in a face other than the plain body font")
+        check(font?.fontDescriptor.symbolicTraits.contains(.bold) == true, "that face carries the .bold symbolic trait")
+        check(effective == boldRange, "the bold run covers EXACTLY the span — not one character more or less")
+        let after = boldRange.location + boldRange.length
+        check(after < output.length, "there is rendered text after the span (so the next check is not vacuous)")
+        check(
+            attribute(output, .font, at: after) as? NSFont == Theme.bodyFont,
+            "the text immediately after the span is plain body font — the wrong-run bolding is gone"
+        )
+    }
+}
+
+section("(preview-bold-spans) criteria 2-3, 9: the joining rule")
+check(
+    MarkdownBlockParser.parse("- a\n  b") == [.listItem(marker: "•", text: "a b", line: 0)],
+    "\"- a\\n  b\" -> ONE list item \"a b\" at line 0 (the continuation's indent is stripped)"
+)
+check(
+    MarkdownBlockParser.parse("- a \n  b") == [.listItem(marker: "•", text: "a b", line: 0)],
+    "\"- a \\n  b\" -> \"a b\", not \"a  b\" — segments are trimmed before joining"
+)
+check(
+    MarkdownBlockParser.parse("- a ") == [.listItem(marker: "•", text: "a ", line: 0)],
+    "\"- a \" with NO continuation keeps its trailing space verbatim — a single-line item is never re-joined"
+)
+check(
+    MarkdownBlockParser.parse("- \n  foo") == [.listItem(marker: "•", text: "foo", line: 0)],
+    "\"- \\n  foo\" -> \"foo\", not \" foo\" — empty segments are dropped, not joined"
+)
+check(
+    MarkdownBlockParser.parse("- a\n  b\n  c") == [.listItem(marker: "•", text: "a b c", line: 0)],
+    "three-line wrap joins into one item (the join is not limited to a single continuation)"
+)
+check(
+    MarkdownBlockParser.parse("3. a\n  b") == [.listItem(marker: "3.", text: "a b", line: 0)],
+    "an ORDERED item continues too, keeping its rendered marker"
+)
+check(
+    MarkdownBlockParser.parse("- a\n\tb") == [.listItem(marker: "•", text: "a b", line: 0)],
+    "a TAB-indented continuation counts as indented"
+)
+
+section("(preview-bold-spans) criterion 4: unindented lines are NOT continuations")
+check(
+    MarkdownBlockParser.parse("- a\nb") == [
+        .listItem(marker: "•", text: "a", line: 0),
+        .paragraph(text: "b", line: 1),
+    ],
+    "\"- a\\nb\" stays item + paragraph — CommonMark's LAZY continuation is deliberately NOT adopted"
+)
+
+section("(preview-bold-spans) criteria 5-6: an indented block starter is not a continuation")
+check(
+    MarkdownBlockParser.parse("- a\n  - b") == [
+        .listItem(marker: "•", text: "a", line: 0),
+        .paragraph(text: "  - b", line: 1),
+    ],
+    "\"- a\\n  - b\" -> item + paragraph, byte-identical to before this item — the SPEC.md:68-70 guard"
+)
+check(
+    MarkdownBlockParser.parse("- a\n  ```") == [
+        .listItem(marker: "•", text: "a", line: 0),
+        .paragraph(text: "  ```", line: 1),
+    ],
+    "an indented fence open is not a continuation (unchanged: an indented ``` is still paragraph text)"
+)
+check(
+    MarkdownBlockParser.parse("- a\n  # h") == [
+        .listItem(marker: "•", text: "a", line: 0),
+        .paragraph(text: "  # h", line: 1),
+    ],
+    "an indented ATX heading is not a continuation"
+)
+check(
+    MarkdownBlockParser.parse("- a\n  > q") == [
+        .listItem(marker: "•", text: "a", line: 0),
+        .paragraph(text: "  > q", line: 1),
+    ],
+    "an indented blockquote marker is not a continuation"
+)
+check(
+    MarkdownBlockParser.parse("- a\n  ---") == [
+        .listItem(marker: "•", text: "a", line: 0),
+        .paragraph(text: "  ---", line: 1),
+    ],
+    "an indented horizontal rule is not a continuation"
+)
+check(
+    MarkdownBlockParser.parse("- a\n  1. b") == [
+        .listItem(marker: "•", text: "a", line: 0),
+        .paragraph(text: "  1. b", line: 1),
+    ],
+    "an indented ORDERED sub-item is not a continuation either"
+)
+do {
+    // The `SPEC.md:68-70` shape itself: one bullet with two indented sub-bullets. The two sub-bullet
+    // lines land in step 9 and merge into ONE space-joined paragraph — that is the PRE-EXISTING
+    // paragraph behaviour, unchanged here by design, and it is why the expected value is two blocks
+    // and not three. What this guard pins is that the parent item's text is `**Parent:**` and
+    // nothing more: under CommonMark lazy continuation both children would instead have been
+    // swallowed into it as one run-on line with literal `-` separators.
+    let source = "- **Parent:**\n  - **Child one:** text.\n  - **Child two:** text."
+    check(
+        MarkdownBlockParser.parse(source) == [
+            .listItem(marker: "•", text: "**Parent:**", line: 0),
+            .paragraph(text: "  - **Child one:** text.   - **Child two:** text.", line: 1),
+        ],
+        "the SPEC.md:68-70 nested-bullet shape parses exactly as before: the parent item keeps only its own text"
+    )
+}
+
+// MARK: - (preview-bold-spans, adv-review-behavior finding 1) MARKER-ONLY block starters
+//
+// The criteria 5-6 cases above all use marker-PLUS-CONTENT lines (`  - b`, `  1. b`, `  # h`), and
+// that gap shipped a real defect past the first implementation: `isListItemContinuation` trimmed
+// BOTH ends before asking `startsBlock`, but `parseListItem` and `parseHeading` each require a
+// space or tab AFTER the marker — so the trailing trim destroyed the exact character they test for.
+// `"  - "` became `"-"`, failed `parseListItem`'s `count >= 2` guard, reported "starts no block",
+// and was absorbed into the parent item: `- Parent\n  - \n  - Child` rendered as `Parent -`.
+//
+// These pin the marker-only forms specifically. `>` and rules and fences are deliberately included
+// too, as controls: they were never affected (a `>` needs no following character, `isRule` strips
+// its own trailing whitespace, `isFenceOpen` only counts leading backticks), so if a future change
+// to the trimming breaks THEM, that shows up here as well.
+section("(preview-bold-spans, review finding 1) a marker-only indented line is not a continuation")
+do {
+    // Every one of these, placed under an open `- parent`, must TERMINATE the item rather than be
+    // swallowed into it — i.e. the parse must contain more than one block, and the parent item's
+    // text must remain exactly "parent".
+    let markerOnly = [
+        "  - ", "  * ", "  + ",           // unordered markers, no content
+        "  1. ", "  1) ", "  12. ",       // ordered markers, no content
+        "  # ", "  ## ", "  ###### ",     // ATX headings, no content
+        "\t- ", "   \t- ",                // tab indentation, and mixed space+tab
+    ]
+    var swallowed: [String] = []
+    for line in markerOnly {
+        let blocks = MarkdownBlockParser.parse("- parent\n" + line)
+        // Swallowed shows up two ways: one block instead of several, or a parent whose text grew.
+        let parentText: String? = {
+            if case let .listItem(_, text, _) = blocks[0] { return text }
+            return nil
+        }()
+        if blocks.count < 2 || parentText != "parent" { swallowed.append(line.debugDescription) }
+    }
+    check(
+        swallowed.isEmpty,
+        "all \(markerOnly.count) marker-only indented lines terminate the parent item (swallowed: \(swallowed))"
+    )
+
+    // The concrete case from the review, asserted whole rather than by property.
+    check(
+        MarkdownBlockParser.parse("- Parent\n  - \n  - Child") == [
+            .listItem(marker: "•", text: "Parent", line: 0),
+            .paragraph(text: "  -    - Child", line: 1),
+        ],
+        "a nested list caught mid-edit (`- Parent`, `  - `, `  - Child`) keeps the parent's text intact"
+    )
+
+    // (adv-review-edge finding 1) UNICODE-INDENTED sub-bullets. The first fix for the marker-only
+    // bug above stripped only space and tab, which introduced a NEW defect: `flushListItem` trims
+    // each segment with `CharacterSet.whitespaces`, so a line indented with spaces and then a
+    // NON-BREAKING space kept its NBSP here (reporting "starts no block", hence a continuation) and
+    // then had the NBSP deleted by the flush — collapsing a sub-bullet into its parent as `"a - x"`.
+    // Reachable by Option+Space on macOS and by any paste from a web page or Word. The stripper now
+    // uses the same `CharacterSet.whitespaces` the flush does; these pin that the two agree.
+    var unicodeSwallowed: [String] = []
+    for scalar in [0x00A0, 0x1680, 0x2000, 0x2003, 0x2007, 0x200A, 0x200B, 0x202F, 0x205F, 0x3000] {
+        let space = String(UnicodeScalar(scalar)!)
+        let blocks = MarkdownBlockParser.parse("- a\n  \(space)- x")
+        if blocks.count < 2 { unicodeSwallowed.append(String(format: "U+%04X", scalar)) }
+    }
+    check(
+        unicodeSwallowed.isEmpty,
+        "a sub-bullet indented with a Unicode space (NBSP et al) still terminates the parent (swallowed: \(unicodeSwallowed))"
+    )
+
+    // (adv-review-edge finding 3) A `|` row must not be absorbed either. This repo's own
+    // `SPEC.md:122-128` is a six-row table indented under a bullet; absorbing it would turn text
+    // that renders as an ugly-but-complete paragraph today into a run-on glued onto a list item.
+    // `(preview-tables)` replaces this with real recognition; until then the parse must match HEAD.
+    check(
+        MarkdownBlockParser.parse("- Token classes:\n  | Class | Color |\n  |---|---|") == [
+            .listItem(marker: "•", text: "Token classes:", line: 0),
+            .paragraph(text: "  | Class | Color |   |---|---|", line: 1),
+        ],
+        "an indented pipe-table row is NOT absorbed into the bullet above it (SPEC.md:122-128's own shape)"
+    )
+
+    // Controls: the three forms that never needed a following character must still terminate.
+    var controlFailures: [String] = []
+    for line in ["  > q", "  ---", "  ```"] {
+        let blocks = MarkdownBlockParser.parse("- parent\n" + line)
+        if blocks.count < 2 { controlFailures.append(line.debugDescription) }
+    }
+    check(controlFailures.isEmpty, "control: `>`, rule and fence-open still terminate an open item (failed: \(controlFailures))")
+
+    // And the counterpart that must NOT change: a marker-only line with no indentation was never a
+    // continuation candidate at all (the test's first half rejects it before `startsBlock` is
+    // consulted), so it stays exactly whatever it was before. Both forms are pinned because they
+    // differ, and the difference is the same trailing space this whole section is about:
+    // `"- "` satisfies `parseListItem` and IS a second list item with empty text, while a bare
+    // `"-"` fails its `count >= 2` guard and falls through to paragraph. Probed, not assumed — my
+    // first draft of this assertion guessed "paragraph" for both and was wrong about the first.
+    check(
+        MarkdownBlockParser.parse("- parent\n- ") == [
+            .listItem(marker: "•", text: "parent", line: 0),
+            .listItem(marker: "•", text: "", line: 1),
+        ],
+        "an UNINDENTED `- ` is a second (empty) list item, not a continuation"
+    )
+    check(
+        MarkdownBlockParser.parse("- parent\n-") == [
+            .listItem(marker: "•", text: "parent", line: 0),
+            .paragraph(text: "-", line: 1),
+        ],
+        "an UNINDENTED bare `-` is a paragraph — no trailing space, so it is not a list item at all"
+    )
+}
+
+section("(preview-bold-spans) criterion 7: six terminators for an open list item")
+check(
+    MarkdownBlockParser.parse("- a\n\nb") == [
+        .listItem(marker: "•", text: "a", line: 0),
+        .paragraph(text: "b", line: 2),
+    ],
+    "a blank line terminates an open list item"
+)
+check(
+    MarkdownBlockParser.parse("- a\n# H") == [
+        .listItem(marker: "•", text: "a", line: 0),
+        .heading(level: 1, text: "H", line: 1),
+    ],
+    "a heading terminates an open list item"
+)
+check(
+    MarkdownBlockParser.parse("- a\n---") == [
+        .listItem(marker: "•", text: "a", line: 0),
+        .rule(line: 1),
+    ],
+    "a rule terminates an open list item"
+)
+check(
+    MarkdownBlockParser.parse("- a\n```\ncode\n```") == [
+        .listItem(marker: "•", text: "a", line: 0),
+        .codeBlock(code: "code", line: 1),
+    ],
+    "a fence terminates an open list item"
+)
+check(
+    MarkdownBlockParser.parse("- a\n> q") == [
+        .listItem(marker: "•", text: "a", line: 0),
+        .blockquote(text: "q", line: 1),
+    ],
+    "a blockquote terminates an open list item"
+)
+check(
+    MarkdownBlockParser.parse("- a\n- b") == [
+        .listItem(marker: "•", text: "a", line: 0),
+        .listItem(marker: "•", text: "b", line: 1),
+    ],
+    "a new list item terminates an open list item"
+)
+
+section("(preview-bold-spans) criterion 7: terminators emit in SOURCE ORDER")
+do {
+    // The silent failure mode the fourth accumulator introduces: because a list item now emits at
+    // FLUSH time rather than inline, any terminator that forgets to flush it appends its own block
+    // FIRST and the item second — `[.blockquote(line: 1), .listItem(line: 0)]`. That trips
+    // `assertStrictlyAscending` in debug and, since `assert` compiles out, silently breaks §8.3
+    // scroll sync in release. Asserting `.line` is ascending over every terminator is what makes a
+    // missed `flushListItem()` fail loudly here instead.
+    //
+    // (adv-review-behavior finding 4) The first version of this section used exactly the six inputs
+    // the six exact-array checks above already assert in full, including their `line` values — so it
+    // could not fail unless one of those also failed, while its comment claimed to be THE guard for
+    // the reordering failure mode. Two changes earn its place: the inputs below are ones the exact
+    // checks do NOT cover (a CONTINUED item before each terminator, so the flush carries a joined
+    // multi-line item, plus deeper prefixes), and it now goes through `MarkdownRenderer.render` to
+    // check anchor `location` ordering as well — the half `assertStrictlyAscending` cares about and
+    // the block-level checks never reach.
+    let terminators = ["\n\nb", "\n# H", "\n---", "\n```\ncode\n```", "\n> q", "\n- b"]
+    var ascending = true
+    var anchorsAscending = true
+    var offenders: [String] = []
+    for terminator in terminators {
+        // A CONTINUED item (two source lines joined) ahead of the terminator, preceded by a heading
+        // so the item is not the first block — neither shape appears in the exact checks above.
+        let source = "# Doc\n\n- a\n  cont" + terminator
+        let blocks = MarkdownBlockParser.parse(source)
+        if blocks.count > 2 {
+            for index in 1..<blocks.count where !(blocks[index].line > blocks[index - 1].line) {
+                ascending = false
+                offenders.append(terminator.debugDescription)
+            }
+        } else {
+            ascending = false
+            offenders.append(terminator.debugDescription)
+        }
+        // The item must still be the one at line 2, carrying its joined text — proving the flush
+        // emitted the WHOLE accumulated item and not a truncated one.
+        if blocks.count > 1, case let .listItem(_, text, line) = blocks[1] {
+            if text != "a cont" || line != 2 { ascending = false; offenders.append(terminator.debugDescription) }
+        } else {
+            ascending = false
+            offenders.append(terminator.debugDescription)
+        }
+        // And the rendered anchors — `location` ordering is what §8.3 binary-searches.
+        let (_, anchors) = MarkdownRenderer.render(source)
+        if anchors.count > 1 {
+            for index in 1..<anchors.count
+            where !(anchors[index].sourceLine > anchors[index - 1].sourceLine)
+                || !(anchors[index].location > anchors[index - 1].location) {
+                anchorsAscending = false
+                offenders.append(terminator.debugDescription)
+            }
+        }
+    }
+    check(ascending, "every terminator emits the pending (continued) list item BEFORE its own block, whole and in source order (offenders: \(Set(offenders).sorted()))")
+    check(anchorsAscending, "and the rendered anchors stay strictly ascending in sourceLine AND location across all six")
+}
+
+section("(preview-bold-spans) criterion 8: a list item open at EOF")
+check(
+    MarkdownBlockParser.parse("# H\n\n- wrapped\n  tail") == [
+        .heading(level: 1, text: "H", line: 0),
+        .listItem(marker: "•", text: "wrapped tail", line: 2),
+    ],
+    "a document ENDING on a wrapped bullet flushes at EOF as one item (the commonest real case)"
+)
+check(
+    MarkdownBlockParser.parse("- a\n  b\n") == [.listItem(marker: "•", text: "a b", line: 0)],
+    "a trailing newline after a continuation still yields one item (the final empty line is blank, not a continuation)"
+)
+
+section("(preview-bold-spans) criterion 13: anchors over a wrapped item")
+do {
+    // Merging a continuation removes a block, and therefore an anchor. The comparison document is
+    // the SAME source with one blank line inserted before the continuation — which breaks the merge
+    // — so the expected difference is exactly one anchor. Written as a difference rather than an
+    // absolute count so it cannot pass by coincidence with an unrelated block count.
+    let wrapped = "# H\n\n- one **span\n  wrapped** tail\n\n- two"
+    let split = "# H\n\n- one **span\n\n  wrapped** tail\n\n- two"
+    let (_, wrappedAnchors) = MarkdownRenderer.render(wrapped)
+    let (_, splitAnchors) = MarkdownRenderer.render(split)
+    check(wrappedAnchors.count == splitAnchors.count - 1, "a wrapped item emits exactly ONE FEWER anchor than the same document with the wrap broken by a blank line")
+    // (adv-review-behavior finding 5) Guard the count before forming the range: a regression that
+    // emitted ZERO anchors would make `1..<0` TRAP with "Range requires lowerBound <= upperBound"
+    // rather than report a FAIL, turning a real defect into a crashed harness that says nothing
+    // about what broke. Asserting the count first also makes the emptiness itself a failure rather
+    // than a vacuous pass.
+    check(wrappedAnchors.count == 3, "sanity: the wrapped document emits 3 anchors before the ordering check reads them")
+    var ascending = true
+    if wrappedAnchors.count > 1 {
+        for index in 1..<wrappedAnchors.count {
+            if !(wrappedAnchors[index].sourceLine > wrappedAnchors[index - 1].sourceLine) { ascending = false }
+            if !(wrappedAnchors[index].location > wrappedAnchors[index - 1].location) { ascending = false }
+        }
+    }
+    check(ascending, "the wrapped document's anchors are strictly ascending in BOTH sourceLine and location")
+    check(
+        wrappedAnchors.map { $0.sourceLine } == [0, 2, 5],
+        "the continuation line contributes no anchor of its own; §8.3 resolves it to its item's anchor at line 2"
+    )
+}
+
 // MARK: - md-link-scan-quadratic: differential fuzz
 //
 // A harness-local reference reimplementing the PRE-FIX `MarkdownInlineParser`/`MarkdownRenderer`
@@ -1057,6 +1489,77 @@ do {
     check(
         renderMismatches == 0,
         "\(fuzzCount) seeded random bracket-heavy inputs: MarkdownRenderer.render output+anchors match the reference renderer (0 mismatches)"
+    )
+}
+
+// MARK: - (preview-bold-spans): emphasis character-preservation property fuzz
+//
+// An oracle with NO reference implementation behind it, and that is exactly the point. The
+// differential fuzz above proves `MarkdownInlineParser` agrees with `ReferenceInlineParser`; the
+// moment a change to the emphasis rule is mirrored into both — which it must be, since the reference
+// exists to prove the link memoization is byte-identical and must never be weakened to stay green —
+// that oracle goes green regardless of whether the new rule is right. This one cannot go green that
+// way, because it checks the parser against a property of the INPUT:
+//
+//     flatten(parse(s)) with every `*` removed  ==  s with every `*` removed
+//
+// The emphasis scan may consume `*` characters as delimiters and may leave them behind as literal
+// text, but it must never drop, duplicate or reorder anything else. The alphabet is `a`, `*` and
+// space, so every draw is emphasis-only: no code spans, links or brackets dilute it.
+//
+// What this does NOT catch, stated plainly so nobody reads more into it than it proves: a tree that
+// accounts for every `*` as a delimiter but renders none of them. For `"** bold**"` the tree
+// `[.italic([]), .text(" bold"), .italic([])]` satisfies this property exactly — both sides reduce
+// to `" bold"` — even though `emitInline` appends nothing for empty children, so all four asterisks
+// would vanish from the rendered output. Only a hand-written expected tree for that specific input
+// pins that failure mode; this fuzz is the guard for character loss, not for delimiter visibility.
+
+section("(preview-bold-spans): emphasis character-preservation property fuzz")
+do {
+    let alphabet: [Character] = ["a", "*", " "]
+    // A DIFFERENT seed from the differential fuzz above, deliberately. `SeededLCG` is fully
+    // deterministic, so reusing 0x5EED_1234_ABCD_9876 would walk the identical state sequence and
+    // this fuzz would draw its lengths and its character indices from the very same stream — adding
+    // far less independent coverage than a second fuzz's name claims, even though the alphabet here
+    // differs. The constant below is arbitrary except for being visibly not that one.
+    var rng = SeededLCG(seed: 0xB01D_5EED_2026_0821)
+    let fuzzCount = 5000
+    var violations = 0
+    // The same corpus guard the differential fuzz carries: "0 violations over 5000 inputs" is
+    // satisfiable by a degenerate corpus, and a degenerate corpus is precisely the failure
+    // (fuzz-rng-low-bits) found in the fuzz above. Without this the assertion below would be worth
+    // whatever the RNG happened to be worth.
+    var distinctInputs = Set<String>()
+
+    for _ in 0..<fuzzCount {
+        let length = rng.nextInt(upperBound: 48)
+        var chars: [Character] = []
+        chars.reserveCapacity(length)
+        for _ in 0..<length {
+            chars.append(alphabet[rng.nextInt(upperBound: alphabet.count)])
+        }
+        let input = String(chars)
+        distinctInputs.insert(input)
+
+        let flattened = flatten(MarkdownInlineParser.parse(input))
+        if flattened.filter({ $0 != "*" }) != input.filter({ $0 != "*" }) {
+            violations += 1
+            print("  FUZZ PROPERTY VIOLATION on \(input.debugDescription): flattened to \(flattened.debugDescription)")
+        }
+    }
+
+    // Threshold: 4000 of 5000, matching the differential fuzz's floor. Measured today is 4533 — a
+    // little below that fuzz's 4740 because this alphabet has 3 entries rather than 8, so short
+    // draws collide far more often (`length == 0` alone recurs ~1/48 of the time, and there are only
+    // 3 one-character and 9 two-character strings to draw). The floor still sits well under the
+    // measured value and hundreds of times above what a low-bit reduction would collapse this to.
+    check(
+        distinctInputs.count > 4_000,
+        "\(fuzzCount) property-fuzz inputs are genuinely distinct (\(distinctInputs.count) unique) — the corpus is not degenerate"
+    )
+    check(
+        violations == 0,
+        "\(fuzzCount) seeded random emphasis-only inputs: parsing loses no non-delimiter character (0 violations)"
     )
 }
 

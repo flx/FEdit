@@ -10,7 +10,6 @@ files an item touches so overlapping items don't get batched in parallel.
 
 ## Features
 
-- [ ] (editor-find-previous) Find Previous (Cmd+Shift+G) in the editor find bar — deliberately excluded from (editor-find), which the TODO item scoped to Find Next only. Cmd+Shift+G is unclaimed (probe-confirmed: a bare SwiftUI menu bar registers no Cmd+G and no Cmd+Shift+G, and installs no Find submenu at all), so today the chord does nothing, which is the standard reflex users will hit. The core already supports it: `FindSession` owns `currentIndex` and a wrapping `stepNext()`, so this is a `stepPrevious()` with the reverse wrap, one menu item, one tick, and harness cases — no new state. `FEdit/Editor/FindSession.swift`, `FEdit/App/FEditApp.swift`, `FEdit/Models/WorkspaceModel.swift`, `FEdit/Editor/CodeEditorView.swift`, `scripts/FindMatchTests`, SPEC §6.5/§10, README. Depends on (editor-find).
 
 ## Bugs
 

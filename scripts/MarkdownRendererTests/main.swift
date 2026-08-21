@@ -696,7 +696,7 @@ do {
     )
     check(
         treeDepth(MarkdownInlineParser.parse(nested(limit + 1))) == limit,
-        "one level past the cap stops at \(limit): the \(limit + 1)th pair refuses to form"
+        "one level past the cap stops at \(limit): pair number \(limit + 1) refuses to form"
     )
     check(
         treeDepth(MarkdownInlineParser.parse(nested(4 * limit))) == limit,
@@ -733,10 +733,14 @@ do {
     )
 
     // **On a real background queue**, because that is where the crash lived: the main thread's 8 MB
-    // stack survives to ~8,000 levels, so a main-thread render passed even with the defect present.
-    // A regression here does not print FAIL — it takes SIGBUS and kills the harness. That is the
-    // loudest signal a stack overflow offers, and it is the same 512 KB-stack path
-    // `MarkdownPreviewView.renderQueue` uses.
+    // stack survives to ~8,000 levels, so a main-thread render passes even with the defect present.
+    // This is the same 512 KB-stack path `MarkdownPreviewView.renderQueue` uses.
+    //
+    // Mutation-checked rather than assumed: deleting the cap's two lines from `processEmphasis` and
+    // running this harness gives **five FAILs — the four depth/leftover checks above and the depth
+    // check below — and then exit 138, SIGBUS, right here**, killing the run. Both halves matter.
+    // The assertions name the defect; this line is what proves the fix is real, because a stack
+    // overflow cannot be caught and reported, only survived.
     let queue = DispatchQueue(label: "FEdit.MarkdownPreview.render.test", qos: .utility)
     let semaphore = DispatchSemaphore(value: 0)
     var renderedLength = 0
@@ -824,6 +828,18 @@ check(
     MarkdownRenderer.render("*a [b* c](d)").output.attribute(.link, at: 3, effectiveRange: nil) is URL,
     "R1: …and the emitter attaches a live .link attribute to it, since URL(string: \"d\") is non-nil"
 )
+// **How big is this change, measured rather than characterized.** Over 20,000 bracket-heavy inputs
+// (the differential fuzz's own alphabet and generator, run against HEAD and against this tree out of
+// tree): **7,342 (36.7%) produce a different inline tree, 3,226 (16.1%) change what is inside a code
+// span, 238 (1.19%) gain at least one `.link` node, and 70 (0.35%) lose one.** Both link directions
+// are real; the gain is the interesting one, because it turns text that rendered as plain characters
+// into something clickable.
+//
+// A property that follows from it, recorded so it is known rather than discovered: `emitInline`
+// attaches `.link` for **anything `URL(string:)` parses**, which includes `javascript:` and `file:`
+// destinations. That is pre-existing for genuine `[a](b)` links and is not changed here — but this
+// item enlarges the set of source text that becomes a link, so it enlarges that exposure too.
+// Filtering schemes is a separate decision and a separate item; this comment is the handoff.
 check(
     MarkdownInlineParser.parse("*a `c b*") == [.italic([.text("a `c b")])],
     "R1 control: *a `c b* is UNCHANGED — an unclosed backtick is literal at block scope too"
@@ -2998,6 +3014,24 @@ do {
 // scores **421 violations on the emphasis-only corpus and 10 on the second** (first hit:
 // `"   ****"` → `[.text("   "), .bold([])]`, four deleted characters), against 0 here. So of the
 // two properties in this section, the cheap structural one is the one carrying the evidence.
+//
+// **The oracle that beats both, and it is external.** Neither property says the PAIRING is right —
+// only these do, and they were run out of tree because the harness has no npm dependency and must
+// not grow one:
+//
+//     swiftc <this tree's renderer> + a driver that prints one HTML rendering per input
+//     node -e "require('markdown-it')('commonmark').renderInline(input)"
+//
+// over **every string of length <= 8 from `{a, *, space}` — all 9,840 of them — with 0 mismatches**,
+// byte for byte on rendered HTML. That covers flanking, the rule of three, `openers_bottom`, partial
+// consumption and nesting against a real CommonMark implementation rather than against a second copy
+// of this one. The same sweep over `{a, *, space, U+0301}` (<= 5 scalars, 1,364 inputs) differs on
+// 83, every one of them containing the combining mark — the documented grapheme-vs-scalar limit
+// recorded on `asteriskRunFlanking` and in SPEC §8.2, and nothing else.
+//
+// Left out of the sweep deliberately: backticks and brackets, where this subset differs from
+// CommonMark BY DESIGN (backticks pair 1-2, 3-4 rather than by run length; link parsing is the
+// documented `[title](url)` form only), so a mismatch there would mean nothing.
 
 /// Re-emits the delimiters the tree says it consumed. See the section comment above.
 func reconstruct(_ nodes: [InlineNode]) -> String {
@@ -3148,6 +3182,13 @@ measureRender("[×40000 + \"]\" (family 3)", ceiling: 1.0, String(repeating: "["
 // of the three below and attributes the risk to `openers_bottom`; **the attribution is wrong for the
 // implementation the plan itself specifies**, and the numbers here are measured by instrumenting a
 // copy of the shipped parser with a backward-step counter, not taken from the plan:
+//
+// **Counting convention, because two instrumentations of the same loop disagree by exactly the
+// number of successful matches**: a "step" below is one ITERATION of the backward `while` loop,
+// including the iteration that finds the opener and breaks. Counting only the candidates walked
+// PAST (the `opener = previous` executions) gives 3,999 and 39,999 for the last two rows instead of
+// 5,999 and 59,999 — the same measurement, minus the 2,000/20,000 matches. Both numbers come from
+// the shipped loop with a counter added; neither changes the conclusion.
 //
 //     input                  steps WITH openers_bottom   steps WITHOUT
 //     "*"×40000                            0                    0     (Rev 1's criterion)

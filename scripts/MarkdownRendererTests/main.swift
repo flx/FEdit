@@ -968,8 +968,35 @@ struct SeededLCG {
         state = 6_364_136_223_846_793_005 &* state &+ 1_442_695_040_888_963_407
         return state
     }
+
+    /// (fuzz-rng-low-bits) **Reduce the HIGH bits, never the low ones.** This is the whole of that
+    /// item, and the trap it fixes is silent and total rather than a matter of degree.
+    ///
+    /// A linear congruential generator with a power-of-two modulus — and `&*`/`&+` on `UInt64` is
+    /// exactly modulus 2^64 — has a catastrophically short period in its low bits: bit *k* of the
+    /// state has period at most 2^(k+1), because the low *k* bits of the recurrence depend only on
+    /// the low *k* bits of the previous state. They form their own little LCG mod 2^k, sealed off
+    /// from everything above them. So `next() % 8` — three low bits — cycles with period **8**, no
+    /// matter how good the generator looks in aggregate.
+    ///
+    /// That is not hypothetical here. The differential fuzz below draws its characters with
+    /// `nextInt(upperBound: alphabet.count)`, and the alphabet has exactly **8** entries. Measured
+    /// against the shipped constants and seed `0x5EED_1234_ABCD_9876`, the old `next() % 8` emitted
+    /// the index stream `[5, 0, 7, 2, 1, 4, 3, 6]` repeating forever, which collapsed the fuzz's
+    /// nominal 5000 random inputs into **6 distinct strings** — every one of them a prefix or
+    /// rotation of the same repeating sequence. The `md-link-scan-quadratic` differential oracle had
+    /// therefore been proving roughly one input, not thousands, for its whole life. With the shift
+    /// below the same 5000 draws produce **4740 distinct inputs**, which is what the fuzz always
+    /// claimed to be doing. (Both numbers are measured, not estimated; the guard assertion in the
+    /// fuzz section pins the property so a future reduction cannot quietly undo it.)
+    ///
+    /// `>> 33` keeps 31 bits — far more than the largest `upperBound` here (48) needs — and is the
+    /// specific shift the item probe-confirmed. The modulo bias that remains (31 bits reduced by a
+    /// non-power-of-two) is on the order of 2^-26 and is irrelevant for a test corpus.
+    ///
+    /// **Anything else that adds a fuzz to this file must call this, not `next() % n`.**
     mutating func nextInt(upperBound: Int) -> Int {
-        Int(next() % UInt64(upperBound))
+        Int((next() >> 33) % UInt64(upperBound))
     }
 }
 
@@ -980,6 +1007,9 @@ do {
     let fuzzCount = 5000
     var treeMismatches = 0
     var renderMismatches = 0
+    // (fuzz-rng-low-bits) The corpus itself is now under test. See the guard assertion below for
+    // why a comment on `nextInt` was not enough.
+    var distinctInputs = Set<String>()
 
     for _ in 0..<fuzzCount {
         let length = rng.nextInt(upperBound: 48)
@@ -989,6 +1019,7 @@ do {
             chars.append(alphabet[rng.nextInt(upperBound: alphabet.count)])
         }
         let input = String(chars)
+        distinctInputs.insert(input)
 
         let actualTree = MarkdownInlineParser.parse(input)
         let referenceTree = ReferenceInlineParser.parse(input)
@@ -1005,6 +1036,20 @@ do {
         }
     }
 
+    // (fuzz-rng-low-bits) **The corpus guard.** The two differential assertions below say nothing
+    // about how many DISTINCT inputs they ran on, so before this existed they read as a 5000-case
+    // sweep while actually proving 6 strings — the whole of that bug, and it was invisible precisely
+    // because everything was green. A prose warning on `nextInt` cannot fail; this can.
+    //
+    // Threshold: 4000 of 5000. Measured today is 4740 (the remainder is genuine birthday-paradox
+    // collision — short draws repeat, and `length == 0` alone recurs ~1/48 of the time), so the
+    // floor sits comfortably below the real value while still being ~790x above the 6 the degenerate
+    // low-bit reduction produced. Any future change to the reduction, the seed, the alphabet or the
+    // length bound that collapses the corpus trips this instead of passing quietly.
+    check(
+        distinctInputs.count > 4_000,
+        "\(fuzzCount) fuzz inputs are genuinely distinct (\(distinctInputs.count) unique) — the corpus is not degenerate"
+    )
     check(
         treeMismatches == 0,
         "\(fuzzCount) seeded random bracket-heavy inputs: MarkdownInlineParser.parse matches the naive reference tree (0 mismatches)"

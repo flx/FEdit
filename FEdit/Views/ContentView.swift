@@ -373,7 +373,16 @@ struct ContentView: View {
             // TextKit stack and is never searched (SPEC §6.5). Gated on the model's flag, so Esc /
             // Done / a menu Find all agree about whether it is showing.
             if workspace.isFindBarVisible {
-                FindBar(workspace: workspace, isQueryFieldFocused: $isFindFieldFocused)
+                // (find-bar-gutter-inset) The same live gutter width the header strip above gets,
+                // and for the same reason: `FindBar` adds the standard 8 pt on top of it, so the
+                // query field's leading edge lands on the file name's, not a gutter-width to its
+                // left over the line numbers. Only the bar's controls move — its background and
+                // hairline still span the column.
+                FindBar(
+                    workspace: workspace,
+                    isQueryFieldFocused: $isFindFieldFocused,
+                    leadingInset: editorGutterWidth
+                )
             }
             if workspace.openFile != nil {
                 CodeEditorView(

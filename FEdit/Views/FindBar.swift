@@ -52,6 +52,17 @@ struct FindBar: View {
     /// has to pull focus back into the field (criterion 17).
     @FocusState.Binding var isQueryFieldFocused: Bool
 
+    /// (find-bar-gutter-inset) Leading offset of the bar's *content* edge, ON TOP OF which the
+    /// standard 8 pt margin is always added — deliberately the same contract, and the same
+    /// arithmetic, as `ColumnHeaderBar.leadingInset`, because the two strips sit in the same
+    /// `VStack` at the same boundary and must not drift apart. `ContentView.editorColumn` passes
+    /// the live line-number gutter width, so the query field lines up with the file name directly
+    /// above it and the first text column directly below it, instead of hanging left over the
+    /// gutter. Only the CONTENT indents: the background and the bottom hairline still span the
+    /// full column width, because the hairline is the top boundary of the editor pane as a whole
+    /// and a notch above the gutter would read as a gap in it.
+    var leadingInset: CGFloat = 0
+
     /// (editor-find, finding 7) Drives `TextField`'s `selection:` binding (macOS 15+; this app
     /// targets macOS 26) so Cmd+F can select the field's existing contents on (re)focus — the half
     /// of criterion 17 a bare `@FocusState` write cannot reach on its own. `nil` most of the time
@@ -129,7 +140,8 @@ struct FindBar: View {
             .keyboardShortcut(.cancelAction)
         }
         .controlSize(.small)
-        .padding(.horizontal, 8)
+        .padding(.leading, leadingInset + 8)
+        .padding(.trailing, 8)
         .padding(.vertical, 5)
         .background(Color(nsColor: .windowBackgroundColor))
         // Same hairline the column header strips carry, so the bar reads as chrome above the text

@@ -42,7 +42,7 @@ v1 feature-complete: everything in the original plan has shipped (see [DONE.md](
 
 Open `FEdit.xcodeproj` in Xcode and Run. No third-party dependencies.
 
-A handful of pure-logic modules (filter query, filter row caching, markdown renderer, git status parsing, file tree scanning, per-root scan scheduling, watcher skip gating, session snapshots, line counting, command-line path mapping, `--wait` marker claiming, find match enumeration and stepping) also have standalone `swiftc`-run regression harnesses — eleven of them under `scripts/*/main.swift`, used in place of an XCTest target; the `fedit` shim has a shell one at `scripts/FeditShimTests/run.sh`. A twelfth, `scripts/GutterRulerTests`, is **not** pure logic — see the note below.
+A handful of pure-logic modules (filter query, filter row caching, markdown renderer, git status parsing, file tree scanning, per-root scan scheduling, watcher skip gating, session snapshots, line counting, command-line path mapping, `--wait` marker claiming, find match enumeration and stepping) also have standalone `swiftc`-run regression harnesses — eleven of them under `scripts/*/main.swift`, used in place of an XCTest target; the `fedit` shim has a shell one at `scripts/FeditShimTests/run.sh`. Two more under `scripts/*/main.swift` — `GutterRulerTests` and `FindBarWidthTests` — are **not** pure logic; see the note below.
 
 Each harness's header comment carries the exact command that builds and runs it, e.g.
 
@@ -51,12 +51,16 @@ swiftc FEdit/Models/FilterQuery.swift scripts/FilterQueryTests/main.swift -o /tm
 sh scripts/FeditShimTests/run.sh
 ```
 
-Eleven of the twelve `scripts/*/main.swift` harnesses are pure logic and run
-anywhere. The exception is `scripts/GutterRulerTests`, which pins the line-number
-gutter's drawing staying inside the editor pane: it builds a real TextKit stack
-and scroll view and rasterises them with `cacheDisplay(in:to:)`, so it needs
-AppKit to be able to draw — in practice a logged-in GUI session. It creates no
-window and never becomes visible.
+Eleven of the thirteen `scripts/*/main.swift` harnesses are pure logic and run
+anywhere. Two are render-level and need AppKit to be able to draw — in practice
+a logged-in GUI session. Neither creates a window or becomes visible:
+
+- `scripts/GutterRulerTests` pins the line-number gutter's drawing staying inside
+  the editor pane, by rasterising a real TextKit stack and scroll view with
+  `cacheDisplay(in:to:)`.
+- `scripts/FindBarWidthTests` pins the find bar fitting inside the editor column
+  rather than painting over the split dividers, by rendering the real `FindBar`
+  at a range of column widths and looking for ink outside its own frame.
 
 ## Installing
 

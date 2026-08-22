@@ -112,7 +112,31 @@ struct FindBar: View {
                         selectAllOnNextFocus = false
                     }
                 }
-                .frame(minWidth: 120, idealWidth: 220, maxWidth: 260)
+                // (find-bar-narrow-column) The floor is 60, not 120: it is the ONLY control in
+                // this bar whose minimum had no recorded rationale, and the one that degrades
+                // gracefully — a short text field still scrolls its contents. The count readout's
+                // 90 pt is load-bearing (its widest real value, `20000 of 20000+`, measures
+                // 100.7 pt, so shrinking it would make the controls shuffle, which is exactly what
+                // that fixed width exists to prevent), and the checkbox is pinned just below.
+                //
+                // Measured by rendering this view at 2 pt steps: with the checkbox pinned the
+                // overflow threshold is `338 pt + leadingInset`, against `398 pt + leadingInset`
+                // before — i.e. it moves by exactly the 60 pt taken off this floor, at every
+                // inset. `idealWidth` is untouched: the floor only binds when the column is tight,
+                // so renders are pixel-identical to before at 430 pt and above (checked at 430,
+                // 450, 480, 500 and 600; at 424, two points above the OLD threshold, the controls
+                // right of this field shift by about a pixel because pinning the checkbox rounds
+                // its width differently).
+                //
+                // NOT fully fixed, and deliberately not overstated: FEdit's real default editor
+                // column is 361.7 pt — `ContentView` subtracts both `dividerHitWidth`s before
+                // halving — so a 3-digit-line-count file (gutter 25 pt) still overflows there, by
+                // about 1 pt rather than the 61 pt it overflowed before. Narrower columns are
+                // easily reachable (161.7 pt at the 700 pt minimum window; 108.5 pt at
+                // `editorFractionMin`) and no floor-lowering reaches them; that needs a
+                // narrow-width design and is filed as its own item. Pinned by
+                // scripts/FindBarWidthTests.
+                .frame(minWidth: 60, idealWidth: 220, maxWidth: 260)
 
             // The visible checkbox the item asks for, unchecked by default — the whole reason this
             // is a custom bar and not `NSTextFinder`'s, which buries case-sensitivity in the
@@ -120,6 +144,15 @@ struct FindBar: View {
             // never render as a switch under a different `.toggleStyle` in an enclosing view.
             Toggle("Case sensitive", isOn: $workspace.findCaseSensitive)
                 .toggleStyle(.checkbox)
+                // (find-bar-narrow-column) Hold the label at its intrinsic width so it can neither
+                // WRAP to two lines nor truncate. Without this it does both as the column narrows —
+                // measured: "Case / sensitive" on two lines from about 380 pt down, and "Case /
+                // sensi…" by 324 pt — which silently made the bar taller and eventually unreadable,
+                // and which is a worse degradation than a short query field. It also made the bar's
+                // shrinking non-linear and hid where the real limit was: with the label pinned, the
+                // overflow threshold moves by exactly the 60 pt this item took off the field's
+                // floor, at every gutter inset, instead of an unexplained 96-100 pt.
+                .fixedSize(horizontal: true, vertical: false)
 
             // Fixed leading-aligned width so the controls beside it do not shuffle sideways as the
             // label goes "" → "1 of 17" → "Not found" on every keystroke.

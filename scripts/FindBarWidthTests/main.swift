@@ -19,8 +19,8 @@
 //  You should have received a copy of the GNU General Public License
 //  along with FEdit. If not, see <https://www.gnu.org/licenses/>.
 //
-//  (find-bar-narrow-column) Regression harness for the find bar's behaviour as
-//  the editor column narrows. Build and run:
+//  (find-bar-narrow-column, find-bar-narrow-redesign) Regression harness for the
+//  find bar's behaviour as the editor column narrows. Build and run:
 //
 //      swiftc FEdit/Models/FileNode.swift FEdit/Models/FilterQuery.swift \
 //          FEdit/Models/FilterRowCache.swift FEdit/Models/GitStatus.swift \
@@ -38,44 +38,38 @@
 //  Method: render the bar at a known column width, centred in a wider MAGENTA
 //  field, and count non-magenta pixels outside the column's band, over EVERY row.
 //  SwiftUI's `.frame(width:)` centres an oversized child rather than clipping it,
-//  so a bar whose controls cannot compress paints its background and its bottom
-//  hairline outside its own frame. Counting every row rather than the bar's mid
-//  row matters: a future change in which only the bottom hairline escaped would
-//  slip past a single-row probe, and the hairline is half of what makes the spill
-//  visible. Every render also counts ink INSIDE the band and fails if there is
-//  none, so a render that silently never laid out cannot report "fits".
+//  so a bar whose controls cannot compress paints outside its own frame. Counting
+//  every row rather than the mid row matters: a spill confined to the bottom
+//  hairline would slip past a single-row probe. Every render also counts ink
+//  INSIDE the band and fails if there is none, so a render that silently never
+//  laid out cannot report "fits" — the null-result trap post-mortemed in 679b698.
 //
-//  Detection is three per-channel thresholds, not a hue test. It is sound here
-//  because nothing in the bar is magenta: `windowBackgroundColor` ≈ 0.93 gray,
-//  the roundedBorder bezel is white, `separatorColor` is gray, the accent is
-//  blue.
+//  Detection is three per-channel thresholds, not a hue test. Sound here because
+//  nothing in the bar is magenta: `windowBackgroundColor` ≈ 0.93 gray, the
+//  roundedBorder bezel is white, `separatorColor` is gray, the accent is blue.
 //
-//  On what "outside its own frame" means in the running app: `ContentView`
-//  declares sidebar → divider → editorColumn → divider → preview, and later
-//  siblings paint over earlier ones, so the LEFT spill covers the left divider
-//  while most of the right spill is repainted by the divider and the preview.
-//  Ink-outside-the-frame is still the right invariant to pin — it is the defect —
-//  but the visible symptom is asymmetric, and "paints over both dividers" (as the
-//  original report put it) overstates the right-hand side.
+//  WHAT THE BAR NOW DOES, and what each number below means:
 //
-//  MEASURED CONTEXT, so nobody re-derives it:
+//  * Above `FindBar.singleRowMinimumWidth + gutterInset` it lays out as ONE row,
+//    exactly as it always has — verified pixel-identical to the pre-change build
+//    at 430, 500 and 600 pt.
+//  * Below that it lays out as TWO rows: query field + checkbox, then the count
+//    readout + Done. One row is 31 pt tall, two are 56 pt.
+//  * That drops the width at which it overflows from `338 + inset` to
+//    `184 + inset` — measured at 2 pt steps: 184 / 208 / 224 / 290 for insets
+//    0 / 25 / 40 / 107.
 //
-//  * The bar's overflow threshold is `338 + gutterInset` pt of column (measured
-//    at 2 pt steps: 338 / 362 / 378 / 444 for insets 0 / 25 / 40 / 107). Before
-//    this item it was `398 + inset`.
-//  * FEdit's real default editor column is **361.7 pt**, not the 366.7 pt a naive
-//    `(1100 − 1100/3)/2` gives: `ContentView` subtracts one
-//    `LayoutMetrics.dividerHitWidth` (5 pt) and a second one when a Markdown
-//    preview is showing, before halving the remainder.
-//  * So at the default window a 2-digit-line-count file (gutter 21 pt) now fits,
-//    and a 3-digit one (gutter 25 pt) **still overflows — by about 1 pt**, down
-//    from about 61 pt. That residue is real and is filed as its own item; it is
-//    NOT asserted away here.
-//  * The overflow is reachable far more easily than "a very narrow window": at
-//    the 700 pt minimum window with an otherwise default layout the editor column
-//    is 161.7 pt, and dragging the editor/preview divider to `editorFractionMin`
-//    reaches 108.5 pt. No floor-lowering fixes those; they need the bar to have a
-//    narrow-width design.
+//  THE RESIDUE, stated rather than asserted away: row-wrapping bottoms out at
+//  about `161.5 + inset`, because the count readout (90 pt) and Done (47.5 pt)
+//  plus a gap and the bar's padding is itself that wide, and splitting THOSE two
+//  apart would be a fourth row. FEdit's real default editor column is 361.7 pt
+//  (`ContentView` subtracts BOTH `dividerHitWidth`s before halving), so the
+//  default window now has ~153 pt of headroom. But the 700 pt minimum window with
+//  an otherwise default layout gives a 161.7 pt column, and dragging the
+//  editor/preview divider to `editorFractionMin` gives 108.5 pt — both still
+//  overflow, and no row-wrapping arrangement reaches them. Closing those needs a
+//  control to change (a narrower count readout, or an unlabelled checkbox), which
+//  is a product decision that was explicitly made the other way.
 //
 
 import AppKit
@@ -113,11 +107,14 @@ app.setActivationPolicy(.prohibited)
 app.appearance = NSAppearance(named: .aqua)
 
 let outerWidth: CGFloat = 800
-let outerHeight: CGFloat = 60
+let outerHeight: CGFloat = 90
 
 /// `(1100 − 1100/3 − 5 − 5) / 2`, i.e. `ContentView`'s own arithmetic with both
 /// divider hit widths subtracted, for a default window showing a Markdown file.
 let defaultEditorColumn: CGFloat = (1100 - 1100.0 / 3.0 - 5 - 5) / 2   // ≈ 361.7
+
+/// A typical live gutter width: `ceil(3 digits × 10 pt monospaced) + 2 × 4`.
+let typicalInset: CGFloat = 25
 
 struct Probe: View {
     @ObservedObject var workspace: WorkspaceModel
@@ -128,7 +125,8 @@ struct Probe: View {
     var body: some View {
         ZStack {
             Color(red: 1, green: 0, blue: 1)
-            FindBar(workspace: workspace, isQueryFieldFocused: $focused, leadingInset: inset)
+            FindBar(workspace: workspace, isQueryFieldFocused: $focused,
+                    leadingInset: inset, availableWidth: columnWidth)
                 .frame(width: columnWidth)
         }
         .frame(width: outerWidth, height: outerHeight)
@@ -140,9 +138,6 @@ struct Measurement {
     let inside: Int
 }
 
-/// Device pixels the bar painted outside its own frame (both sides, every row),
-/// plus the ink it painted inside — the latter so a render that never laid out
-/// cannot masquerade as "nothing outside".
 @MainActor
 func measure(columnWidth: CGFloat, inset: CGFloat) -> Measurement {
     let model = WorkspaceModel()
@@ -178,110 +173,124 @@ func measure(columnWidth: CGFloat, inset: CGFloat) -> Measurement {
         }
         return n
     }
-    return Measurement(
-        outside: nonMagenta(0..<leftEdge) + nonMagenta(rightEdge..<rep.pixelsWide),
-        inside: nonMagenta(leftEdge..<rightEdge)
-    )
+    return Measurement(outside: nonMagenta(0..<leftEdge) + nonMagenta(rightEdge..<rep.pixelsWide),
+                       inside: nonMagenta(leftEdge..<rightEdge))
 }
 
-/// The bar's natural height at a given column width, with no height imposed. If
-/// the "Case sensitive" label ever wraps to a second line, this grows — which is
-/// how the contents are pinned without OCR.
+/// The bar's natural height at a given column width. One row is 31 pt and two are
+/// 56 pt, so this is how the harness tells which layout was chosen — and how it
+/// catches the checkbox label wrapping, which would produce neither figure.
 @MainActor
 func naturalHeight(columnWidth: CGFloat, inset: CGFloat) -> CGFloat {
-    let model = WorkspaceModel()
     struct Bare: View {
         @ObservedObject var workspace: WorkspaceModel
         @FocusState private var focused: Bool
         let columnWidth: CGFloat
         let inset: CGFloat
         var body: some View {
-            FindBar(workspace: workspace, isQueryFieldFocused: $focused, leadingInset: inset)
+            FindBar(workspace: workspace, isQueryFieldFocused: $focused,
+                    leadingInset: inset, availableWidth: columnWidth)
                 .frame(width: columnWidth)
         }
     }
-    let hosting = NSHostingView(rootView: Bare(workspace: model, columnWidth: columnWidth, inset: inset))
+    let hosting = NSHostingView(rootView: Bare(workspace: WorkspaceModel(),
+                                               columnWidth: columnWidth, inset: inset))
     hosting.frame = NSRect(x: 0, y: 0, width: columnWidth, height: 200)
     hosting.layoutSubtreeIfNeeded()
     RunLoop.main.run(until: Date().addingTimeInterval(0.1))
     return hosting.fittingSize.height
 }
 
-@MainActor
-func report(_ label: String, _ m: Measurement) {
-    print("        \(label): outside = \(m.outside), inside = \(m.inside)")
-}
-
 MainActor.assumeIsolated {
 
     section("Every render actually drew something")
 
-    // Guards the whole suite: if a render silently fails to lay out, `outside`
-    // is 0 and every "nothing outside" check below would pass while measuring
-    // nothing at all. This project has been bitten by exactly that (see
-    // scripts/GutterRulerTests and commit 679b698).
-    let sanity = measure(columnWidth: 600, inset: 25)
+    let sanity = measure(columnWidth: 600, inset: typicalInset)
     check(sanity.inside > 1000, "a 600 pt render puts substantial ink inside the band",
           "inside = \(sanity.inside)")
 
-    section("The overflow threshold sits where this item put it: 338 pt + gutter inset")
+    let oneRowHeight = naturalHeight(columnWidth: 600, inset: typicalInset)
+    let twoRowHeight = naturalHeight(columnWidth: 300, inset: typicalInset)
+    print("        one row = \(oneRowHeight) pt, two rows = \(twoRowHeight) pt")
+    check(oneRowHeight > 10 && twoRowHeight > oneRowHeight,
+          "the two layouts have distinguishable heights",
+          "\(oneRowHeight) vs \(twoRowHeight)")
 
-    // Straddle checks. These pin the threshold from BOTH sides, so they catch a
-    // regression that raises it AND silently notice if it ever improves. A
-    // one-sided "does not overflow at width W" check would still pass if the
-    // query field's floor crept back up to 100.
-    for (inset, clean, spilling) in [(CGFloat(0), CGFloat(342), CGFloat(334)),
-                                     (CGFloat(25), CGFloat(366), CGFloat(358))] {
+    section("The bar switches rows exactly at FindBar.singleRowMinimumWidth")
+
+    // Straddle computed FROM the production constant, not from a copied literal,
+    // so changing the constant without re-measuring fails here instead of
+    // silently leaving a stale number passing. Project convention: bound a
+    // derived value, declare it, and pin both sides of the boundary from it.
+    let switchAt = FindBar.singleRowMinimumWidth + typicalInset
+    let justAbove = (switchAt / 2).rounded(.up) * 2      // next even width at or above
+    let justBelow = justAbove - 4
+
+    let above = measure(columnWidth: justAbove, inset: typicalInset)
+    let below = measure(columnWidth: justBelow, inset: typicalInset)
+    check(above.inside > 1000 && below.inside > 1000,
+          "both straddle renders drew", "\(above.inside) / \(below.inside)")
+    check(abs(naturalHeight(columnWidth: justAbove, inset: typicalInset) - oneRowHeight) < 0.5,
+          "at \(Int(justAbove)) pt — just above the threshold — the bar is ONE row")
+    check(abs(naturalHeight(columnWidth: justBelow, inset: typicalInset) - twoRowHeight) < 0.5,
+          "at \(Int(justBelow)) pt — just below it — the bar is TWO rows")
+    check(above.outside == 0, "one row at \(Int(justAbove)) pt paints nothing outside its frame",
+          "outside = \(above.outside)")
+    check(below.outside == 0, "two rows at \(Int(justBelow)) pt paint nothing outside either",
+          "outside = \(below.outside)")
+
+    section("Two rows hold down to about 184 pt + gutter inset")
+
+    // The wrapped layout's own floor. Straddled so a regression that widens any
+    // control shows up here rather than only in a very narrow window.
+    for (inset, clean, spilling) in [(CGFloat(0), CGFloat(190), CGFloat(180)),
+                                     (typicalInset, CGFloat(214), CGFloat(204))] {
         let ok = measure(columnWidth: clean, inset: inset)
         let bad = measure(columnWidth: spilling, inset: inset)
-        report("inset \(Int(inset)) @ \(Int(clean)) pt", ok)
-        report("inset \(Int(inset)) @ \(Int(spilling)) pt", bad)
         check(ok.inside > 1000 && bad.inside > 1000,
-              "inset \(Int(inset)): both straddle renders drew",
-              "inside = \(ok.inside) / \(bad.inside)")
+              "inset \(Int(inset)): both floor renders drew", "\(ok.inside) / \(bad.inside)")
         check(ok.outside == 0,
-              "inset \(Int(inset)): a \(Int(clean)) pt column paints nothing outside its frame",
+              "inset \(Int(inset)): two rows at \(Int(clean)) pt still fit",
               "outside = \(ok.outside)")
         check(bad.outside > 0,
-              "inset \(Int(inset)): a \(Int(spilling)) pt column still DOES overflow — the threshold has not moved",
+              "inset \(Int(inset)): at \(Int(spilling)) pt even two rows overflow — the floor has not moved",
               "outside = \(bad.outside)")
     }
 
-    section("Roomy columns are unaffected")
+    section("The default editor column fits, with room to spare")
+
+    // This is what the item was for. 360 is the real default (361.7) rounded down
+    // to an even width, which makes the check strictly harder than reality.
+    let atDefault = measure(columnWidth: 360, inset: typicalInset)
+    check(atDefault.outside == 0 && atDefault.inside > 1000,
+          "at the default editor column with a 3-digit gutter, nothing paints outside the frame",
+          "outside = \(atDefault.outside) (it was ~60 device px before this item, and ~4560 before its predecessor)")
+    print("        default column \(String(format: "%.1f", defaultEditorColumn)) pt vs a floor of about \(184 + Int(typicalInset)) pt")
+
+    section("Roomy columns are untouched")
 
     for width in [430, 500, 600] as [CGFloat] {
-        let m = measure(columnWidth: width, inset: 25)
-        check(m.outside == 0 && m.inside > 1000,
-              "a \(Int(width)) pt column paints nothing outside its frame",
-              "outside = \(m.outside), inside = \(m.inside)")
+        let m = measure(columnWidth: width, inset: typicalInset)
+        check(m.outside == 0 && m.inside > 1000 &&
+              abs(naturalHeight(columnWidth: width, inset: typicalInset) - oneRowHeight) < 0.5,
+              "a \(Int(width)) pt column is one row and paints nothing outside",
+              "outside = \(m.outside)")
     }
 
-    section("The controls survive: the checkbox label never wraps")
+    section("The checkbox label never wraps, in either layout")
 
     // The bar fitting is worthless if it fits by degrading its own contents. The
-    // "Case sensitive" label used to wrap to two lines from about 380 pt down and
-    // truncate ("Case / sensi…") by 324 pt, which made the bar taller and
-    // eventually unreadable; `.fixedSize` now holds it. Height is the proxy: a
-    // wrapped label is a second line.
-    let wide = naturalHeight(columnWidth: 600, inset: 25)
-    check(wide > 10, "measured a plausible bar height at 600 pt", "got \(wide)")
-    for width in [360, 330, 300, 260] as [CGFloat] {
-        let h = naturalHeight(columnWidth: width, inset: 25)
-        check(abs(h - wide) < 0.5,
-              "at \(Int(width)) pt the bar is still one line tall (label not wrapped)",
-              "height \(h) vs \(wide) at 600 pt")
+    // label used to wrap to two lines from about 380 pt down and truncate by
+    // 324 pt, taking the bar's height to 38 / 52 / 94 pt — figures that are
+    // neither of the two legitimate ones. Anything other than exactly one-row or
+    // exactly two-row height means a control wrapped.
+    for width in [500, 420, 380, 360, 330, 300, 260, 220] as [CGFloat] {
+        let h = naturalHeight(columnWidth: width, inset: typicalInset)
+        let legitimate = abs(h - oneRowHeight) < 0.5 || abs(h - twoRowHeight) < 0.5
+        check(legitimate,
+              "at \(Int(width)) pt the bar is exactly one or two rows tall — no control wrapped",
+              "height \(h), expected \(oneRowHeight) or \(twoRowHeight)")
     }
-
-    section("Context that is measured, not asserted")
-
-    // Recorded rather than checked, because it is the part this item did NOT
-    // fix. Asserting it either way would be dishonest: asserting "no overflow"
-    // would fail, and asserting "overflow" would enshrine the defect.
-    let atDefault = measure(columnWidth: 360, inset: 25)
-    print("        default editor column is \(String(format: "%.1f", defaultEditorColumn)) pt;")
-    print("        at 360 pt with a 3-digit gutter the bar still spills \(atDefault.outside) px")
-    print("        (it spilled ~61 pt worth before this item; the residue is filed separately)")
-    check(sanity.inside > 1000, "…and that measurement drew, so the number above means something")
 
     print("")
     print("==================================")

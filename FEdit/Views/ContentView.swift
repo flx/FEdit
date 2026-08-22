@@ -121,7 +121,7 @@ struct ContentView: View {
                 )
 
                 if workspace.isMarkdown {
-                    editorColumn
+                    editorColumn(availableWidth: editorWidth)
                         .frame(width: editorWidth)
 
                     SplitDivider(
@@ -140,7 +140,8 @@ struct ContentView: View {
                     previewColumn
                         .frame(maxWidth: .infinity)
                 } else {
-                    editorColumn
+                    // Non-Markdown: no preview column, so the editor takes the whole remainder.
+                    editorColumn(availableWidth: contentWidth)
                         .frame(maxWidth: .infinity)
                 }
             }
@@ -360,7 +361,11 @@ struct ContentView: View {
         }
     }
 
-    private var editorColumn: some View {
+    /// (find-bar-narrow-redesign) Takes the column's own width, because `FindBar` needs it to
+    /// decide between its one-row and two-row layouts. Passed rather than measured with a
+    /// `GeometryReader` inside the bar: this is the same number the column's `.frame` already
+    /// uses, so the two can never disagree, and a reader would report it a layout pass late.
+    private func editorColumn(availableWidth: CGFloat) -> some View {
         VStack(spacing: 0) {
             if let name = workspace.openFileName {
                 // Inset past the line-number gutter; `ColumnHeaderBar` then adds the standard 8 pt on
@@ -381,7 +386,8 @@ struct ContentView: View {
                 FindBar(
                     workspace: workspace,
                     isQueryFieldFocused: $isFindFieldFocused,
-                    leadingInset: editorGutterWidth
+                    leadingInset: editorGutterWidth,
+                    availableWidth: availableWidth
                 )
             }
             if workspace.openFile != nil {

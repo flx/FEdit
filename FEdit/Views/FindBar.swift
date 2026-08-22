@@ -63,6 +63,13 @@ struct FindBar: View {
     /// and a notch above the gutter would read as a gap in it.
     var leadingInset: CGFloat = 0
 
+    /// (find-bar-narrow-redesign) The editor column's width, so the bar can tell whether its
+    /// controls fit on one row. `ContentView` already computes this for the column's own frame
+    /// and passes the same value, rather than the bar measuring itself with a `GeometryReader`:
+    /// a reader would report the width AFTER this view had already been given it, which is one
+    /// layout pass too late to choose a layout with.
+    var availableWidth: CGFloat = .infinity
+
     /// (editor-find, finding 7) Drives `TextField`'s `selection:` binding (macOS 15+; this app
     /// targets macOS 26) so Cmd+F can select the field's existing contents on (re)focus — the half
     /// of criterion 17 a bare `@FocusState` write cannot reach on its own. `nil` most of the time
@@ -81,96 +88,157 @@ struct FindBar: View {
     /// on the focus handler for the regression this fixes.
     @State private var selectAllOnNextFocus = true
 
-    var body: some View {
-        HStack(spacing: 8) {
-            // Return submits one Find Next step (SPEC §6.5). `.onSubmit` — not a hidden default
-            // button — so Return keeps stepping while the field holds focus, which is the behaviour
-            // the item asks for; Cmd+G is the same signal from the menu.
-            TextField("Find", text: $workspace.findQuery, selection: $querySelection)
-                .textFieldStyle(.roundedBorder)
-                .focused($isQueryFieldFocused)
-                .onSubmit { workspace.findNextTick += 1 }
-                // (editor-find, finding 5, second round) Re-arms `selectAllOnNextFocus` for a LATER
-                // Cmd+F: `findFocusTick` only bumps on Cmd+F (never on a click), so this is the
-                // signal that distinguishes "focus is about to move here because of Cmd+F" from
-                // every other way this field can gain focus.
-                .onChange(of: workspace.findFocusTick) {
-                    selectAllOnNextFocus = true
+    /// Measured single-row minimum width, EXCLUDING the gutter inset, which is added on top.
+    /// Below `singleRowMinimumWidth + leadingInset` the controls cannot compress any further and
+    /// the bar would paint outside its own frame, so it lays out as two rows instead.
+    ///
+    /// The number is measured, not estimated — `scripts/FindBarWidthTests` renders this view at
+    /// 2 pt steps and straddles this exact constant, so changing it here without re-measuring
+    /// fails the harness rather than silently drifting. It is the sum of the controls' floors —
+    /// 60 (field) + 93 (checkbox) + 90 (count) + 47.5 (Done) + 32 (four 8 pt gaps) + 16 (the bar's
+    /// own horizontal padding) ≈ 338.5 — rounded UP to the next even point, because the measured
+    /// answer is that one row still spills AT 338 and is clean at 340. Rounding down left a 2 pt
+    /// band at the boundary where the bar chose one row and then overflowed it.
+    static let singleRowMinimumWidth: CGFloat = 340
+
+    /// Whether the single-row layout fits. `.infinity` by default so a `FindBar` built without a
+    /// width — there is one call site today, but the default has to be the safe one — keeps the
+    /// layout it has always had rather than silently wrapping.
+    private var fitsOnOneRow: Bool {
+        availableWidth >= Self.singleRowMinimumWidth + leadingInset
+    }
+
+    private var queryField: some View {
+        // Return submits one Find Next step (SPEC §6.5). `.onSubmit` — not a hidden default
+        // button — so Return keeps stepping while the field holds focus, which is the behaviour
+        // the item asks for; Cmd+G is the same signal from the menu.
+        TextField("Find", text: $workspace.findQuery, selection: $querySelection)
+            .textFieldStyle(.roundedBorder)
+            .focused($isQueryFieldFocused)
+            .onSubmit { workspace.findNextTick += 1 }
+            // (editor-find, finding 5, second round) Re-arms `selectAllOnNextFocus` for a LATER
+            // Cmd+F: `findFocusTick` only bumps on Cmd+F (never on a click), so this is the
+            // signal that distinguishes "focus is about to move here because of Cmd+F" from
+            // every other way this field can gain focus.
+            .onChange(of: workspace.findFocusTick) {
+                selectAllOnNextFocus = true
+            }
+            // (editor-find, finding 7; finding 5 second round) Select the whole query on a
+            // transition INTO focus, but ONLY when `selectAllOnNextFocus` says it was Cmd+F that
+            // caused it — not an arbitrary focus gain. Without the flag, this fired on EVERY
+            // false->true transition, which SwiftUI also reports for a plain click into the
+            // field: bar open with `foo` typed, click into the editor, then click into the
+            // middle of `foo` to fix a typo — the click's own caret placement was overridden by
+            // a full-range selection. Guarded on `isQueryFieldFocused` (not the `false` half of
+            // `ContentView`'s two-step) so this never fires on the deliberate false->true
+            // bounce's `false` leg.
+            .onChange(of: isQueryFieldFocused) {
+                if isQueryFieldFocused && selectAllOnNextFocus {
+                    querySelection = TextSelection(range: workspace.findQuery.startIndex..<workspace.findQuery.endIndex)
+                    selectAllOnNextFocus = false
                 }
-                // (editor-find, finding 7; finding 5 second round) Select the whole query on a
-                // transition INTO focus, but ONLY when `selectAllOnNextFocus` says it was Cmd+F that
-                // caused it — not an arbitrary focus gain. Without the flag, this fired on EVERY
-                // false->true transition, which SwiftUI also reports for a plain click into the
-                // field: bar open with `foo` typed, click into the editor, then click into the
-                // middle of `foo` to fix a typo — the click's own caret placement was overridden by
-                // a full-range selection. Guarded on `isQueryFieldFocused` (not the `false` half of
-                // `ContentView`'s two-step) so this never fires on the deliberate false->true
-                // bounce's `false` leg.
-                .onChange(of: isQueryFieldFocused) {
-                    if isQueryFieldFocused && selectAllOnNextFocus {
-                        querySelection = TextSelection(range: workspace.findQuery.startIndex..<workspace.findQuery.endIndex)
-                        selectAllOnNextFocus = false
+            }
+            // (find-bar-narrow-column) The floor is 60, not 120: it is the ONLY control in
+            // this bar whose minimum had no recorded rationale, and the one that degrades
+            // gracefully — a short text field still scrolls its contents. The count readout's
+            // 90 pt is load-bearing (its widest real value, `20000 of 20000+`, measures
+            // 100.7 pt, so shrinking it would make the controls shuffle, which is exactly what
+            // that fixed width exists to prevent), and the checkbox is pinned just below.
+            //
+            // Measured by rendering this view at 2 pt steps: with the checkbox pinned the
+            // overflow threshold is `338 pt + leadingInset`, against `398 pt + leadingInset`
+            // before — i.e. it moves by exactly the 60 pt taken off this floor, at every
+            // inset. `idealWidth` is untouched: the floor only binds when the column is tight,
+            // so renders are pixel-identical to before at 430 pt and above (checked at 430,
+            // 450, 480, 500 and 600; at 424, two points above the OLD threshold, the controls
+            // right of this field shift by about a pixel because pinning the checkbox rounds
+            // its width differently).
+            //
+            // NOT fully fixed, and deliberately not overstated: FEdit's real default editor
+            // column is 361.7 pt — `ContentView` subtracts both `dividerHitWidth`s before
+            // halving — so a 3-digit-line-count file (gutter 25 pt) still overflows there, by
+            // about 1 pt rather than the 61 pt it overflowed before. Narrower columns are
+            // easily reachable (161.7 pt at the 700 pt minimum window; 108.5 pt at
+            // `editorFractionMin`) and no floor-lowering reaches them; that needs a
+            // narrow-width design and is filed as its own item. Pinned by
+            // scripts/FindBarWidthTests.
+            .frame(minWidth: 60, idealWidth: 220, maxWidth: 260)
+    }
+
+    private var caseToggle: some View {
+        // The visible checkbox the item asks for, unchecked by default — the whole reason this
+        // is a custom bar and not `NSTextFinder`'s, which buries case-sensitivity in the
+        // magnifier popup (D1). `.checkbox` is stated rather than inherited so the control can
+        // never render as a switch under a different `.toggleStyle` in an enclosing view.
+        Toggle("Case sensitive", isOn: $workspace.findCaseSensitive)
+            .toggleStyle(.checkbox)
+            // (find-bar-narrow-column) Hold the label at its intrinsic width so it can neither
+            // WRAP to two lines nor truncate. Without this it does both as the column narrows —
+            // measured: "Case / sensitive" on two lines from about 380 pt down, and "Case /
+            // sensi…" by 324 pt — which silently made the bar taller and eventually unreadable,
+            // and which is a worse degradation than a short query field. It also made the bar's
+            // shrinking non-linear and hid where the real limit was: with the label pinned, the
+            // overflow threshold moves by exactly the 60 pt this item took off the field's
+            // floor, at every gutter inset, instead of an unexplained 96-100 pt.
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var countReadout: some View {
+        // Fixed leading-aligned width so the controls beside it do not shuffle sideways as the
+        // label goes "" → "1 of 17" → "Not found" on every keystroke.
+        Text(workspace.findCountLabel)
+            .font(.system(size: 12))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .frame(minWidth: 90, alignment: .leading)
+    }
+
+    private var doneButton: some View {
+        // Esc closes the bar (SPEC §6.5). `.cancelAction` covers Esc while focus is in the
+        // query field; Esc while focus is in the *editor text* is covered on the AppKit side by
+        // `FindableTextView.cancelOperation(_:)` — the two together are criterion 18.
+        Button("Done") {
+            workspace.closeFindBar()
+        }
+        .keyboardShortcut(.cancelAction)
+    }
+
+    var body: some View {
+        Group {
+            if fitsOnOneRow {
+                HStack(spacing: 8) {
+                    queryField
+                    caseToggle
+                    countReadout
+                    Spacer(minLength: 0)
+                    doneButton
+                }
+            } else {
+                // (find-bar-narrow-redesign) Two rows: the query field and the checkbox stay
+                // together on the first, the count readout and Done move to the second. Chosen
+                // over an icon-only checkbox (SPEC §6.5 names a *visible* Case sensitive
+                // checkbox, so that would be a SPEC change rather than a layout one), over
+                // folding the readout into the field (a visible change at EVERY width, not just
+                // narrow ones), and over horizontal scrolling (which can hide Done outright).
+                // This arrangement is the one that keeps every control present, labelled and
+                // clickable, and changes nothing at all above the threshold.
+                //
+                // The split is this way round because the binding constraint is the first row:
+                // field + checkbox is 161 pt of floor against the readout + Done's 145.5, so
+                // pairing the two widest controls on separate rows is what actually buys width.
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        queryField
+                        caseToggle
+                        Spacer(minLength: 0)
+                    }
+                    HStack(spacing: 8) {
+                        countReadout
+                        Spacer(minLength: 0)
+                        doneButton
                     }
                 }
-                // (find-bar-narrow-column) The floor is 60, not 120: it is the ONLY control in
-                // this bar whose minimum had no recorded rationale, and the one that degrades
-                // gracefully — a short text field still scrolls its contents. The count readout's
-                // 90 pt is load-bearing (its widest real value, `20000 of 20000+`, measures
-                // 100.7 pt, so shrinking it would make the controls shuffle, which is exactly what
-                // that fixed width exists to prevent), and the checkbox is pinned just below.
-                //
-                // Measured by rendering this view at 2 pt steps: with the checkbox pinned the
-                // overflow threshold is `338 pt + leadingInset`, against `398 pt + leadingInset`
-                // before — i.e. it moves by exactly the 60 pt taken off this floor, at every
-                // inset. `idealWidth` is untouched: the floor only binds when the column is tight,
-                // so renders are pixel-identical to before at 430 pt and above (checked at 430,
-                // 450, 480, 500 and 600; at 424, two points above the OLD threshold, the controls
-                // right of this field shift by about a pixel because pinning the checkbox rounds
-                // its width differently).
-                //
-                // NOT fully fixed, and deliberately not overstated: FEdit's real default editor
-                // column is 361.7 pt — `ContentView` subtracts both `dividerHitWidth`s before
-                // halving — so a 3-digit-line-count file (gutter 25 pt) still overflows there, by
-                // about 1 pt rather than the 61 pt it overflowed before. Narrower columns are
-                // easily reachable (161.7 pt at the 700 pt minimum window; 108.5 pt at
-                // `editorFractionMin`) and no floor-lowering reaches them; that needs a
-                // narrow-width design and is filed as its own item. Pinned by
-                // scripts/FindBarWidthTests.
-                .frame(minWidth: 60, idealWidth: 220, maxWidth: 260)
-
-            // The visible checkbox the item asks for, unchecked by default — the whole reason this
-            // is a custom bar and not `NSTextFinder`'s, which buries case-sensitivity in the
-            // magnifier popup (D1). `.checkbox` is stated rather than inherited so the control can
-            // never render as a switch under a different `.toggleStyle` in an enclosing view.
-            Toggle("Case sensitive", isOn: $workspace.findCaseSensitive)
-                .toggleStyle(.checkbox)
-                // (find-bar-narrow-column) Hold the label at its intrinsic width so it can neither
-                // WRAP to two lines nor truncate. Without this it does both as the column narrows —
-                // measured: "Case / sensitive" on two lines from about 380 pt down, and "Case /
-                // sensi…" by 324 pt — which silently made the bar taller and eventually unreadable,
-                // and which is a worse degradation than a short query field. It also made the bar's
-                // shrinking non-linear and hid where the real limit was: with the label pinned, the
-                // overflow threshold moves by exactly the 60 pt this item took off the field's
-                // floor, at every gutter inset, instead of an unexplained 96-100 pt.
-                .fixedSize(horizontal: true, vertical: false)
-
-            // Fixed leading-aligned width so the controls beside it do not shuffle sideways as the
-            // label goes "" → "1 of 17" → "Not found" on every keystroke.
-            Text(workspace.findCountLabel)
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .frame(minWidth: 90, alignment: .leading)
-
-            Spacer(minLength: 0)
-
-            // Esc closes the bar (SPEC §6.5). `.cancelAction` covers Esc while focus is in the
-            // query field; Esc while focus is in the *editor text* is covered on the AppKit side by
-            // `FindableTextView.cancelOperation(_:)` — the two together are criterion 18.
-            Button("Done") {
-                workspace.closeFindBar()
             }
-            .keyboardShortcut(.cancelAction)
         }
         .controlSize(.small)
         .padding(.leading, leadingInset + 8)

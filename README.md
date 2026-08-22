@@ -1,5 +1,7 @@
 # FEdit
 
+<img src="art/fedit-4-knockout-1024.png" alt="FEdit app icon" width="120" align="right" />
+
 A lightweight, memory-frugal text editor for macOS with Markdown preview and simple syntax highlighting for Swift, Python and Markdown.
 
 The motivation: editing a couple of kB of text should not cost a gigabyte of RAM. FEdit deliberately avoids heavyweight machinery — native AppKit text views instead of a web-based editor, and a native Markdown renderer instead of an embedded browser. In practice it settles at roughly 80–190 MB with small files open, most of which is framework memory an audit found to be irreducible rather than leaked; the point is the order of magnitude, not a race to the bottom.
@@ -9,7 +11,7 @@ The motivation: editing a couple of kB of text should not cost a gigabyte of RAM
 - **Three-column window** — folder sidebar, editor, and a Markdown preview column that appears only while a Markdown file is open. Draggable, persisted splits (1/3 · 1/3 · 1/3 by default), each column topped by a fixed header strip (folder name(s), open file name, "Preview"). Windows are independent: each has its own folders, filter, open file and cursor.
 - **Folder sidebar** — open multiple top-level folders (each its own section, `~`-abbreviated header, Remove/Refresh menu); expandable tree view, or a flat filtered list driven by a boolean query language (`.py OR .swift`, `AND` binds tighter than `OR`, space = union, `^`/`$` anchor a term to the start/end of the path). Scanning runs off the main thread — the window is usable while a big root fills in behind a `Scanning…` placeholder — and each root's tree is capped at ~50,000 entries, filled breadth-first, with a notice in that section when the cap is hit. Sidebar roots and the open file are watched (FSEvents / vnode) so external adds, removes and edits are reflected automatically. Files whose working-tree content differs from `HEAD` show a read-only "(changed)" badge when the root is a git repo.
 - **Editor** — line numbers, soft wrapping, lightweight regex-based syntax highlighting for Swift, Python and Markdown; opens any UTF-8 (Latin-1 fallback) text file; font size zoom (Cmd-+ / Cmd-− / Cmd-0), app-wide and persisted.
-- **Find in the editor text** — Cmd+F opens a find bar over the editor (never the preview): literal matching with a visible **Case sensitive** checkbox (off by default), every match highlighted with the current one distinguished, Return / Cmd+G to step and wrap (Cmd+Shift+G steps backwards, wrapping at the start), a `3 of 17` count, Esc to close. No regex and no replace, by design.
+- **Find in the editor text** — Cmd+F opens a find bar over the editor (never the preview): literal matching with a visible **Case sensitive** checkbox (off by default), every match highlighted with the current one distinguished, Return / Cmd+G to step and wrap (Cmd+Shift+G steps backwards, wrapping at the start), a `3 of 17` count, Esc to close. No regex and no replace, by design. In a narrow editor column the bar **wraps to two rows** — query field and checkbox above, count and Done below — rather than spilling out over the split dividers.
 - **Markdown preview** — rendered natively (no WKWebView), with approximate scroll sync: the preview follows the first line visible in the editor. GFM pipe tables render as real aligned grids (`NSTextTable`), with a bold header row and `:---:` alignment honored; ragged rows degrade gracefully rather than being rejected or truncated.
 - **Save flow** — explicit save (Cmd+S), plus unconditional, always-on debounced autosave (no toggle) on typing pause, file switch, window close and quit. A clean buffer is reloaded when the file changes underneath you; a dirty one is kept and the window subtitle says "changed on disk" until the next save wins. The only surviving dialog is a minimal "Close Without Saving / Cancel" escape when a close/quit flush fails.
 - **File creation** — File → New… (Cmd+N) creates a file via a filename sheet in the current folder.
@@ -31,7 +33,7 @@ The motivation: editing a couple of kB of text should not cost a gigabyte of RAM
 
 ## Status
 
-v1 feature-complete: everything in the original plan has shipped (see [DONE.md](DONE.md)); [TODO.md](TODO.md) carries the open work that has been filed since. [SPEC.md](SPEC.md) is the maintained implementation contract — kept in sync with each shipped change, and the place to look for exact behavior. It also absorbed the original one-page pitch, which used to live in `Specification.md`.
+v1 feature-complete: everything in the original plan has shipped (see [DONE.md](DONE.md)); [TODO.md](TODO.md) carries the open queue of work filed since — currently empty. [SPEC.md](SPEC.md) is the maintained implementation contract — kept in sync with each shipped change, and the place to look for exact behavior. It also absorbed the original one-page pitch, which used to live in `Specification.md`.
 
 ## Requirements
 
@@ -60,7 +62,11 @@ a logged-in GUI session. Neither creates a window or becomes visible:
   `cacheDisplay(in:to:)`.
 - `scripts/FindBarWidthTests` pins the find bar fitting inside the editor column
   rather than painting over the split dividers, by rendering the real `FindBar`
-  at a range of column widths and looking for ink outside its own frame.
+  at a range of column widths and looking for ink outside its own frame. It also
+  straddles the one-row/two-row switch from the production constant itself (so
+  moving that constant without re-measuring fails), and pins the bar's height to
+  exactly the one-row or two-row figure — a **Case sensitive** label that wrapped
+  or truncated would produce neither.
 
 ## Installing
 

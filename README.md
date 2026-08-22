@@ -42,7 +42,7 @@ v1 feature-complete: everything in the original plan has shipped (see [DONE.md](
 
 Open `FEdit.xcodeproj` in Xcode and Run. No third-party dependencies.
 
-A handful of pure-logic modules (filter query, filter row caching, markdown renderer, git status parsing, file tree scanning, per-root scan scheduling, watcher skip gating, session snapshots, line counting, command-line path mapping, `--wait` marker claiming, find match enumeration and stepping) also have standalone `swiftc`-run regression harnesses — eleven of them under `scripts/*/main.swift`, used in place of an XCTest target; the `fedit` shim has a shell one at `scripts/FeditShimTests/run.sh`.
+A handful of pure-logic modules (filter query, filter row caching, markdown renderer, git status parsing, file tree scanning, per-root scan scheduling, watcher skip gating, session snapshots, line counting, command-line path mapping, `--wait` marker claiming, find match enumeration and stepping) also have standalone `swiftc`-run regression harnesses — eleven of them under `scripts/*/main.swift`, used in place of an XCTest target; the `fedit` shim has a shell one at `scripts/FeditShimTests/run.sh`. A twelfth, `scripts/GutterRulerTests`, is **not** pure logic — see the note below.
 
 Each harness's header comment carries the exact command that builds and runs it, e.g.
 
@@ -50,6 +50,12 @@ Each harness's header comment carries the exact command that builds and runs it,
 swiftc FEdit/Models/FilterQuery.swift scripts/FilterQueryTests/main.swift -o /tmp/fqtests && /tmp/fqtests
 sh scripts/FeditShimTests/run.sh
 ```
+
+Eleven of the twelve `scripts/*/main.swift` harnesses are pure logic and run
+anywhere. The exception is `scripts/GutterRulerTests`, which pins the line-number gutter's drawing staying
+inside the editor pane: it hosts a real SwiftUI editor column in an offscreen
+window and rasterises it, so it needs a window-server connection (a logged-in
+GUI session). It never becomes visible. A headless runner has to skip that one.
 
 ## Installing
 

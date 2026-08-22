@@ -60,6 +60,20 @@ final class LineNumberRulerView: NSRulerView {
         super.init(scrollView: scrollView, orientation: .verticalRuler)
         clientView = textView
 
+        // (gutter-top-overflow) Keep every mark this view draws INSIDE this view. `clipsToBounds`
+        // has defaulted to `false` since macOS 14 — before that AppKit always clipped — and the
+        // label walk below deliberately starts at the logical line containing the first visible
+        // CHARACTER, so the topmost label is by construction centred in a fragment that begins
+        // above the viewport. Unclipped, that label was painted over `ColumnHeaderBar`'s bottom
+        // hairline and into the header strip (measured on the shipped build: ink at device rows
+        // 117-129 against a background fill starting at 124). It is not bounded by one line
+        // height either: scrolled into the middle of a paragraph that wraps to many fragments,
+        // the label goes to that paragraph's FIRST fragment, several rows above the pane.
+        // Clipping — rather than skipping or re-centring the label — keeps the number attached to
+        // its own text row and merely cuts it off at the pane's edge, which is what Xcode shows.
+        // Pinned by scripts/GutterRulerTests.
+        clipsToBounds = true
+
         // Tier 2 sets this on its own account (Tier 3 also sets it, idempotently, for its own
         // scroll-position observing — see the DECISION in the plan: reverting either tier must
         // not silently break the other's notification).

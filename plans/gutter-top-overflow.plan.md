@@ -216,3 +216,76 @@ edge and anything painted below it leaves the window. The top edge has 28 pt of
 header strip (plus 31 pt of find bar when open) sitting right above it, which is
 exactly where the escaped label landed. Clipping fixes both; only one of them
 was ever reportable.
+
+## Decisions taken — round 2, after `adv-review-edge`
+
+**2026-08-22 — THE SWIFTUI CLAIM ABOVE IS WRONG, AND IS RETRACTED.**
+Everything in this plan and in the first version of the harness that says the
+`NSHostingView` context is required to reproduce the escape is false. The
+reviewer refuted it by building the plain-AppKit reproduction it claimed was
+impossible, and I re-verified independently before accepting: a plain `NSView`
+root with the real scroll view and ruler reproduces the escape at **21 stray
+subpixels above the pane**, matching the SwiftUI harness's own figure, and it
+does so **with no `NSWindow` at all** (checked in a fresh process, so it is not
+an artefact of an earlier window in the same run).
+
+What is actually load-bearing is **subview paint order**. Measured, same document
+and scroll offset, clip forced off:
+
+| arrangement | stray subpixels above the pane |
+|---|---|
+| chrome strip added BEFORE the scroll view | **21** |
+| chrome strip added AFTER the scroll view | **0** — the strip repaints over it |
+| no strip; the root fills its own bounds | **21** |
+
+A strip added last simply paints over the escaped label. That is also why the
+overflow at the bottom edge measured 0 in an early probe, and it is the most
+likely reason the first harness reported a clean 0 and was misread as "plain
+AppKit clips it". The harness is now plain AppKit — no SwiftUI, no window — and
+its header records the three-way measurement so the arrangement is not
+"simplified" back into a vacuous pass. The claim also went into README and the
+DONE.md record and is corrected in both.
+
+The general lesson is the one this project keeps relearning: a **null result is
+not evidence of a mechanism.** The first harness's 0 was read as proof that
+AppKit clips in plain hierarchies, when it only ever showed that *that* harness
+did not observe an escape.
+
+**2026-08-22 — case 2 cannot distinguish clipping from skipping; said so.**
+The reviewer showed that mid-paragraph the shipped gutter is entirely blank: the
+paragraph's only label belongs to its first fragment, now clipped, and the next
+logical line starts below `visibleRect.maxY` so the loop breaks first. Every one
+of case 2's assertions therefore also passes for an implementation that simply
+skipped such labels; only case 1's sliver check rules that out. The harness now
+asserts the blankness explicitly and both it and the production comment say which
+case is the discriminator. The production comment previously claimed clipping
+"merely cuts it off at the pane's edge", which is wrong for exactly the case it
+cited as motivation — corrected to state both outcomes and why blank is right.
+
+**2026-08-22 — the dark-pixel threshold raised from 0.6 to 0.75.**
+Accepted from the review, with the arithmetic re-derived: `secondaryLabelColor`
+in light aqua is sRGB 0 at α ≈ 0.498 over the ruler's `NSColor(white: 0.95)`, so
+a fully covered pixel composites to ≈ 0.476 and a pixel of coverage `c` to
+`0.949 × (1 − 0.498c)`. At 0.6 a pixel needed ≈ 74 % coverage to register, which
+left roughly 4 qualifying pixels at 1×; 0.75 admits ≈ 42 % coverage while still
+excluding the white chrome and the ruler's own 0.95 background. The revert check
+now reports 30 and 58 stray subpixels where it previously reported 22 and 42.
+
+**2026-08-22 — the in-pane comparison is now pixel identity, not a count.**
+The plan claimed "byte-identical" while the assertion compared dark-pixel
+*counts*, which two different images can share. Rather than soften the wording,
+the assertion was strengthened to compare every pixel in the band.
+
+**2026-08-22 — the harness's chrome strip carries no title text.**
+It previously drew one at a hardcoded 35 pt inset, chosen to match a 3-digit
+gutter. At 5 digits `ruleThickness` is 39 and the title's leading glyph falls
+inside the inspected band, so anyone enlarging the test document would have hit a
+failure unrelated to the bug. A plain fill makes any ink in the strip
+unambiguously the gutter's.
+
+**2026-08-22 — accepted without change:** the reviewer's finding that the bottom
+edge also overflowed and is now clipped, with no user-visible effect today
+because the editor pane's bottom edge is the window's. Recorded in the section
+above; if a status bar is ever added below the editor, the clip already covers it.
+
+**Rejected:** nothing. Every finding was real.

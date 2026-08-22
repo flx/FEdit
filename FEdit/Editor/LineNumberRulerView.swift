@@ -69,9 +69,16 @@ final class LineNumberRulerView: NSRulerView {
         // 117-129 against a background fill starting at 124). It is not bounded by one line
         // height either: scrolled into the middle of a paragraph that wraps to many fragments,
         // the label goes to that paragraph's FIRST fragment, several rows above the pane.
-        // Clipping — rather than skipping or re-centring the label — keeps the number attached to
-        // its own text row and merely cuts it off at the pane's edge, which is what Xcode shows.
-        // Pinned by scripts/GutterRulerTests.
+        // Clipping rather than skipping or re-centring the label: the number stays tied to its own
+        // text row and is simply cut off by the pane's edge. For a line whose fragment is only
+        // PARTLY above the viewport that means a visible sliver, which is what Xcode shows; for a
+        // fragment entirely above it — the wrapped-paragraph case above — it means the number is
+        // not visible at all, and the gutter beside a wrapped continuation is blank. That is also
+        // what Xcode does, and it is the correct outcome rather than a shortfall of the fix: the
+        // alternatives would either invent a number for a row whose start is off-screen, or move
+        // one so it no longer marks the line it names.
+        // Pinned by scripts/GutterRulerTests, whose case 1 is the assertion that distinguishes
+        // clipping from skipping — case 2's gutter is legitimately blank and cannot.
         clipsToBounds = true
 
         // Tier 2 sets this on its own account (Tier 3 also sets it, idempotently, for its own

@@ -52,10 +52,11 @@ sh scripts/FeditShimTests/run.sh
 ```
 
 Eleven of the twelve `scripts/*/main.swift` harnesses are pure logic and run
-anywhere. The exception is `scripts/GutterRulerTests`, which pins the line-number gutter's drawing staying
-inside the editor pane: it hosts a real SwiftUI editor column in an offscreen
-window and rasterises it, so it needs a window-server connection (a logged-in
-GUI session). It never becomes visible. A headless runner has to skip that one.
+anywhere. The exception is `scripts/GutterRulerTests`, which pins the line-number
+gutter's drawing staying inside the editor pane: it builds a real TextKit stack
+and scroll view and rasterises them with `cacheDisplay(in:to:)`, so it needs
+AppKit to be able to draw — in practice a logged-in GUI session. It creates no
+window and never becomes visible.
 
 ## Installing
 
